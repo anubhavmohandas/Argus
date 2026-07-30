@@ -1,0 +1,2 @@
+# Argus core is stdlib-only. The single external dep is for the phone module.
+phonenumbers>=8.13

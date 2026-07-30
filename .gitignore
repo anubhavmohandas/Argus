@@ -1,0 +1,11 @@
+# User's own tools — integrated directly, kept out of version control
+MY OWN/
+
+# Source tool zips (external, not part of the Argus codebase)
+*.zip
+
+# macOS + Python noise
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
