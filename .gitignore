@@ -1,7 +1,7 @@
-# User's own tools — integrated directly, kept out of version control
-MY OWN/
+# Source tools + user's own tools — kept out of version control
+Tools/
 
-# Source tool zips (external, not part of the Argus codebase)
+# Any stray source zips (e.g. Shadowbroker-main.zip still at root)
 *.zip
 
 # macOS + Python noise
