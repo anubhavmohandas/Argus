@@ -218,6 +218,61 @@ def test_color_gating_cross_platform():
     assert _color_enabled() is False
 
 
+def test_evidence_provider():
+    # The architectural test: a provider feeds evidence in, and existing rules
+    # get more certain — with zero changes to engine.py, the rules, or the
+    # result object. Pure parsing only; nothing here touches the network.
+    from argus import engine, providers
+
+    # 1. establishes only what it observed
+    ev = providers.evidence_from(200, {"x-jenkins": "2.4"}, "<title>Dashboard [Jenkins]</title>")
+    assert ev["technology"] == "jenkins" and ev["internet_facing"] is True
+    assert ev["authentication_required"] is False        # probed, got the page: real negative
+    assert providers.evidence_from(401, {"www-authenticate": "Basic"}, "")["authentication_required"]
+    assert providers.evidence_from(403, {}, "")["authentication_required"]
+    assert providers.evidence_from(302, {"location": "/login"}, "")["authentication_required"]
+    # fingerprinting reads the <title>, never loose body text: a page that links
+    # to gitlab is not gitlab. And unreachable establishes NOTHING.
+    assert "technology" not in providers.evidence_from(
+        200, {}, "<title>Home</title><a href='/x'>our gitlab and jenkins</a>")
+    assert providers.evidence_from(0, {}, "") == {}, "no answer must not mean 'not internet-facing'"
+
+    # 2. it never draws conclusions — those words belong to the rule engine
+    assert set(ev) <= set(engine._PREDICATES), "a provider may only assert engine vocabulary"
+    assert not {"priority", "confidence", "risk"} & set(ev)
+
+    # 3. SSRF guard: a discovered name pointing inward is never probed.
+    # IP literals + /etc/hosts only — getaddrinfo does no DNS for these.
+    for inward in ("127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254", "localhost"):
+        assert providers._resolvable_and_global(inward) is False, inward
+    assert providers._resolvable_and_global("8.8.8.8") is True
+
+    # 4. the payoff — same graph, same rules, better evidence
+    g = Graph()
+    g.add(Entity("subdomain", "jenkins.example.com", 1))
+    rules = engine.load_rules()
+    before = {c.rule: c.confidence for c in engine.evaluate(g, rules)}
+    assert "jenkins_suspected" in before and "jenkins_confirmed" not in before
+
+    g.nodes["subdomain:jenkins.example.com"].evidence.update(ev)   # provider speaks
+    after = {c.rule: c.confidence for c in engine.evaluate(g, rules)}
+    assert "jenkins_confirmed" in after, "probe evidence must fire the confirmed rule"
+    assert after["jenkins_suspected"] > before["jenkins_suspected"], "verified outranks suspected"
+
+    # 5. enrich() writes evidence and nothing else — discovery shape is untouched.
+    # probe() is stubbed so this stays offline and deterministic.
+    g.add(Entity("username", "someone", 1))     # not probeable — must be skipped
+    shape = (len(g.nodes), len(g.edges), len(g.findings))
+    real_probe = providers.probe
+    providers.probe = lambda host, timeout=8.0: {"internet_facing": True}
+    try:
+        assert providers.enrich(g) == 1, "only the subdomain is probeable"
+    finally:
+        providers.probe = real_probe
+    assert (len(g.nodes), len(g.edges), len(g.findings)) == shape
+    assert g.nodes["username:someone"].evidence == {}
+
+
 def test_pivot_offline_fanout():
     # max_depth=-1 forbids running any (network) module, so this stays offline.
     # An email seed still fans out into domain + username nodes before the loop.

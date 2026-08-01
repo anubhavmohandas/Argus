@@ -6,7 +6,7 @@ import json
 import os
 import sys
 
-from . import core, store
+from . import core, providers, store
 from .core import MODULES, run_module, run_all, sort_by_severity
 from .pivot import pivot, dossier, Budget, classify
 from .engine import investigate
@@ -66,6 +66,8 @@ def main(argv=None):
     pv.add_argument("--depth", type=int, default=2, help="max pivot depth (default 2)")
     pv.add_argument("--max", type=int, default=40, dest="max_entities", help="max entities (default 40)")
     pv.add_argument("--deep", type=int, default=0, help="re-pivot into N discovered subdomains (default 0)")
+    pv.add_argument("--probe", action="store_true",
+                    help="ACTIVE: connect to discovered hosts to establish evidence (off by default)")
     pv.add_argument("--no-memory", action="store_true", help="don't save this run or compare against past ones")
     pv.add_argument("--json", action="store_true")
 
@@ -92,6 +94,9 @@ def main(argv=None):
         past = [] if args.no_memory else store.history(args.seed)
         g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
                                     expand_subdomains=args.deep))
+        if args.probe:   # providers add evidence only — the engine is untouched by this
+            n = providers.enrich(g)
+            print(f"[argus] probed {n} host(s) — evidence attached", file=sys.stderr)
         result = investigate(g)   # discovery -> reasoning: the one result object
         if past:  # investigation memory — "I've seen this before"
             prev = past[-1]
