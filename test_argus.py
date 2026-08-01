@@ -70,24 +70,26 @@ def test_normalize_child_drops_junk():
     assert _normalize_child("ip", "1.2.3.4") == "1.2.3.4"
 
 
-def test_triage():
-    # the "200 CDN, ignore; 4 admin portals, high priority" pass, deterministic
-    from argus import triage
+def test_priority():
+    # triage folded into the engine: priority is now one read-only engine output.
+    from argus import engine
     g = Graph()
-    admin = Entity("subdomain", "admin.example.com", 1)
-    cdn = Entity("subdomain", "cdn-static.example.com", 1)
-    shop = Entity("subdomain", "shop.example.com", 1)
-    for e in (admin, cdn, shop):
-        g.add(e)
-    triage.prioritize(g)
-    assert admin.score > shop.score > cdn.score, (admin.score, shop.score, cdn.score)
-    assert "admin" in admin.tags and "noise" in cdn.tags
-    assert triage.top_priority(g)[0] is admin
-    assert "admin surface" in triage.why(admin)
+    for v in ("admin.example.com", "cdn-static.example.com", "shop.example.com"):
+        g.add(Entity("subdomain", v, 1))
+    r = engine.investigate(g)
+    score = {p.value: p.score for p in r.priority}
+    assert score["admin.example.com"] > score["shop.example.com"] > score["cdn-static.example.com"], score
+    assert r.interesting[0].value == "admin.example.com"          # look here first
+    assert "admin surface" in r.interesting[0].why
+    assert [p.value for p in r.noise] == ["cdn-static.example.com"]
+    # read-only: scoring must not mutate the evidence graph
+    before = g.to_dict()
+    engine.investigate(g)
+    assert g.to_dict() == before
     # a critical finding on an otherwise-boring host lifts it above the bare name
     g.findings.append(Finding("secrets", "shop.example.com", "AWS_ACCESS_KEY", core.CRITICAL))
-    triage.prioritize(g)
-    assert shop.score > admin.score
+    score2 = {p.value: p.score for p in engine.investigate(g).priority}
+    assert score2["shop.example.com"] > score2["admin.example.com"]
 
 
 def test_rules():

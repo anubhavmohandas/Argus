@@ -9,6 +9,7 @@ import sys
 from . import core, store
 from .core import MODULES, run_module, run_all, sort_by_severity
 from .pivot import pivot, dossier, Budget, classify
+from .engine import investigate
 
 _SEV_COLOR = {
     core.CRITICAL: "\033[1;31m", core.HIGH: "\033[31m", core.MEDIUM: "\033[33m",
@@ -91,17 +92,18 @@ def main(argv=None):
         past = [] if args.no_memory else store.history(args.seed)
         g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
                                     expand_subdomains=args.deep))
+        result = investigate(g)   # discovery -> reasoning: the one result object
         if past:  # investigation memory — "I've seen this before"
             prev = past[-1]
             print(f"[argus] seen before: {len(past)} prior investigation(s), "
                   f"last {prev.get('timestamp', '?')[:10]} — {store.compare_line(prev, g)}",
                   file=sys.stderr)
         if not args.no_memory:
-            store.save(args.seed, g)
+            store.save(args.seed, g)   # memory stores evidence; conclusions are re-derivable
         if args.json:
-            print(json.dumps(g.to_dict(), indent=2))
+            print(json.dumps({"graph": g.to_dict(), "investigation": result.to_dict()}, indent=2))
         else:
-            print(dossier(g))
+            print(dossier(g, result))
         return 0
 
     if args.cmd == "run":

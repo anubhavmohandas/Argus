@@ -28,7 +28,7 @@ another scan" — is the whole difference.
 
 ---
 
-## The eight principles
+## The nine principles
 
 ### 1. Discovery is deterministic
 The same seed produces the same graph. Enumeration, resolution, and
@@ -88,6 +88,19 @@ is as load-bearing as "graphs are the source of truth": an investigator must be
 able to re-run last week's investigation and trust that a changed conclusion
 means changed *evidence* — never a changed mood.
 
+### 9. Rule definitions are declarative; their parser cannot execute code
+Rule definitions must be declarative data, and the parser that loads them must
+not be capable of executing code — no `eval`, no serialization format that can
+carry a callable, no predicate a rule file defines for itself. This is why
+rules ship as TOML (stdlib `tomllib`, structurally codeless) and why the loader
+is a **structural allowlist**: a rule may only name predicates the engine
+already implements, and any unrecognised key is a load error, not a silent
+skip. Data that can become executable is not data — it is an attack surface,
+and in a security tool that is the one surface you never build. This principle
+outranks convenience: if a future rule needs logic the vocabulary can't
+express, the answer is a new predicate in engine code under review, never an
+escape hatch in the rule file.
+
 ---
 
 ## The Investigator Rule Engine
@@ -131,8 +144,12 @@ deterministic reasoning layer, fed by the graph, keeps it maintainable — and
 makes every new discovery module *compound* in value (new evidence → new rules
 fire → better investigation) instead of just producing more JSON.
 
-Today's `triage.py` is the standalone proto of this layer. It converges into
-the Rule Engine as its first output; it does not sit beside it.
+Triage was the standalone proto of this layer. As of Phase 3.1 it is **folded
+in**: priority and interestingness are `engine.investigate()`'s read-only
+scoring output, not a separate subsystem. Every consumer — the dossier, JSON,
+a future API, NYX — reads one `InvestigationResult` (`conclusions`, `priority`,
+`interesting`, `recommendations`, `ledger`, `fingerprint`), never engine
+internals. There is one reasoning authority.
 
 ### Two levels, so it stays both deterministic and extensible
 

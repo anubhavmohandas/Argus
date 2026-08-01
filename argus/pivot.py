@@ -70,7 +70,6 @@ class Graph:
     nodes: dict[str, Entity] = field(default_factory=dict)
     edges: list[tuple[str, str, str]] = field(default_factory=list)  # (src_key, rel, dst_key)
     findings: list[Finding] = field(default_factory=list)
-    conclusions: list = field(default_factory=list)  # Rule Engine output (derived, not evidence)
 
     def add(self, e: Entity, parent: Entity | None = None, rel: str = "") -> bool:
         new = e.key not in self.nodes
@@ -86,11 +85,10 @@ class Graph:
         """Serialize the whole graph. Used by --json output and the memory store."""
         return {
             "nodes": [{"type": e.type, "value": e.value, "depth": e.depth, "via": e.via,
-                       "tags": sorted(e.tags), "score": e.score}
+                       "evidence": e.evidence}
                       for e in self.nodes.values()],
             "edges": [{"src": s, "rel": r, "dst": d} for (s, r, d) in self.edges],
             "findings": [f.to_dict() for f in self.findings],
-            "conclusions": [c.to_dict() for c in self.conclusions],
         }
 
 
@@ -200,16 +198,12 @@ def pivot(seed: str, budget: Budget | None = None) -> Graph:
                     if g.add(child, ent, rel) and child.depth <= budget.max_depth:
                         queue.append(child)
     g.findings = sort_by_severity(g.findings)
-    prioritize(g)   # score/tag every node so the graph itself says what matters
-    try:
-        g.conclusions = evaluate(g)   # Rule Engine: deterministic conclusions + ledgers
-    except (ValueError, OSError):
-        g.conclusions = []            # a broken rule file must not kill a live investigation
-    return g
+    return g   # discovery produces the evidence graph; reasoning is engine.investigate(g)
 
 
-def dossier(g: Graph) -> str:
-    """Human-readable intelligence brief from a pivot graph."""
+def dossier(g: Graph, result) -> str:
+    """Human-readable intelligence brief from a pivot graph + its InvestigationResult.
+    Consumes only the result object — never engine internals."""
     lines = ["═" * 60, " ARGUS DOSSIER", "═" * 60]
     by_type: dict[str, list[Entity]] = {}
     for e in g.nodes.values():
@@ -223,16 +217,15 @@ def dossier(g: Graph) -> str:
             more = f"  (+{len(ents) - 12} more)" if len(ents) > 12 else ""
             lines.append(f"   {t:<10} {len(ents):>3}  {vals}{more}")
 
-    top_p = top_priority(g, 10)
+    top_p = result.interesting[:10]
     if top_p:
-        lines.append("\n PRIORITY TRIAGE  (what an investigator looks at first)")
-        for e in top_p:
-            lines.append(f"   [{e.score:>4.0f}] {e.type:<9} {e.value:<34} {why(e)}")
-        noise = sum(1 for e in g.nodes.values() if "noise" in e.tags)
-        if noise:
-            lines.append(f"   deprioritized (CDN/static/plumbing): {noise}")
+        lines.append("\n PRIORITY  (what an investigator looks at first)")
+        for p in top_p:
+            lines.append(f"   [{p.score:>4.0f}] {p.type:<9} {p.value:<34} {p.why}")
+        if result.noise:
+            lines.append(f"   deprioritized (CDN/static/plumbing): {len(result.noise)}")
 
-    concl = [c for c in g.conclusions if c.priority != "noise"]
+    concl = [c for c in result.conclusions if c.priority != "noise"]
     if concl:
         lines.append("\n INVESTIGATOR CONCLUSIONS  (deterministic — every score is traceable)")
         for c in concl[:8]:

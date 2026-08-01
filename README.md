@@ -82,20 +82,24 @@ auto-registers and the pivot engine can chain it.
 ```
 core.py     finding model · module registry · validated HTTP · input guards
 modules.py  built-in recon modules (the hands)
-pivot.py    the Investigation Engine — bounded BFS correlation over an entity graph
-triage.py   deterministic "what matters" reasoning over that graph
+pivot.py    discovery — bounded BFS correlation into an entity graph
+engine.py   Investigator Rule Engine — read-only reasoning: rules, priority, conclusions, ledger
+rules/      declarative TOML rule files (data, never code)
 cli.py      pivot / run / all / modules
 ```
 
-The deterministic reasoning stack (pivot + triage, and the Investigator Rule
-Engine to come) **is** the Investigation Engine — the identity of the system.
-See [`docs/ENGINEERING_PRINCIPLES.md`](docs/ENGINEERING_PRINCIPLES.md).
+Discovery (`pivot`) builds the evidence graph; the **Investigator Rule Engine**
+(`engine.investigate`) reasons over it read-only and returns one
+`InvestigationResult` that every consumer reads. Together they **are** the
+Investigation Engine — the identity of the system. Priority/triage is now one
+engine output, not a separate pass. See
+[`docs/ENGINEERING_PRINCIPLES.md`](docs/ENGINEERING_PRINCIPLES.md).
 
 ## Roadmap
 
-- **Investigator Rule Engine** — data-defined rules over the graph that emit
-  priorities, hypotheses, and recommendations with *traceable* confidence
-  scores. Deterministic; see the principles doc.
+- **Evidence providers** — modules that assert probe facts (e.g. ExploitDB →
+  `public_exploit`, a TLS probe → `certificate_reused`) so existing rules fire
+  on real evidence. No engine/rule changes — just better evidence.
 - **Optional LLM layer (NYX)** — sits *above* the engine to explain,
   summarize, converse, and answer questions over its output. It never decides
   investigation logic — that stays deterministic (Rule 7).
