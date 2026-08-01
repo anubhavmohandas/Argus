@@ -28,7 +28,7 @@ another scan" — is the whole difference.
 
 ---
 
-## The seven principles
+## The eight principles
 
 ### 1. Discovery is deterministic
 The same seed produces the same graph. Enumeration, resolution, and
@@ -78,6 +78,15 @@ It may **not** collect, correlate, score, prioritize, or decide what to
 investigate. Those are deterministic and stay in the engine. Argus is fully
 useful with no LLM present; the LLM makes it *feel* like working with another
 investigator. Neither project depends on the other.
+
+### 8. Reasoning is reproducible
+Given the same graph, the same rule set, and the same engine version, Argus
+produces identical conclusions. No randomness, no temperature, no hidden state,
+no nondeterminism. `engine.fingerprint(graph, rules)` hashes the evidence and
+the rules; if it is unchanged, the conclusions are guaranteed unchanged. This
+is as load-bearing as "graphs are the source of truth": an investigator must be
+able to re-run last week's investigation and trust that a changed conclusion
+means changed *evidence* — never a changed mood.
 
 ---
 
@@ -151,15 +160,20 @@ steps are deterministic, both are logged.
 
 A new piece of investigator knowledge is a new data entry — never an engine
 change. A generic evaluator walks the rule set; adding rule #120 touches no
-Python, it adds a file:
+Python, it adds a file. Rules ship as **TOML** (`argus/rules/*.toml`) — parsed
+by stdlib `tomllib`, zero dependencies, and a format that structurally *cannot*
+express code, which enforces the boundary below rather than trusting authors to
+respect it. The schema is identical in any serialization; the shape is:
 
 ```yaml
-id: exposed_jenkins
+id: jenkins_suspected
 requires:
-  technology: Jenkins
-  internet_facing: true
-base_confidence: 55
+  name_suggests_technology: jenkins
+  publicly_discoverable: true
+base_confidence: 40
 adjustments:
+  - if: internet_facing      # probe-confirmed; raises a lead toward a fact
+    add: 15
   - if: public_exploit
     add: 10
 outputs:
@@ -180,7 +194,10 @@ become executable. No `eval`, no `if:` expression that evaluates as Python, no
 plugin hook that runs rule-supplied code. The condition vocabulary
 (`public_exploit`, `internet_facing`, …) is a closed set the engine resolves
 against the graph — extend it in the engine, under review, not from a rule
-file.
+file. Enforcement is a **structural allowlist**: exactly the keys above, and
+anything the schema doesn't recognise is a load error. A denylist of scary
+words only catches what we thought of, and silently accepts a typo'd
+`[[adjustment]]` that then never fires.
 
 ### Predicates vs. evidence providers
 
@@ -189,6 +206,34 @@ A rule references **predicates** (`internet_facing`, `public_exploit`,
 *who discovered it*. **Evidence providers** — the discovery modules — set those
 predicates on the graph: a certificate analyzer writes `certificate_reused =
 true`, and every rule referencing that predicate now fires.
+
+**Predicates are three-valued: true / false / unknown.** Absence of an
+assertion is `unknown`, never `false` — *"nobody checked"* and *"checked, it
+isn't"* are different claims (invariant I-1). Silence never satisfies a
+requirement, so a rule asking for `authentication_required = false` will not
+fire on a host no one probed. The ledger renders unknowns as `?` and lists
+them, which turns them into the operator's work queue: each one is a number
+the confidence does *not* yet account for.
+
+**The vocabulary has two tiers, and the names say which.**
+
+| Tier | Examples | Established by |
+|---|---|---|
+| **Discovery** — observations | `publicly_discoverable`, `name_suggests_admin`, `name_suggests_preprod`, `name_suggests_cdn`, `name_suggests_technology` | a public source, or the hostname itself. Determinate — the name is fully known. |
+| **Probe** — facts about the host | `internet_facing`, `has_admin_interface`, `technology`, `authentication_required`, `public_exploit` | something that actually checked. `unknown` until then; never inferred from a name or an entity type. |
+
+A hostname containing `admin` is a **lead**, not a finding. Calling that
+predicate `has_admin_interface` would have Argus reporting a name as a fact —
+so the name-derived one is called `name_suggests_admin`, and
+`has_admin_interface` is reserved for a probe. Confidence follows the same
+split: a rule's base is what the name justifies, and the probe-confirmed
+predicate is an adjustment on top. That gap *is* the difference between
+suspected and verified, expressed in a number.
+
+Because `requires` is AND-only by design, the two tiers usually mean two
+rules rather than an OR in the schema — `jenkins_suspected` (name) and
+`jenkins_confirmed` (probe). Two rules, two confidences, two provenance
+trails, no evaluator change.
 
 This is what makes the closed-vocabulary trade-off livable. **A new module
 feeding an existing predicate needs no engine change** — it just produces
@@ -201,7 +246,7 @@ something Argus reasons about.
 
 Once the engine is stable, one capability comes almost for free: a rule's
 output can itself become a predicate another rule consumes. `internet_facing +
-public_exploit + admin_interface` → derived fact `high_value_exposed_service`
+public_exploit + has_admin_interface` → derived fact `high_value_exposed_service`
 → a priority rule consumes that. This is **bounded forward-chaining over
 derived facts, not arbitrary recursion** — still declarative, still fully
 explainable (the ledger gains one hop). v1 does **not** build this, but v1 must

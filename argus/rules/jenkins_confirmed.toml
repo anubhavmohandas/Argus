@@ -1,0 +1,37 @@
+# The probe-confirmed counterpart of jenkins_suspected.toml. Fires when
+# something actually established what the host runs — regardless of its name.
+# Higher base: this is a fact, not a lead.
+id = "jenkins_confirmed"
+name = "Jenkins CI surface confirmed"
+description = "A probe established that this publicly discoverable host runs Jenkins — an administrative CI interface."
+base_confidence = 65
+tags = ["ci", "admin", "exposure"]
+version = 1
+
+[requires]
+technology = "jenkins"
+publicly_discoverable = true
+
+[[adjustments]]
+if = "internet_facing"
+add = 10
+
+[[adjustments]]
+if = "public_exploit"
+add = 10
+
+[[adjustments]]
+if = "known_exploited"
+add = 15
+
+[[adjustments]]
+if = "authentication_required"
+subtract = 20
+
+[outputs]
+priority = "high"
+recommendation = [
+    "Confirm authentication is enforced on the Jenkins instance",
+    "Check Jenkins core + plugin versions against known CVEs",
+]
+hypothesis = ["An administrative CI interface may be externally accessible"]

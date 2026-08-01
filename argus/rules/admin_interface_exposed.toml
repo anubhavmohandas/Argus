@@ -1,0 +1,32 @@
+# v2: the name is the lead; `has_admin_interface` is the probe-verified fact.
+# The +25 gap between them is the difference between suspected and verified.
+id = "admin_interface_exposed"
+name = "Administrative interface suspected"
+description = "A publicly discoverable host whose name signals an admin/portal/dashboard surface."
+base_confidence = 30
+tags = ["admin", "exposure"]
+version = 2
+
+[requires]
+name_suggests_admin = true
+publicly_discoverable = true
+
+[[adjustments]]
+if = "has_admin_interface"    # a probe found a real admin surface
+add = 25
+
+[[adjustments]]
+if = "public_exploit"
+add = 10
+
+[[adjustments]]
+if = "authentication_required"
+subtract = 20
+
+[outputs]
+priority = "high"
+recommendation = [
+    "Probe the host to confirm an administrative surface actually exists",
+    "Verify authentication and IP allow-listing on the admin surface",
+]
+hypothesis = ["An administrative surface is reachable without a VPN"]

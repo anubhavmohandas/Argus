@@ -1,0 +1,48 @@
+# Investigator rule — data, never code. The engine interprets this; it never
+# executes it. Schema: id/name/description/base_confidence/tags/version +
+# [requires] [[adjustments]] [outputs]. Predicate names must be in the engine's
+# closed vocabulary (argus/engine.py:_PREDICATES) or the rule fails to load.
+#
+# v2: the *name* signal only. A hostname containing "jenkins" is a lead, not a
+# fingerprint. `requires` is AND-only by design, so the probe-confirmed case is
+# its own rule (jenkins_confirmed.toml) rather than an OR in the schema — two
+# rules, two confidences, two provenance trails.
+id = "jenkins_suspected"
+name = "Jenkins CI surface suspected (name signal)"
+description = "A publicly discoverable host whose name signals a Jenkins CI server — an administrative interface an attacker may be able to reach directly."
+base_confidence = 40
+tags = ["ci", "admin", "exposure"]
+version = 2
+
+[requires]
+name_suggests_technology = "jenkins"
+publicly_discoverable = true
+
+[[adjustments]]
+if = "internet_facing"        # a probe confirmed it actually answers
+add = 15
+
+[[adjustments]]
+if = "technology"             # a probe confirmed what it runs
+add = 10
+
+[[adjustments]]
+if = "public_exploit"
+add = 10
+
+[[adjustments]]
+if = "known_exploited"
+add = 15
+
+[[adjustments]]
+if = "authentication_required"
+subtract = 20
+
+[outputs]
+priority = "high"
+recommendation = [
+    "Probe the host to confirm it is reachable and actually runs Jenkins",
+    "Confirm authentication is enforced on the Jenkins instance",
+    "Check Jenkins core + plugin versions against known CVEs",
+]
+hypothesis = ["An administrative CI interface may be externally accessible"]

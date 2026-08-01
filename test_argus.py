@@ -90,6 +90,97 @@ def test_triage():
     assert shop.score > admin.score
 
 
+def test_rules():
+    # Investigator Rule Engine: deterministic conclusions + traceable ledger.
+    from argus import engine
+    g = Graph()
+    g.add(Entity("subdomain", "jenkins.example.com", 1, evidence={"public_exploit": True}))
+    rules = engine.load_rules()  # the shipped TOML rule files parse + validate
+
+    c1 = engine.evaluate(g, rules)
+    jc = [c for c in c1 if c.rule == "jenkins_suspected"]
+    assert jc, [c.rule for c in c1]
+    # name-only lead (40) + public exploit (10). Reaching 65 needs probe facts —
+    # the name alone must never score like a verified finding.
+    assert jc[0].confidence == 50 and jc[0].priority == "high", jc[0]
+    calc = jc[0].ledger["calculation"]                    # 40 base, +10 public_exploit -> traceable
+    assert calc[0] == {"step": "base", "delta": 40}
+    assert {"step": "public_exploit", "delta": 10} in calc
+    assert jc[0].rule_version == 2, jc[0]                 # provenance: which rule version concluded this
+
+    # Principle 8 — reproducible: same graph + same rules => identical output + hash
+    c2 = engine.evaluate(g, rules)
+    assert [c.to_dict() for c in c1] == [c.to_dict() for c in c2]
+    assert engine.output_hash(c1) == engine.output_hash(c2)
+    fp = engine.fingerprint(g, rules)
+    assert fp == engine.fingerprint(g, rules)
+
+    # read-only: evaluation must not mutate the evidence graph
+    before = g.to_dict()["nodes"]
+    engine.evaluate(g, rules)
+    assert g.to_dict()["nodes"] == before
+
+    # changing the graph changes the fingerprint (and therefore the conclusions)
+    g.add(Entity("subdomain", "admin.example.com", 1))
+    assert engine.fingerprint(g, rules) != fp
+
+    # confidence is clamped to 0..100 — never exceeds what evidence justifies
+    hi = engine.evaluate(g, [{"id": "hi", "base_confidence": 95, "requires": {"publicly_discoverable": True},
+                              "adjustments": [{"if": "public_exploit", "add": 50}], "outputs": {}}])
+    assert all(c.confidence <= 100 for c in hi) and any(c.confidence == 100 for c in hi)
+    g.nodes["subdomain:admin.example.com"].evidence["authentication_required"] = True
+    lo = engine.evaluate(g, [{"id": "lo", "base_confidence": 10, "requires": {"name_suggests_admin": True},
+                              "adjustments": [{"if": "authentication_required", "subtract": 50}], "outputs": {}}])
+    assert all(c.confidence >= 0 for c in lo) and any(c.confidence == 0 for c in lo)
+
+    # closed vocabulary: an unknown predicate is rejected, not silently ignored
+    try:
+        engine.evaluate(g, [{"id": "x", "requires": {"made_up_predicate": True}}]); assert False
+    except engine.RuleError:
+        pass
+    # security invariant: a rule carrying an executable key is rejected at load
+    try:
+        engine.evaluate(g, [{"id": "x", "python": "import os"}]); assert False
+    except engine.RuleError:
+        pass
+    # allowlist, not denylist: a typo'd key is rejected too, rather than silently
+    # ignored (a rule that quietly never fires is the bug you never find)
+    try:
+        engine.evaluate(g, [{"id": "x", "adjustment": [{"if": "public_exploit"}]}]); assert False
+    except engine.RuleError:
+        pass
+
+    # two-tier vocabulary: a name is a lead, a probe is a fact. A probe fact is
+    # never inferred from a hostname, and verifying it must raise confidence.
+    g4 = Graph()
+    g4.add(Entity("subdomain", "admin.example.com", 1))
+    bare = g4.nodes["subdomain:admin.example.com"]
+    assert engine._PREDICATES["name_suggests_admin"](bare, g4) is True
+    assert engine._PREDICATES["has_admin_interface"](bare, g4) is None, \
+        "a probe fact must stay unknown until something actually probed"
+    lead = engine.evaluate(g4, rules)
+    bare.evidence["has_admin_interface"] = True
+    assert engine.evaluate(g4, rules)[0].confidence > lead[0].confidence, "verified must outrank suspected"
+
+    # I-1 — unknown is not false. Nobody probed this host for authentication.
+    g3 = Graph()
+    g3.add(Entity("subdomain", "unchecked.example.com", 1))
+    silent = [{"id": "assumes_no_auth", "base_confidence": 50,
+               "requires": {"authentication_required": False}, "outputs": {}}]
+    assert engine.evaluate(g3, silent) == [], \
+        "silence must never satisfy a requirement — that is inventing negative evidence"
+    # and an unchecked adjustment reads as '?', never as a negative
+    g3.nodes["subdomain:unchecked.example.com"].evidence["has_admin_interface"] = True
+    partial = engine.evaluate(g3, [{"id": "p", "base_confidence": 50,
+                                    "requires": {"has_admin_interface": True},
+                                    "adjustments": [{"if": "authentication_required", "subtract": 20}],
+                                    "outputs": {}}])
+    assert partial[0].confidence == 50, partial[0]        # unchecked => no adjustment
+    lines = engine.ledger_lines(partial[0])
+    assert "? authentication_required" in lines[0], lines
+    assert "not established" in lines[-1], lines
+
+
 def test_memory():
     import os, tempfile
     from argus import store

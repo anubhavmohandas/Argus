@@ -1,0 +1,31 @@
+# v2: "publicly discoverable" is what discovery established. Whether the box
+# actually answers is a probe fact, and it raises confidence when confirmed.
+id = "preprod_weakness"
+name = "Pre-production environment discoverable"
+description = "Staging/dev/UAT/test environments are often internet-reachable and carry weaker controls than production."
+base_confidence = 35
+tags = ["preprod", "exposure"]
+version = 2
+
+[requires]
+name_suggests_preprod = true
+publicly_discoverable = true
+
+[[adjustments]]
+if = "internet_facing"        # a probe confirmed it answers
+add = 15
+
+[[adjustments]]
+if = "name_suggests_admin"
+add = 10
+
+[[adjustments]]
+if = "authentication_required"
+subtract = 15
+
+[outputs]
+priority = "medium"
+recommendation = [
+    "Confirm pre-prod is not sharing credentials or data with production",
+]
+hypothesis = ["Weaker pre-prod controls may expose a path toward production"]

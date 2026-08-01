@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 from . import core
 from .core import Finding, run_module, sort_by_severity
-from .triage import prioritize, top_priority, why
+from .engine import ledger_lines
 
 # What modules to run for each entity type. Order = cheap/authoritative first.
 _PLAN: dict[str, list[str]] = {
@@ -58,8 +58,7 @@ class Entity:
     value: str
     depth: int
     via: str = "seed"          # how we discovered it
-    tags: set = field(default_factory=set)   # triage labels (admin, cdn/noise, ...)
-    score: float = 0.0         # how much an investigator should care (triage.py)
+    evidence: dict = field(default_factory=dict)  # predicate flags for the rule engine (set by evidence providers)
 
     @property
     def key(self) -> str:
@@ -71,6 +70,7 @@ class Graph:
     nodes: dict[str, Entity] = field(default_factory=dict)
     edges: list[tuple[str, str, str]] = field(default_factory=list)  # (src_key, rel, dst_key)
     findings: list[Finding] = field(default_factory=list)
+    conclusions: list = field(default_factory=list)  # Rule Engine output (derived, not evidence)
 
     def add(self, e: Entity, parent: Entity | None = None, rel: str = "") -> bool:
         new = e.key not in self.nodes
@@ -90,6 +90,7 @@ class Graph:
                       for e in self.nodes.values()],
             "edges": [{"src": s, "rel": r, "dst": d} for (s, r, d) in self.edges],
             "findings": [f.to_dict() for f in self.findings],
+            "conclusions": [c.to_dict() for c in self.conclusions],
         }
 
 
@@ -200,6 +201,10 @@ def pivot(seed: str, budget: Budget | None = None) -> Graph:
                         queue.append(child)
     g.findings = sort_by_severity(g.findings)
     prioritize(g)   # score/tag every node so the graph itself says what matters
+    try:
+        g.conclusions = evaluate(g)   # Rule Engine: deterministic conclusions + ledgers
+    except (ValueError, OSError):
+        g.conclusions = []            # a broken rule file must not kill a live investigation
     return g
 
 
@@ -226,6 +231,18 @@ def dossier(g: Graph) -> str:
         noise = sum(1 for e in g.nodes.values() if "noise" in e.tags)
         if noise:
             lines.append(f"   deprioritized (CDN/static/plumbing): {noise}")
+
+    concl = [c for c in g.conclusions if c.priority != "noise"]
+    if concl:
+        lines.append("\n INVESTIGATOR CONCLUSIONS  (deterministic — every score is traceable)")
+        for c in concl[:8]:
+            lines.append(f"   [{c.confidence:>3}%] {c.target:<34} {c.name}  · priority: {c.priority}")
+            for l in ledger_lines(c):
+                lines.append(f"          {l}")
+            for h in c.hypotheses:
+                lines.append(f"          ↳ hypothesis: {h}")
+            for r in c.recommendations:
+                lines.append(f"          ↳ recommend:  {r}")
 
     sev_counts: dict[str, int] = {}
     for f in g.findings:

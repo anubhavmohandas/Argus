@@ -1,0 +1,14 @@
+# v2: renamed predicate only — the name is all this rule ever looked at.
+id = "cdn_noise"
+name = "Public CDN / static plumbing"
+description = "CDN, static-asset, and edge hosts are public infrastructure — deprioritize so real surfaces stand out."
+base_confidence = 10
+tags = ["noise"]
+version = 2
+
+[requires]
+name_suggests_cdn = true
+
+[outputs]
+priority = "noise"
+recommendation = ["Deprioritize unless it fronts an origin you can reach"]

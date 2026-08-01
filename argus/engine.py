@@ -1,0 +1,483 @@
+"""Investigator Rule Engine — the deterministic brain of the Investigation Engine.
+
+Phase 3.1. Consumes an *immutable* investigation graph and produces conclusions,
+each with a confidence score and a full explanation ledger. It never mutates the
+graph, executes rule-supplied code, or performs discovery — see
+docs/ENGINEERING_PRINCIPLES.md ("The Rule Engine invariant").
+
+Rules are declarative data files (argus/rules/*.toml). A rule may only reference
+predicates in the closed vocabulary below (`_PREDICATES`); an unknown predicate,
+or any executable-looking key, fails to load. That is the "data must never
+become executable" security boundary, enforced at load time.
+
+Determinism (Principle 8): same graph + same rules + same engine => identical
+conclusions. `fingerprint()` proves it — no randomness, no hidden state.
+
+occam: predicate vocabulary is a closed dict resolved here, in engine code under
+review — the ONLY place new investigator words are added. Rule files just use
+them. Derived-facts / forward-chaining is deliberately out of v1.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .core import CRITICAL, HIGH, MEDIUM, LOW, INFO
+
+try:
+    import tomllib  # stdlib 3.11+
+except ModuleNotFoundError:  # pragma: no cover - engine still runs on inline rules
+    tomllib = None
+
+_RULES_DIR = Path(__file__).parent / "rules"
+
+_TOK = re.compile(r"[^a-z0-9]+")
+
+
+def _tokens(value: str) -> set[str]:
+    return {t for t in _TOK.split(value.lower()) if t}
+
+
+# --- investigator name vocabulary (folded in from the old triage.py) ------
+# One home for the name-signal knowledge, two views of it:
+#  · _TECH/_ADMIN/_PREPROD/_NOISE feed the name_suggests_* DISCOVERY predicates
+#    (categorical: does the name suggest admin? tech? cdn?).
+#  · _INTERESTING is the weighted view — how much an investigator should care —
+#    that drives the priority output.
+# occam: overlapping tokens, but they answer different questions (is-it-admin vs
+#        how-interesting); unify only if they start to drift.
+_TECH = {"jenkins", "gitlab", "grafana", "kibana", "phpmyadmin", "jira", "confluence"}
+_ADMIN = {"admin", "portal", "dashboard", "phpmyadmin", "sso"}
+_PREPROD = {"staging", "stage", "dev", "uat", "test"}
+
+# tokens meaning "public plumbing, deprioritize" — the CDN-noise bucket.
+_NOISE = {
+    "cdn", "static", "assets", "img", "images", "media", "www", "edge",
+    "cloudfront", "akamai", "fastly", "cachefly", "cdnjs", "gstatic",
+}
+
+# token -> (weight, why). Higher weight = an investigator should look sooner.
+_INTERESTING: dict[str, tuple[int, str]] = {
+    "admin": (5, "admin surface"),
+    "internal": (5, "meant to be internal"),
+    "vpn": (5, "remote access"),
+    "vault": (5, "secrets store"),
+    "jenkins": (5, "CI server"),
+    "gitlab": (5, "source control"),
+    "phpmyadmin": (5, "db admin surface"),
+    "git": (4, "source control"),
+    "sso": (4, "auth surface"),
+    "grafana": (4, "monitoring"),
+    "kibana": (4, "log access"),
+    "staging": (4, "pre-prod (often weaker)"),
+    "stage": (4, "pre-prod (often weaker)"),
+    "dev": (4, "dev (often weaker)"),
+    "uat": (4, "pre-prod (often weaker)"),
+    "corp": (4, "corporate surface"),
+    "db": (4, "database surface"),
+    "database": (4, "database surface"),
+    "sql": (4, "database surface"),
+    "backup": (4, "backups"),
+    "rdp": (4, "remote desktop"),
+    "test": (3, "test (often weaker)"),
+    "portal": (3, "app portal"),
+    "dashboard": (3, "app dashboard"),
+    "jira": (3, "internal tooling"),
+    "confluence": (3, "internal wiki"),
+    "storage": (3, "object storage"),
+    "s3": (3, "object storage"),
+    "ftp": (3, "file transfer"),
+    "ssh": (3, "remote shell"),
+    "api": (2, "api surface"),
+    "gateway": (2, "gateway"),
+    "mail": (1, "mail infra"),
+}
+
+_SEV_WEIGHT = {CRITICAL: 6, HIGH: 4, MEDIUM: 2, LOW: 1, INFO: 0}
+
+# Structural allowlist: exactly these keys, nothing else. A denylist of scary
+# words ("python", "eval", ...) only catches what we thought of, and silently
+# accepts a typo'd `[[adjustment]]` that then never fires. Everything the
+# schema doesn't recognise is a load error.
+_ALLOWED_KEYS = {"id", "name", "description", "base_confidence", "tags",
+                 "version", "requires", "adjustments", "outputs"}
+_ALLOWED_ADJUSTMENT_KEYS = {"if", "add", "subtract"}
+_ALLOWED_OUTPUT_KEYS = {"priority", "recommendation", "hypothesis"}
+
+
+class RuleError(ValueError):
+    """A rule file is malformed or references something outside the vocabulary."""
+
+
+# --- predicate resolvers (the closed vocabulary) --------------------------
+# Each resolver reads an entity (+ graph) and returns a value. `requires`
+# compares that value to the rule's expected one; `adjustments` use truthiness.
+# Resolvers are pure reads — they never write to the entity or graph.
+def _ev(name):
+    """Evidence-flag predicate: read what a provider asserted about the entity.
+
+    Absent => None (unknown), never False. "Nobody checked" and "checked, it
+    isn't" are different claims and Argus must never collapse them — that is
+    invariant I-1 (Argus never invents negative evidence).
+    """
+    return lambda e, g: (getattr(e, "evidence", {}) or {}).get(name)
+
+
+def _p_publicly_discoverable(e, g):
+    """We found it through a public source (DNS, CT, RDAP).
+
+    An observation about our own discovery — NOT a claim the host is
+    reachable. A hostname in a CT log may never have resolved.
+    """
+    return e.type in ("domain", "subdomain", "ip")
+
+
+def _p_name_suggests_technology(e, g):
+    for t in _tokens(e.value):
+        if t in _TECH:
+            return t
+    return None
+
+
+def _p_name_suggests_admin(e, g):
+    return bool(_tokens(e.value) & _ADMIN)
+
+
+def _p_name_suggests_preprod(e, g):
+    return bool(_tokens(e.value) & _PREPROD)
+
+
+def _p_name_suggests_cdn(e, g):
+    return bool(_tokens(e.value) & _NOISE)
+
+
+# The vocabulary, in two tiers — the distinction is the point.
+#
+#   DISCOVERY predicates are *observations*: what a public source showed us,
+#   or what the hostname itself says. Determinate, because the name is fully
+#   known. `name_suggests_admin` is a fact about the name, and says so.
+#
+#   PROBE predicates are *facts about the host*. Only something that actually
+#   checked can establish one, so they are evidence-backed only and stay
+#   `unknown` until a provider asserts them. They are never inferred from a
+#   name or an entity type.
+#
+# Keeping these apart is what stops "the hostname contains 'admin'" from being
+# reported as "this host has an admin interface" — and it lets confidence
+# distinguish suspected from verified.
+_PREDICATES = {
+    # discovery — observations
+    "publicly_discoverable": _p_publicly_discoverable,
+    "name_suggests_technology": _p_name_suggests_technology,
+    "name_suggests_admin": _p_name_suggests_admin,
+    "name_suggests_preprod": _p_name_suggests_preprod,
+    "name_suggests_cdn": _p_name_suggests_cdn,
+    # probe — facts, evidence-backed only
+    "internet_facing": _ev("internet_facing"),
+    "technology": _ev("technology"),
+    "has_admin_interface": _ev("has_admin_interface"),
+    "authentication_required": _ev("authentication_required"),
+    "public_exploit": _ev("public_exploit"),
+    "known_exploited": _ev("known_exploited"),
+    "certificate_reused": _ev("certificate_reused"),
+}
+# occam: no dns_resolves / http_reachable / tls_valid / certificate_seen yet —
+#        nothing asserts them and no rule reads them. Add each with its probe.
+
+
+@dataclass
+class Conclusion:
+    rule: str
+    name: str
+    target: str            # the entity value the conclusion is about
+    confidence: int        # clamped 0..100
+    priority: str
+    ledger: dict           # traceable: evidence checks + the confidence arithmetic
+    recommendations: list = field(default_factory=list)
+    hypotheses: list = field(default_factory=list)
+    tags: list = field(default_factory=list)
+    rule_version: int = 0  # provenance: which version of the rule concluded this
+
+    def to_dict(self) -> dict:
+        return {
+            "rule": self.rule, "rule_version": self.rule_version,
+            "name": self.name, "target": self.target,
+            "confidence": self.confidence, "priority": self.priority,
+            "ledger": self.ledger, "recommendations": self.recommendations,
+            "hypotheses": self.hypotheses, "tags": self.tags,
+        }
+
+
+# --- validation (trust boundary — rule files are data, never code) --------
+def _validate_rules(rules: list[dict]) -> None:
+    for r in rules:
+        rid = r.get("id")
+        if not rid:
+            raise RuleError(f"rule missing 'id': {r!r}")
+        bad = set(r) - _ALLOWED_KEYS
+        if bad:
+            raise RuleError(f"rule {rid!r} has key(s) outside the rule schema: {sorted(bad)}")
+        for adj in r.get("adjustments", []):
+            bad = set(adj) - _ALLOWED_ADJUSTMENT_KEYS
+            if bad:
+                raise RuleError(f"rule {rid!r} adjustment has unknown key(s): {sorted(bad)}")
+        bad = set(r.get("outputs", {})) - _ALLOWED_OUTPUT_KEYS
+        if bad:
+            raise RuleError(f"rule {rid!r} outputs has unknown key(s): {sorted(bad)}")
+        base = r.get("base_confidence", 0)
+        if not isinstance(base, int) or not 0 <= base <= 100:
+            raise RuleError(f"rule {rid!r} base_confidence must be an int 0..100, got {base!r}")
+        preds = set(r.get("requires", {})) | {a.get("if") for a in r.get("adjustments", [])}
+        unknown = preds - set(_PREDICATES)
+        if unknown:
+            raise RuleError(f"rule {rid!r} uses predicates outside the vocabulary: {sorted(unknown)}")
+
+
+def load_rules(rules_dir=None) -> list[dict]:
+    """Load + validate every *.toml rule. occam: TOML via stdlib tomllib — no dep,
+    and a format that structurally cannot carry code. 3.11+ for file loading."""
+    if tomllib is None:
+        raise RuleError("loading rule files needs Python 3.11+ (tomllib); pass rules to evaluate() directly otherwise")
+    d = Path(rules_dir) if rules_dir else _RULES_DIR
+    rules = []
+    for fp in sorted(d.glob("*.toml")):
+        with open(fp, "rb") as fh:
+            rules.append(tomllib.load(fh))
+    _validate_rules(rules)
+    return rules
+
+
+# --- evaluation -----------------------------------------------------------
+def _requirement_met(pred: str, expected, e, g) -> bool | None:
+    """True / False / None, where None means 'nobody established this'.
+
+    I-1: silence never satisfies a requirement. A rule asking for
+    `authentication_required = false` must NOT fire on a host no one ever
+    probed — that would be Argus concluding a negative it never checked.
+    """
+    actual = _PREDICATES[pred](e, g)
+    if actual is None:
+        return None
+    if isinstance(expected, bool):
+        return bool(actual) == expected
+    return str(actual).lower() == str(expected).lower()
+
+
+def _evaluate_rule(rule: dict, e, g) -> Conclusion | None:
+    """Fire `rule` against entity `e` if its requirements hold; else None."""
+    evidence = []
+    for pred, expected in sorted(rule.get("requires", {}).items()):
+        met = _requirement_met(pred, expected, e, g)
+        evidence.append({"predicate": pred, "expected": expected, "met": met})
+        if met is not True:
+            return None  # failed (False) or unestablished (None) — rule does not fire
+
+    base = int(rule.get("base_confidence", 0))
+    calc = [{"step": "base", "delta": base}]
+    conf = base
+    for adj in rule.get("adjustments", []):
+        pred = adj["if"]
+        delta = int(adj.get("add", 0)) - int(adj.get("subtract", 0))
+        actual = _PREDICATES[pred](e, g)
+        applied = None if actual is None else bool(actual)   # None = never checked
+        evidence.append({"predicate": pred, "applied": applied, "delta": delta})
+        if applied:
+            conf += delta
+            calc.append({"step": pred, "delta": delta})
+    final = max(0, min(100, conf))  # clamp — confidence never exceeds evidence
+
+    out = rule.get("outputs", {})
+    return Conclusion(
+        rule=rule["id"], rule_version=int(rule.get("version", 0)),
+        name=rule.get("name", rule["id"]), target=e.value,
+        confidence=final, priority=out.get("priority", "info"),
+        ledger={"evidence": evidence, "calculation": calc, "final": final},
+        recommendations=list(out.get("recommendation", [])),
+        hypotheses=list(out.get("hypothesis", [])),
+        tags=list(rule.get("tags", [])),
+    )
+
+
+def evaluate(g, rules=None) -> list[Conclusion]:
+    """Read-only pass over the graph → deterministic conclusions with ledgers.
+
+    One graph, one walk: for each entity, each rule that fires. No recursion,
+    no mutation of `g`. Deterministic order: entities by key, rules by id,
+    conclusions ranked by (confidence desc, target, rule)."""
+    rules = rules if rules is not None else load_rules()
+    _validate_rules(rules)
+    rules = sorted(rules, key=lambda r: r["id"])
+    entities = sorted(g.nodes.values(), key=lambda e: e.key)
+
+    out = []
+    for e in entities:
+        for rule in rules:
+            c = _evaluate_rule(rule, e, g)
+            if c is not None:
+                out.append(c)
+    out.sort(key=lambda c: (-c.confidence, c.target, c.rule))
+    return out
+
+
+# --- reproducibility (Principle 8) ----------------------------------------
+def _graph_digest(g) -> dict:
+    """Canonical, sorted view of the evidence that conclusions depend on."""
+    return {
+        "nodes": sorted(
+            [e.type, e.value.lower(), sorted((getattr(e, "evidence", {}) or {}).items())]
+            for e in g.nodes.values()
+        ),
+        "edges": sorted([s, r, d] for (s, r, d) in getattr(g, "edges", [])),
+        "findings": sorted([f.module, f.target.lower(), f.title, f.severity] for f in g.findings),
+    }
+
+
+def fingerprint(g, rules=None) -> str:
+    """sha256 over (graph evidence + rule set). Same inputs => same hash =>
+    same conclusions. This is the reproducibility guarantee, made checkable."""
+    rules = rules if rules is not None else load_rules()
+    payload = json.dumps({"graph": _graph_digest(g), "rules": sorted(rules, key=lambda r: r.get("id", ""))},
+                         sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def output_hash(conclusions: list[Conclusion]) -> str:
+    return hashlib.sha256(json.dumps([c.to_dict() for c in conclusions], sort_keys=True).encode()).hexdigest()
+
+
+# --- rendering (used by the dossier) --------------------------------------
+_MARK = {True: "✓", False: "✗", None: "?"}   # ? = nobody established this (I-1)
+
+
+def ledger_lines(c: Conclusion) -> list[str]:
+    """The explanation ledger as compact human lines — nothing hidden.
+
+    Three marks, not two: `?` means unchecked, and never reads as a negative.
+    """
+    ev, unknown = [], []
+    for chk in c.ledger["evidence"]:
+        if "met" in chk:
+            state = chk["met"]
+            ev.append(f"{_MARK[state]} {chk['predicate']}={chk['expected']}")
+        else:
+            state = chk["applied"]
+            sign = f"({'+' if chk['delta'] >= 0 else ''}{chk['delta']})"
+            ev.append(f"{_MARK[state]} {chk['predicate']}{sign}")
+        if state is None:
+            unknown.append(chk["predicate"])
+    calc = " ".join(
+        (f"{s['delta']}" if s["step"] == "base" else f"{'+' if s['delta'] >= 0 else ''}{s['delta']}")
+        for s in c.ledger["calculation"]
+    )
+    lines = [f"why:  {'  '.join(ev)}", f"calc: {calc} = {c.ledger['final']}"]
+    if unknown:
+        # unknowns aren't noise — each one is the next thing worth checking,
+        # and each is a number this confidence does NOT account for.
+        lines.append(f"open: not established — {', '.join(unknown)}")
+    return lines
+
+
+# --- priority (triage, folded in as an engine output) ---------------------
+@dataclass
+class PriorityItem:
+    """Where an investigator should look, and why. A read-only score over the
+    name + findings — the old triage.py, now one output of this engine."""
+    value: str
+    type: str
+    score: float
+    why: str
+    reasons: list = field(default_factory=list)   # the interesting tokens matched
+    noise: bool = False
+
+    def to_dict(self) -> dict:
+        return {"value": self.value, "type": self.type, "score": self.score,
+                "why": self.why, "reasons": self.reasons, "noise": self.noise}
+
+
+def _priority(g) -> list[PriorityItem]:
+    """Rank every entity by how much it deserves attention. Pure read over the
+    graph — like the whole engine, it never mutates a node ("200 CDN, ignore;
+    4 admin portals, look first")."""
+    findings_by_target: dict[str, list] = {}
+    for f in g.findings:
+        findings_by_target.setdefault(f.target.lower(), []).append(f)
+
+    items = []
+    for e in g.nodes.values():
+        toks = _tokens(e.value)
+        matched = sorted(toks & _INTERESTING.keys())
+        score = float(sum(_INTERESTING[t][0] for t in matched))
+        noise = bool(toks & _NOISE)
+        if noise:
+            score -= 3
+        for f in findings_by_target.get(e.value.lower(), []):
+            score += _SEV_WEIGHT.get(f.severity, 0)
+        why = ", ".join(dict.fromkeys(_INTERESTING[t][1] for t in matched))
+        if not why and noise:
+            why = "public CDN/static plumbing"
+        items.append(PriorityItem(e.value, e.type, score, why, matched, noise))
+    items.sort(key=lambda p: (-p.score, p.value))   # deterministic
+    return items
+
+
+# --- the one result object every consumer reads ---------------------------
+@dataclass
+class InvestigationResult:
+    """The single object the dossier, JSON output, an API, or NYX all consume —
+    never engine internals. Everything the Rule Engine concluded about a graph."""
+    conclusions: list          # Conclusion, ranked by confidence
+    priority: list             # PriorityItem, every entity ranked by score
+    fingerprint: str           # reproducibility hash of (graph + rules)
+
+    @property
+    def interesting(self) -> list:
+        """What to look at first: scored above zero and not plumbing."""
+        return [p for p in self.priority if p.score > 0 and not p.noise]
+
+    @property
+    def noise(self) -> list:
+        return [p for p in self.priority if p.noise]
+
+    @property
+    def recommendations(self) -> list:
+        """Deduped, in confidence order — flattened from the conclusions."""
+        seen: list = []
+        for c in self.conclusions:
+            for r in c.recommendations:
+                if r not in seen:
+                    seen.append(r)
+        return seen
+
+    @property
+    def ledger(self) -> list:
+        """The full explainability trail: one traceable ledger per conclusion."""
+        return [{"target": c.target, "rule": c.rule, **c.ledger} for c in self.conclusions]
+
+    def to_dict(self) -> dict:
+        return {
+            "conclusions": [c.to_dict() for c in self.conclusions],
+            "priority": [p.to_dict() for p in self.priority],
+            "recommendations": self.recommendations,
+            "fingerprint": self.fingerprint,
+        }
+
+
+def investigate(g, rules=None) -> InvestigationResult:
+    """Reason over a discovered graph → one InvestigationResult. The only
+    reasoning entry point; discovery (pivot) hands its graph here.
+
+    Degrades to name-based priority if the rule files are unavailable — a
+    broken rule set must not blank out a live investigation. Determinism and
+    the closed-vocabulary/executable-key errors still surface via evaluate()."""
+    conclusions: list = []
+    fp = ""
+    try:
+        rules = rules if rules is not None else load_rules()
+        conclusions = evaluate(g, rules)
+        fp = fingerprint(g, rules)
+    except (ValueError, OSError):
+        pass  # occam: rules missing/broken -> priority-only result, no conclusions
+    return InvestigationResult(conclusions=conclusions, priority=_priority(g), fingerprint=fp)
