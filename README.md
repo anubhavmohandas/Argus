@@ -95,6 +95,12 @@ Investigation Engine — the identity of the system. Priority/triage is now one
 engine output, not a separate pass. See
 [`docs/ENGINEERING_PRINCIPLES.md`](docs/ENGINEERING_PRINCIPLES.md).
 
+**Silence is never a negative.** Argus distinguishes an observation, a
+probe-backed fact, and an unknown — and never collapses them. Where another
+tool reports "no exploit found," Argus reports "exploit status unknown — no
+evidence provider asserted either state." Every conclusion is reproducible from
+versioned evidence and inference rules; nothing is inferred from absence.
+
 ## Roadmap
 
 - **Evidence providers** — modules that assert probe facts (e.g. ExploitDB →
