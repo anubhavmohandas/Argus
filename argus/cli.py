@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
-from . import core
+from . import core, store
 from .core import MODULES, run_module, run_all, sort_by_severity
 from .pivot import pivot, dossier, Budget, classify
 
@@ -16,6 +17,29 @@ _SEV_COLOR = {
 _RESET = "\033[0m"
 
 
+def _color_enabled() -> bool:
+    """ANSI only when it'll render: a real terminal, NO_COLOR unset, and on
+    Windows 10+ after enabling virtual-terminal processing. Keeps output clean
+    when piped/redirected and on legacy consoles — same behavior every OS."""
+    if os.environ.get("NO_COLOR") is not None or not sys.stdout.isatty():
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_uint32()
+            if not k.GetConsoleMode(h, ctypes.byref(mode)):
+                return False
+            k.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            return False
+    return True
+
+
+_COLOR = _color_enabled()
+
+
 def _print_findings(findings, as_json: bool):
     if as_json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))
@@ -24,8 +48,9 @@ def _print_findings(findings, as_json: bool):
         print("  (no findings)")
         return
     for f in sort_by_severity(findings):
-        c = _SEV_COLOR.get(f.severity, "")
-        print(f"  {c}[{f.severity:<8}]{_RESET} {f.module:<11} {f.title}")
+        c = _SEV_COLOR.get(f.severity, "") if _COLOR else ""
+        r = _RESET if _COLOR else ""
+        print(f"  {c}[{f.severity:<8}]{r} {f.module:<11} {f.title}")
         for k, v in (f.data or {}).items():
             if v:
                 print(f"      {k}: {v}")
@@ -40,6 +65,7 @@ def main(argv=None):
     pv.add_argument("--depth", type=int, default=2, help="max pivot depth (default 2)")
     pv.add_argument("--max", type=int, default=40, dest="max_entities", help="max entities (default 40)")
     pv.add_argument("--deep", type=int, default=0, help="re-pivot into N discovered subdomains (default 0)")
+    pv.add_argument("--no-memory", action="store_true", help="don't save this run or compare against past ones")
     pv.add_argument("--json", action="store_true")
 
     rn = sub.add_parser("run", help="Run one module against a target")
@@ -62,15 +88,18 @@ def main(argv=None):
 
     if args.cmd == "pivot":
         print(f"[argus] seed {args.seed!r} classified as: {classify(args.seed)}", file=sys.stderr)
+        past = [] if args.no_memory else store.history(args.seed)
         g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
                                     expand_subdomains=args.deep))
+        if past:  # investigation memory — "I've seen this before"
+            prev = past[-1]
+            print(f"[argus] seen before: {len(past)} prior investigation(s), "
+                  f"last {prev.get('timestamp', '?')[:10]} — {store.compare_line(prev, g)}",
+                  file=sys.stderr)
+        if not args.no_memory:
+            store.save(args.seed, g)
         if args.json:
-            print(json.dumps({
-                "nodes": [{"type": e.type, "value": e.value, "depth": e.depth, "via": e.via}
-                          for e in g.nodes.values()],
-                "edges": [{"src": s, "rel": r, "dst": d} for (s, r, d) in g.edges],
-                "findings": [f.to_dict() for f in g.findings],
-            }, indent=2))
+            print(json.dumps(g.to_dict(), indent=2))
         else:
             print(dossier(g))
         return 0

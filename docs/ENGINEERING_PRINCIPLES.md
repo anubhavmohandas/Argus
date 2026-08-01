@@ -1,0 +1,258 @@
+# Argus — Engineering Principles
+
+> **Argus is not an AI pentesting tool. Argus is a deterministic offensive
+> intelligence engine that models how experienced investigators collect,
+> correlate, prioritize, and explain evidence. AI is optional and sits above
+> that foundation — not beneath it.**
+
+That sentence is the constitution. Everything below defends it. Read this
+before proposing an architectural change — it exists to prevent drift a year
+from now, when Argus has 80+ modules and a change "just needs a quick LLM
+call here."
+
+## Identity
+
+Argus is **a deterministic investigation platform for offensive security**.
+The load-bearing word is *investigation* — it explains the whole vocabulary
+(investigation graph, investigation memory, Investigation Engine, Investigator
+Rule Engine, investigation dossier) and the pipeline that separates Argus from
+a scanner:
+
+```
+Collect → Model → Remember → Reason → Explain
+```
+
+Most tools stop at `Collect → Display`; a few reach `Collect → Analyze →
+Display`. Making *persistent investigation* the core abstraction — not "run
+another scan" — is the whole difference.
+
+---
+
+## The seven principles
+
+### 1. Discovery is deterministic
+The same seed produces the same graph. Enumeration, resolution, and
+correlation are mechanical walks over public sources — no model in the loop,
+no run-to-run variance. Reproducibility is a security property: an
+investigator has to be able to trust that what Argus found is what is there.
+
+### 2. Reasoning is deterministic
+Priority, interestingness, relationships, hypotheses, recommendations, and
+warnings are all produced by rules over the graph — not by a model's
+judgement. This is encoded investigator expertise, and it is Argus's job
+**permanently**. It is never a placeholder to be swapped out for an LLM.
+
+### 3. Every conclusion must be explainable
+No output is allowed to be a bare number or a verdict. If Argus says
+something is high priority, or states a hypothesis, it must be able to answer
+"why?" with the exact chain of facts and rules that produced it. Nothing
+hidden, no magic.
+
+### 4. Every confidence score must be traceable
+A confidence score is the sum of a base rule and named evidence adjustments —
+each with a sign, a weight, and a source. A score you cannot decompose into
+its inputs is a score you cannot defend, and Argus does not emit it.
+
+### 5. Memory stores facts, not conversations
+Investigation memory persists **evidence** — graphs, findings, case files —
+not chat history or prompt logs. Memory answers "what did I learn about this
+target, and what changed since last time," not "what did we talk about." The
+graph is what Argus remembers.
+
+### 6. Graphs are the source of truth
+The investigation graph is the product. JSON is only its transport format.
+Every module, every rule, and every consumer (including NYX) reads from and
+writes to the graph — not to each other. There is one canonical
+representation of what is known, and it is the graph.
+
+### 7. LLMs never replace investigator logic
+An optional LLM layer (NYX) sits **above** the engine. It may:
+
+- explain,
+- summarize,
+- converse,
+- synthesize,
+- and answer questions.
+
+It may **not** collect, correlate, score, prioritize, or decide what to
+investigate. Those are deterministic and stay in the engine. Argus is fully
+useful with no LLM present; the LLM makes it *feel* like working with another
+investigator. Neither project depends on the other.
+
+---
+
+## The Investigator Rule Engine
+
+> **The Rule Engine invariant (locked):** *The Rule Engine consumes an
+> immutable investigation graph and produces deterministic conclusions plus an
+> explanation ledger. It never mutates evidence, executes user-defined code, or
+> performs discovery.*
+
+That one sentence is the governing contract for the whole reasoning layer. Its
+three "never"s each close a specific failure mode:
+
+- **never mutates evidence** — the graph is read-only *during* evaluation.
+  Rules interpret evidence; they do not create synthetic nodes, delete edges,
+  or rewrite confidence on the graph. Keeping data and reasoning separate is
+  what makes the engine deterministic and testable: re-run it against the same
+  graph, get the same conclusions, forever. The moment rules mutate the graph,
+  reasoning and data intertwine and neither is trustworthy.
+- **never executes user-defined code** — see "Rules are declarative data" below.
+- **never performs discovery** — collection lives upstream in modules. The
+  engine reads what discovery already found; it does not go fetch.
+
+Principles 2, 3, and 4 are embodied by one component: the **Investigator Rule
+Engine**. Not a "hypothesis engine" — hypotheses are only one of its outputs.
+
+**It is not a feature; it is the brain of the Investigation Engine.** All
+deterministic reasoning routes through this one layer, and every reasoning
+output is a product of it:
+
+```
+Discovery → Graph → Rule Engine → { priority · interestingness · correlation ·
+                                    hypotheses · recommendations · warnings ·
+                                    explainability }
+```
+
+That inversion is the point. Hundreds of investigator rules are coming — AWS
+exposure, exposed Jenkins, misconfigured S3, public Grafana, open
+Elasticsearch, orphaned domains, shared CDN origins, suspicious certificate
+reuse. If each lives in its own subsystem, the logic scatters and rots. One
+deterministic reasoning layer, fed by the graph, keeps it maintainable — and
+makes every new discovery module *compound* in value (new evidence → new rules
+fire → better investigation) instead of just producing more JSON.
+
+Today's `triage.py` is the standalone proto of this layer. It converges into
+the Rule Engine as its first output; it does not sit beside it.
+
+### Two levels, so it stays both deterministic and extensible
+
+**Level 1 — a rule fires and creates a conclusion with a base confidence.**
+
+```
+admin.example.com  +  Jenkins detected  +  Internet-facing
+        └──> rule: "Administrative Jenkins exposed"   base_confidence: 55
+```
+
+**Level 2 — evidence adjusts that confidence, up or down.**
+
+```
++ public exploit exists        +10
++ known exploited              +15
+- authentication required      -20
+- behind VPN                   -35
+- recently patched             -15
+```
+
+The rule *creates* the hypothesis; the evidence *tunes* the confidence. Both
+steps are deterministic, both are logged.
+
+### Rules are declarative data — never code
+
+A new piece of investigator knowledge is a new data entry — never an engine
+change. A generic evaluator walks the rule set; adding rule #120 touches no
+Python, it adds a file:
+
+```yaml
+id: exposed_jenkins
+requires:
+  technology: Jenkins
+  internet_facing: true
+base_confidence: 55
+adjustments:
+  - if: public_exploit
+    add: 10
+outputs:
+  priority: high
+  recommendation:
+    - Inspect authentication
+    - Check plugin versions
+  hypothesis:
+    - Administrative interface may be externally accessible
+```
+
+**Hard boundary: rules never execute arbitrary code.** A rule is a fixed
+declarative vocabulary — `requires` / `adjustments` / `outputs` — that the
+engine *interprets*; it is not a script the engine *runs*. This is a
+scalability rule (contributors add data, not engine changes) and, more
+importantly, a **security rule**: rule files are data, and data must never
+become executable. No `eval`, no `if:` expression that evaluates as Python, no
+plugin hook that runs rule-supplied code. The condition vocabulary
+(`public_exploit`, `internet_facing`, …) is a closed set the engine resolves
+against the graph — extend it in the engine, under review, not from a rule
+file.
+
+### Predicates vs. evidence providers
+
+A rule references **predicates** (`internet_facing`, `public_exploit`,
+`certificate_reused`). It asks only *whether the predicate is true* — never
+*who discovered it*. **Evidence providers** — the discovery modules — set those
+predicates on the graph: a certificate analyzer writes `certificate_reused =
+true`, and every rule referencing that predicate now fires.
+
+This is what makes the closed-vocabulary trade-off livable. **A new module
+feeding an existing predicate needs no engine change** — it just produces
+evidence. Only a genuinely *new predicate* — a new word in Argus's
+investigation vocabulary — goes through engine code review. That review is
+governance, not friction: it is the gate that decides a concept deserves to be
+something Argus reasons about.
+
+### Derived facts (future — not v1)
+
+Once the engine is stable, one capability comes almost for free: a rule's
+output can itself become a predicate another rule consumes. `internet_facing +
+public_exploit + admin_interface` → derived fact `high_value_exposed_service`
+→ a priority rule consumes that. This is **bounded forward-chaining over
+derived facts, not arbitrary recursion** — still declarative, still fully
+explainable (the ledger gains one hop). v1 does **not** build this, but v1 must
+not *preclude* it: predicates and rule outputs share one namespace, so a
+conclusion can be referenced as a condition later without reworking the
+evaluator.
+
+This does **not** break the read-only invariant, because derived facts are not
+evidence. The immutable **evidence graph** (what discovery found) is never
+written to; derived facts accumulate in a separate **conclusions layer** the
+engine owns. Rules *read* from evidence + already-derived facts and *write*
+only to the conclusions layer. Evidence stays immutable; reasoning stays
+deterministic.
+
+### Every output carries its own explanation
+
+Because rules and adjustments are data, the trace is free. When a user asks
+"why 73%?", Argus answers with the ledger, not a paragraph:
+
+```
+Confidence: 73%
+
+Rule fired
+  ✓ Jenkins detected
+  ✓ Internet-facing
+  ✓ Public exploit exists
+  ✓ Version vulnerable
+
+Negative evidence
+  ✗ Authentication required   -20
+
+Final confidence: 73%
+```
+
+A hypothesis is a **claim worth investigating**, never a truth assertion.
+"Based on everything I know, this is worth your time" — that is what a senior
+investigator says, and it is all Argus claims.
+
+---
+
+## For contributors
+
+Before you add code, check it against the constitution:
+
+- Adding intelligence? It goes in a **rule (data)**, not in the engine, and it
+  must be explainable and traceable (Principles 2–4).
+- Reaching for an LLM? Only if the task is explain / summarize / converse /
+  synthesize / answer. Anything that collects, correlates, scores, or decides
+  stays deterministic (Principle 7).
+- Adding an output? It reads from and writes to the **graph** (Principle 6).
+- Adding memory? It stores **evidence**, not conversation (Principle 5).
+
+If a change can't satisfy these, it isn't an Argus change — it's a NYX change,
+or it doesn't belong.

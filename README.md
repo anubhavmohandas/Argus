@@ -82,14 +82,23 @@ auto-registers and the pivot engine can chain it.
 ```
 core.py     finding model · module registry · validated HTTP · input guards
 modules.py  built-in recon modules (the hands)
-pivot.py    the correlation engine (the brain) — bounded BFS over an entity graph
+pivot.py    the Investigation Engine — bounded BFS correlation over an entity graph
+triage.py   deterministic "what matters" reasoning over that graph
 cli.py      pivot / run / all / modules
 ```
 
+The deterministic reasoning stack (pivot + triage, and the Investigator Rule
+Engine to come) **is** the Investigation Engine — the identity of the system.
+See [`docs/ENGINEERING_PRINCIPLES.md`](docs/ENGINEERING_PRINCIPLES.md).
+
 ## Roadmap
 
-- **AI brain** — optional agentic driver (CAI-style loop + guardrails) that
-  reads the graph and decides the next pivot instead of the fixed plan.
+- **Investigator Rule Engine** — data-defined rules over the graph that emit
+  priorities, hypotheses, and recommendations with *traceable* confidence
+  scores. Deterministic; see the principles doc.
+- **Optional LLM layer (NYX)** — sits *above* the engine to explain,
+  summarize, converse, and answer questions over its output. It never decides
+  investigation logic — that stays deterministic (Rule 7).
 - **Your `MY OWN` tools** — recon_scanner / owasp_scanner / whoisuser /
   secure_gen / CyberTrace register as modules and feed the same graph.
 - **Persistence** — SQLite findings store (pentest-ai schema) for

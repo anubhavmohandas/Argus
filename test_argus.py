@@ -70,6 +70,61 @@ def test_normalize_child_drops_junk():
     assert _normalize_child("ip", "1.2.3.4") == "1.2.3.4"
 
 
+def test_triage():
+    # the "200 CDN, ignore; 4 admin portals, high priority" pass, deterministic
+    from argus import triage
+    g = Graph()
+    admin = Entity("subdomain", "admin.example.com", 1)
+    cdn = Entity("subdomain", "cdn-static.example.com", 1)
+    shop = Entity("subdomain", "shop.example.com", 1)
+    for e in (admin, cdn, shop):
+        g.add(e)
+    triage.prioritize(g)
+    assert admin.score > shop.score > cdn.score, (admin.score, shop.score, cdn.score)
+    assert "admin" in admin.tags and "noise" in cdn.tags
+    assert triage.top_priority(g)[0] is admin
+    assert "admin surface" in triage.why(admin)
+    # a critical finding on an otherwise-boring host lifts it above the bare name
+    g.findings.append(Finding("secrets", "shop.example.com", "AWS_ACCESS_KEY", core.CRITICAL))
+    triage.prioritize(g)
+    assert shop.score > admin.score
+
+
+def test_memory():
+    import os, tempfile
+    from argus import store
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["ARGUS_HOME"] = tmp
+        try:
+            g1 = Graph()
+            g1.add(Entity("domain", "x.com", 0)); g1.add(Entity("subdomain", "a.x.com", 1))
+            store.save("x.com", g1)
+            hist = store.history("x.com")
+            assert len(hist) == 1 and hist[0]["seed"] == "x.com"
+            # next run finds a new subdomain — diff must catch it
+            g2 = Graph()
+            for v in ("x.com",): g2.add(Entity("domain", v, 0))
+            for v in ("a.x.com", "b.x.com"): g2.add(Entity("subdomain", v, 1))
+            new, gone = store.diff_keys(hist[-1], g2)
+            assert "subdomain:b.x.com" in new and gone == set()
+            assert "+1 new subdomain(s)" in store.compare_line(hist[-1], g2)
+        finally:
+            os.environ.pop("ARGUS_HOME", None)
+
+
+def test_color_gating_cross_platform():
+    # colors must never leak into piped/redirected output on any OS
+    import os
+    from argus.cli import _color_enabled
+    os.environ["NO_COLOR"] = "1"
+    try:
+        assert _color_enabled() is False
+    finally:
+        os.environ.pop("NO_COLOR", None)
+    # under the test runner stdout is captured (not a tty), so it's off there too
+    assert _color_enabled() is False
+
+
 def test_pivot_offline_fanout():
     # max_depth=-1 forbids running any (network) module, so this stays offline.
     # An email seed still fans out into domain + username nodes before the loop.

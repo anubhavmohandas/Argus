@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from . import core
 from .core import Finding, run_module, sort_by_severity
+from .triage import prioritize, top_priority, why
 
 # What modules to run for each entity type. Order = cheap/authoritative first.
 _PLAN: dict[str, list[str]] = {
@@ -57,6 +58,8 @@ class Entity:
     value: str
     depth: int
     via: str = "seed"          # how we discovered it
+    tags: set = field(default_factory=set)   # triage labels (admin, cdn/noise, ...)
+    score: float = 0.0         # how much an investigator should care (triage.py)
 
     @property
     def key(self) -> str:
@@ -78,6 +81,16 @@ class Graph:
             if edge not in self.edges:
                 self.edges.append(edge)
         return new
+
+    def to_dict(self) -> dict:
+        """Serialize the whole graph. Used by --json output and the memory store."""
+        return {
+            "nodes": [{"type": e.type, "value": e.value, "depth": e.depth, "via": e.via,
+                       "tags": sorted(e.tags), "score": e.score}
+                      for e in self.nodes.values()],
+            "edges": [{"src": s, "rel": r, "dst": d} for (s, r, d) in self.edges],
+            "findings": [f.to_dict() for f in self.findings],
+        }
 
 
 # --- extraction: turn a module's findings into new entities to pivot into ---
@@ -186,6 +199,7 @@ def pivot(seed: str, budget: Budget | None = None) -> Graph:
                     if g.add(child, ent, rel) and child.depth <= budget.max_depth:
                         queue.append(child)
     g.findings = sort_by_severity(g.findings)
+    prioritize(g)   # score/tag every node so the graph itself says what matters
     return g
 
 
@@ -203,6 +217,15 @@ def dossier(g: Graph) -> str:
             vals = ", ".join(sorted(e.value for e in ents)[:12])
             more = f"  (+{len(ents) - 12} more)" if len(ents) > 12 else ""
             lines.append(f"   {t:<10} {len(ents):>3}  {vals}{more}")
+
+    top_p = top_priority(g, 10)
+    if top_p:
+        lines.append("\n PRIORITY TRIAGE  (what an investigator looks at first)")
+        for e in top_p:
+            lines.append(f"   [{e.score:>4.0f}] {e.type:<9} {e.value:<34} {why(e)}")
+        noise = sum(1 for e in g.nodes.values() if "noise" in e.tags)
+        if noise:
+            lines.append(f"   deprioritized (CDN/static/plumbing): {noise}")
 
     sev_counts: dict[str, int] = {}
     for f in g.findings:

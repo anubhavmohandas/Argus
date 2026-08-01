@@ -6,7 +6,7 @@
 
 Each is a @module-registered function: takes a validated target, yields Findings.
 Add a new module here (or in a new file imported by __init__) — that's the seam
-your MY OWN tools and the AI brain plug into.
+your MY OWN tools and the optional LLM layer plug into.
 """
 from __future__ import annotations
 
