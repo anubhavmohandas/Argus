@@ -28,7 +28,7 @@ another scan" — is the whole difference.
 
 ---
 
-## The nine principles
+## The ten principles
 
 ### 1. Discovery is deterministic
 The same seed produces the same graph. Enumeration, resolution, and
@@ -100,6 +100,26 @@ and in a security tool that is the one surface you never build. This principle
 outranks convenience: if a future rule needs logic the vocabulary can't
 express, the answer is a new predicate in engine code under review, never an
 escape hatch in the rule file.
+
+### 10. Providers contribute observations, never conclusions
+A provider answers exactly one question — *"what evidence can I establish?"* —
+and never *"what conclusion should I draw?"* It may assert what it observed on
+the wire (`technology = jenkins`, because the response carried an `X-Jenkins`
+header). It may not assert what that means: not "high risk", not "exploitable",
+not even "this is an administrative interface". A provider that knows Jenkins is
+an admin surface has become a second rule engine, and now investigator knowledge
+lives in two places that will disagree. So the provider reports the header and
+`rules/jenkins_confirmed.toml` draws the conclusion — that is the *only* reason
+adding a provider requires no engine change, which is the property the whole
+architecture is built to have. The full chain:
+
+```
+Discovery → Observation → Evidence → Predicates → Rules → Conclusions
+```
+
+Providers own the first two arrows and nothing after them. See
+[`EVIDENCE_MODEL.md`](EVIDENCE_MODEL.md) for how observations are represented
+today and how they will be represented when providers start disagreeing.
 
 ---
 
@@ -220,9 +240,16 @@ words only catches what we thought of, and silently accepts a typo'd
 
 A rule references **predicates** (`internet_facing`, `public_exploit`,
 `certificate_reused`). It asks only *whether the predicate is true* — never
-*who discovered it*. **Evidence providers** — the discovery modules — set those
+*who discovered it*. **Evidence providers** (`argus/providers.py`) set those
 predicates on the graph: a certificate analyzer writes `certificate_reused =
 true`, and every rule referencing that predicate now fires.
+
+Providers are a distinct category from discovery modules, and the difference is
+worth keeping straight. A **module** finds new entities and yields `Finding`s
+that discovery pivots into — it grows the graph. A **provider** establishes
+facts about entities the graph already has and writes them to
+`Entity.evidence` — it grows what is *known*, never the shape. Modules answer
+"what else is out there?"; providers answer "what is true about this?"
 
 **Predicates are three-valued: true / false / unknown.** Absence of an
 assertion is `unknown`, never `false` — *"nobody checked"* and *"checked, it
