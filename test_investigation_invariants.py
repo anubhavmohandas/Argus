@@ -8,14 +8,15 @@ that must never regress no matter how the rule packs grow.
 
     python3 test_investigation_invariants.py   # asserts, exits 0 on pass
 
-The four invariants:
+The five invariants:
   1. Discovery alone is never overconfident — a name is a lead, not a finding.
   2. Verified evidence always outranks a same-named suspicion.
   3. A fully-probed investigation carries no lingering unknowns.
   4. Silence is never a negative — the differentiator (invariant I-1).
+  5. A broken rule set never reads as a clean result.
 """
 from argus import engine
-from argus.pivot import Graph, Entity
+from argus.pivot import Graph, Entity, dossier
 
 _RULES = engine.load_rules()
 
@@ -93,6 +94,23 @@ def test_silence_is_never_a_negative():
                         "requires": {"authentication_required": False}, "outputs": {}}]
     assert engine.evaluate(g, assumes_no_auth) == [], \
         "silence must never satisfy a requirement — that would invent negative evidence"
+
+
+def test_broken_rules_never_read_as_a_clean_result():
+    """A malformed rule set degrades, but never silently. The investigation is
+    not blanked by a config bug — discovery survives — yet the failure travels
+    with the result into every consumer. Zero conclusions presented as a clean
+    run is a false negative wearing the costume of an answer."""
+    g = Graph()
+    g.add(Entity("subdomain", "jenkins.example.com", 1))
+    # `adjustment` is a typo for `adjustments`: a rule that would quietly never fire
+    r = engine.investigate(g, [{"id": "typo", "adjustment": [{"if": "public_exploit"}]}])
+
+    assert r.conclusions == [], "a malformed rule must not fire"
+    assert "RuleError" in r.error, r.error
+    assert r.error in dossier(g, r), "the human path must show the degradation"
+    assert r.to_dict()["error"] == r.error, "the JSON path must show it too"
+    assert r.priority, "discovery work must survive a broken rule set"
 
 
 if __name__ == "__main__":

@@ -1,2 +1,6 @@
-# Argus core is stdlib-only. The single external dep is for the phone module.
-phonenumbers>=8.13
+# Argus core is stdlib-only. This file is intentionally empty of requirements.
+#
+# Optional — the `phone` module uses libphonenumber. Without it that one module
+# yields a "not installed" finding and nothing else changes:
+#
+#     pip install 'phonenumbers>=8.13'

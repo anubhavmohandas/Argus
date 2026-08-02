@@ -93,7 +93,7 @@ class Graph:
 
 
 # --- extraction: turn a module's findings into new entities to pivot into ---
-def _extract(finding: Finding, seed_domain: str) -> list[tuple[str, str, str]]:
+def _extract(finding: Finding) -> list[tuple[str, str, str]]:
     """Return (child_type, child_value, relation) tuples from one finding."""
     out: list[tuple[str, str, str]] = []
     d = finding.data or {}
@@ -165,7 +165,6 @@ def pivot(seed: str, budget: Budget | None = None) -> Graph:
     else:
         g.add(root)
 
-    seed_domain = root.value if root.type == "domain" else ""
     queue = [e for e in g.nodes.values()]
     sub_expanded = 0
 
@@ -182,7 +181,7 @@ def pivot(seed: str, budget: Budget | None = None) -> Graph:
                 continue
             g.findings.extend(findings)
             for f in findings:
-                for ctype, cvalue, rel in _extract(f, seed_domain):
+                for ctype, cvalue, rel in _extract(f):
                     cvalue = _normalize_child(ctype, cvalue)
                     if cvalue is None:
                         continue  # junk (null-MX "0 .", malformed host, bad IP) — never a node
@@ -205,6 +204,10 @@ def dossier(g: Graph, result) -> str:
     """Human-readable intelligence brief from a pivot graph + its InvestigationResult.
     Consumes only the result object — never engine internals."""
     lines = ["═" * 60, " ARGUS DOSSIER", "═" * 60]
+    if result.error:
+        # loud, and above everything: no conclusions here means the rules broke,
+        # NOT that there was nothing to conclude.
+        lines.append(f"\n ⚠  REASONING DEGRADED — conclusions unavailable: {result.error}")
     by_type: dict[str, list[Entity]] = {}
     for e in g.nodes.values():
         by_type.setdefault(e.type, []).append(e)

@@ -7,6 +7,9 @@ Tools/
 
 # macOS + Python noise
 .DS_Store
+*.jpeg
+*.jpg
+*.png
 __pycache__/
 *.pyc
 .venv/

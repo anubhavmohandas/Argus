@@ -43,8 +43,8 @@ the deliverable, not a flat list.
 ## Install
 
 ```bash
-pip install -r requirements.txt   # only dep: phonenumbers (for the phone module)
-python3 -m argus modules          # list capabilities
+python3 -m argus modules              # no install step — core is stdlib-only
+pip install 'phonenumbers>=8.13'      # optional, only for the `phone` module
 ```
 
 Core is **stdlib-only** and dependency-light on purpose — it stays a tool
@@ -100,6 +100,23 @@ probe-backed fact, and an unknown — and never collapses them. Where another
 tool reports "no exploit found," Argus reports "exploit status unknown — no
 evidence provider asserted either state." Every conclusion is reproducible from
 versioned evidence and inference rules; nothing is inferred from absence.
+
+A broken rule set degrades the same way rather than lying: conclusions go empty,
+discovery survives, and the failure travels on `InvestigationResult.error` into
+both the dossier and the JSON. A config bug must never read as a clean run.
+
+### Public API
+
+These names are re-exported from the package and are what a downstream caller
+(or a NYX module) should import. Everything else is internal and may move.
+
+```python
+from argus import pivot, dossier, Budget, Graph, classify   # discovery
+from argus import Finding, run_module, run_all, MODULES     # modules
+from argus.engine import investigate, InvestigationResult   # reasoning
+```
+
+Pre-1.0: the surface is deliberate, but not yet frozen.
 
 ## Roadmap
 

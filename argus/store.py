@@ -18,16 +18,23 @@ import datetime as _dt
 import json
 import os
 import re
+from collections import Counter
 from pathlib import Path
 
 _SLUG_RE = re.compile(r"[^a-z0-9._-]+")
 
 
-def home() -> Path:
-    """Where case files live. Override with $ARGUS_HOME (defaults to ~/.argus)."""
+def _home() -> Path:
+    """Where case files live. Override with $ARGUS_HOME (defaults to ~/.argus).
+
+    Owner-only. A case file is a map of someone else's infrastructure — hosts,
+    IPs, and the relationships between them — so it never inherits a permissive
+    umask, and the chmod re-applies to a directory that already existed.
+    """
     base = os.environ.get("ARGUS_HOME") or os.path.join(os.path.expanduser("~"), ".argus")
     d = Path(base) / "investigations"
     d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o700)   # no-op beyond the read-only bit on Windows; never raises
     return d
 
 
@@ -39,7 +46,8 @@ def save(seed: str, g) -> Path:
     """Write one case file for this pivot. Returns its path."""
     now = _dt.datetime.now(_dt.timezone.utc)
     rec = {"seed": seed, "timestamp": now.isoformat(), **g.to_dict()}
-    path = home() / f"{_slug(seed)}__{now.strftime('%Y%m%dT%H%M%S')}.json"
+    path = _home() / f"{_slug(seed)}__{now.strftime('%Y%m%dT%H%M%S')}.json"
+    path.touch(mode=0o600)   # created owner-only BEFORE any data lands in it
     path.write_text(json.dumps(rec, indent=2))
     return path
 
@@ -47,7 +55,7 @@ def save(seed: str, g) -> Path:
 def history(seed: str) -> list[dict]:
     """All prior case files for this seed, oldest first."""
     out: list[dict] = []
-    for fp in sorted(home().glob(f"{_slug(seed)}__*.json")):
+    for fp in sorted(_home().glob(f"{_slug(seed)}__*.json")):
         try:
             out.append(json.loads(fp.read_text()))
         except (OSError, ValueError):
@@ -62,20 +70,11 @@ def diff_keys(prev: dict, g) -> tuple[set[str], set[str]]:
     return cur_keys - prev_keys, prev_keys - cur_keys
 
 
-def _by_type(keys: set[str], t: str) -> int:
-    return sum(1 for k in keys if k.startswith(t + ":"))
-
-
 def compare_line(prev: dict, g) -> str:
     """One-line summary of what changed since the previous investigation."""
     new, gone = diff_keys(prev, g)
-    bits = []
-    for t in ("subdomain", "domain", "ip"):
-        c = _by_type(new, t)
-        if c:
-            bits.append(f"+{c} new {t}(s)")
-    for t in ("subdomain", "domain", "ip"):
-        c = _by_type(gone, t)
-        if c:
-            bits.append(f"-{c} {t}(s) gone")
+    n = Counter(k.split(":", 1)[0] for k in new)
+    o = Counter(k.split(":", 1)[0] for k in gone)
+    bits = [f"+{n[t]} new {t}(s)" for t in ("subdomain", "domain", "ip") if n[t]]
+    bits += [f"-{o[t]} {t}(s) gone" for t in ("subdomain", "domain", "ip") if o[t]]
     return ", ".join(bits) or "no entity changes since last run"

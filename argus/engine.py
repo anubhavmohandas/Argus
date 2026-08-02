@@ -344,10 +344,6 @@ def fingerprint(g, rules=None) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def output_hash(conclusions: list[Conclusion]) -> str:
-    return hashlib.sha256(json.dumps([c.to_dict() for c in conclusions], sort_keys=True).encode()).hexdigest()
-
-
 # --- rendering (used by the dossier) --------------------------------------
 _MARK = {True: "✓", False: "✗", None: "?"}   # ? = nobody established this (I-1)
 
@@ -431,6 +427,7 @@ class InvestigationResult:
     conclusions: list          # Conclusion, ranked by confidence
     priority: list             # PriorityItem, every entity ranked by score
     fingerprint: str           # reproducibility hash of (graph + rules)
+    error: str = ""            # why reasoning degraded, if it did — see investigate()
 
     @property
     def interesting(self) -> list:
@@ -451,17 +448,13 @@ class InvestigationResult:
                     seen.append(r)
         return seen
 
-    @property
-    def ledger(self) -> list:
-        """The full explainability trail: one traceable ledger per conclusion."""
-        return [{"target": c.target, "rule": c.rule, **c.ledger} for c in self.conclusions]
-
     def to_dict(self) -> dict:
         return {
             "conclusions": [c.to_dict() for c in self.conclusions],
             "priority": [p.to_dict() for p in self.priority],
             "recommendations": self.recommendations,
             "fingerprint": self.fingerprint,
+            "error": self.error,
         }
 
 
@@ -469,15 +462,18 @@ def investigate(g, rules=None) -> InvestigationResult:
     """Reason over a discovered graph → one InvestigationResult. The only
     reasoning entry point; discovery (pivot) hands its graph here.
 
-    Degrades to name-based priority if the rule files are unavailable — a
-    broken rule set must not blank out a live investigation. Determinism and
-    the closed-vocabulary/executable-key errors still surface via evaluate()."""
+    Degrades to name-based priority if the rule set is unavailable or malformed
+    — a broken rule set must not blank out a live investigation. But the failure
+    is *carried*, on `.error`, and every consumer shows it: a malformed rule file
+    turning into "zero conclusions" would be a config bug reported as a clean
+    result, which is exactly the false negative Argus must never produce."""
     conclusions: list = []
-    fp = ""
+    fp = error = ""
     try:
         rules = rules if rules is not None else load_rules()
         conclusions = evaluate(g, rules)
         fp = fingerprint(g, rules)
-    except (ValueError, OSError):
-        pass  # occam: rules missing/broken -> priority-only result, no conclusions
-    return InvestigationResult(conclusions=conclusions, priority=_priority(g), fingerprint=fp)
+    except (ValueError, OSError) as e:   # RuleError is a ValueError — degrade, never silently
+        error = f"{type(e).__name__}: {e}"
+    return InvestigationResult(conclusions=conclusions, priority=_priority(g),
+                               fingerprint=fp, error=error)

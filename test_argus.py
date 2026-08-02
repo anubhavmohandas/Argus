@@ -50,9 +50,9 @@ def test_severity_sort():
 def test_extract_and_graph():
     # dns A record -> ip entity ; MX -> mail domain
     f = Finding("dns", "x.com", "A", core.INFO, data={"type": "A", "records": ["1.2.3.4"]})
-    assert ("ip", "1.2.3.4", "resolves_to") in _extract(f, "x.com")
+    assert ("ip", "1.2.3.4", "resolves_to") in _extract(f)
     mx = Finding("dns", "x.com", "MX", core.INFO, data={"type": "MX", "records": ["10 mail.x.com"]})
-    assert ("domain", "mail.x.com", "mail_server") in _extract(mx, "x.com")
+    assert ("domain", "mail.x.com", "mail_server") in _extract(mx)
     # graph dedupes nodes, records edges
     g = Graph()
     a = Entity("domain", "x.com", 0); b = Entity("ip", "1.2.3.4", 1)
@@ -113,7 +113,6 @@ def test_rules():
     # Principle 8 — reproducible: same graph + same rules => identical output + hash
     c2 = engine.evaluate(g, rules)
     assert [c.to_dict() for c in c1] == [c.to_dict() for c in c2]
-    assert engine.output_hash(c1) == engine.output_hash(c2)
     fp = engine.fingerprint(g, rules)
     assert fp == engine.fingerprint(g, rules)
 
@@ -201,6 +200,14 @@ def test_memory():
             new, gone = store.diff_keys(hist[-1], g2)
             assert "subdomain:b.x.com" in new and gone == set()
             assert "+1 new subdomain(s)" in store.compare_line(hist[-1], g2)
+            # A case file maps someone else's infrastructure. Nothing outside the
+            # owner may read it, and it is never world-readable for even an
+            # instant — created 0600, not chmod'd after the data lands.
+            if os.name == "posix":
+                import stat
+                p = store.save("x.com", g2)
+                assert stat.S_IMODE(p.stat().st_mode) & 0o077 == 0, oct(p.stat().st_mode)
+                assert stat.S_IMODE(store._home().stat().st_mode) & 0o077 == 0
         finally:
             os.environ.pop("ARGUS_HOME", None)
 

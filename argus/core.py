@@ -131,12 +131,10 @@ def run_module(name: str, target: str) -> list[Finding]:
     return list(mod.fn(clean))
 
 
-def run_all(target: str, kinds: set[str] | None = None) -> list[Finding]:
+def run_all(target: str) -> list[Finding]:
     """Run every module whose kind validates the target (best-effort sweep)."""
     out: list[Finding] = []
     for name, mod in MODULES.items():
-        if kinds and mod.kind not in kinds:
-            continue
         try:
             clean = check_target(mod.kind, target)
         except ValueError:
