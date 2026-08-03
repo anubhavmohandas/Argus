@@ -25,9 +25,11 @@ never runs by default.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import ipaddress
 import re
 import socket
+import ssl
 import urllib.error
 import urllib.request
 
@@ -155,26 +157,69 @@ def evidence_from(status: int, headers: dict, body: str) -> dict:
     return ev
 
 
+# Headers whose whole value IS the product version (Jenkins volunteers it).
+_VERSION_HEADERS = ("x-jenkins", "x-gitlab-version")
+_VERSION_RE = re.compile(r"\d+(?:\.\d+){1,3}")
+
+
+def version_from(headers: dict) -> str | None:
+    """Pure: pull a product version from a header that volunteers it.
+
+    A *version* is not an engine predicate — it's an observation another
+    provider (KEV) consumes, so it never goes in the evidence dict. occam:
+    header-declared versions only; parsing versions out of banners/bodies is
+    per-product guesswork — add it when a provider actually needs it.
+    """
+    for h in _VERSION_HEADERS:
+        if h in headers:
+            m = _VERSION_RE.search(headers[h])
+            if m:
+                return m.group(0)
+    return None
+
+
 # occam: no has_admin_interface — asserting it from `technology == "jenkins"`
 #        would be the provider drawing a conclusion. That mapping is the rule
 #        engine's job (see rules/jenkins_confirmed.toml). Assert it only when a
 #        probe actually reaches an admin surface.
 # occam: no certificate_reused — it compares entities, so it is reasoning, not
 #        observation. It belongs to a predicate over the graph, not here.
-def probe(host: str, timeout: float = 8.0) -> dict:
-    """Probe one host over HTTPS, then HTTP. Returns the evidence established."""
+def probe(host: str, timeout: float = 8.0) -> tuple[dict, dict]:
+    """Probe one host over HTTPS, then HTTP. Returns (evidence, observed):
+    evidence is engine-vocabulary predicates; observed is non-predicate facts
+    (e.g. a product version) that OTHER providers read. Unreachable => ({}, {})."""
     if not _resolvable_and_global(host):
-        return {}
+        return {}, {}
     for scheme in ("https", "http"):
         status, headers, body = _fetch(f"{scheme}://{host}/", timeout)
         if status:
-            return evidence_from(status, headers, body)
-    return {}
+            observed = {}
+            ver = version_from(headers)
+            if ver:
+                observed["version"] = ver
+            return evidence_from(status, headers, body), observed
+    return {}, {}
 
 
 _PROBEABLE = ("domain", "subdomain", "ip")
 
 
+# --- provider manifest ----------------------------------------------------
+# A provider declares the engine predicates it can establish, right next to its
+# code, so the coverage map can never drift from reality. `argus coverage`
+# reads this; the predicates with no provider are the roadmap.
+PROVIDES: dict[str, tuple[str, ...]] = {}
+
+
+def declares(name: str, provides):
+    """Register a provider's asserted predicates. Returns the fn unchanged."""
+    def deco(fn):
+        PROVIDES[name] = tuple(provides)
+        return fn
+    return deco
+
+
+@declares("http_probe", ("internet_facing", "technology", "authentication_required"))
 def enrich(g, timeout: float = 8.0, workers: int = 8) -> int:
     """Attach probe evidence to every probeable node. Returns hosts reached.
 
@@ -186,8 +231,165 @@ def enrich(g, timeout: float = 8.0, workers: int = 8) -> int:
         return 0
     reached = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        for ent, ev in zip(targets, ex.map(lambda e: probe(e.value, timeout), targets)):
+        for ent, (ev, obs) in zip(targets, ex.map(lambda e: probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
                 reached += 1
+            if obs:
+                ent.observed.update(obs)
     return reached
+
+
+def coverage() -> dict:
+    """predicate -> provider name (or None). Reads the engine's live vocabulary
+    and the provider manifest, so it can't go stale. The name_suggests_* /
+    publicly_discoverable predicates come from discovery itself, not a probe;
+    every predicate left with None is a gap — the next provider to build."""
+    from . import engine
+    owner: dict = {}
+    for name, preds in PROVIDES.items():
+        for pred in preds:
+            owner[pred] = name
+    for pred in engine._PREDICATES:
+        if pred.startswith("name_suggests_") or pred == "publicly_discoverable":
+            owner.setdefault(pred, "discovery")
+    return {pred: owner.get(pred) for pred in engine._PREDICATES}
+
+
+# --- KEV / public-exploit intelligence (version-gated) --------------------
+# A small local catalog of known-exploited product versions. occam: a static
+# subset, not the live CISA KEV feed — wire the feed (or NVD CPE matching) when
+# breadth matters; the seam and the honesty property are what this proves.
+# Each entry: the product, the highest version still vulnerable, what's known.
+_KEV_CATALOG = [
+    # Jenkins CVE-2024-23897 — unauth arbitrary file read; KEV-listed, PoC public.
+    {"product": "jenkins", "vulnerable_through": "2.441",
+     "known_exploited": True, "public_exploit": True},
+]
+
+
+def _ver_tuple(v: str) -> tuple:
+    """Numeric dotted version -> comparable tuple. occam: numeric versions only
+    (Jenkins etc.); swap in packaging.version if non-numeric ones appear."""
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except (ValueError, AttributeError):
+        return ()
+
+
+def kev_evidence(technology, version) -> dict:
+    """Pure: (product, version) -> exploit evidence, gated on the version.
+
+    Version-gated on purpose. "Jenkins is in KEV" is a fact about the product,
+    not about this host — a patched instance is not exploitable. So only a
+    running version at or below a known-exploited one earns the claim, and no
+    version means no claim: the same honesty as I-1 (don't assert the
+    unestablished). The provider states facts; whether they raise priority is
+    the rule engine's call, never this file's."""
+    if not technology or not version:
+        return {}
+    running = _ver_tuple(version)
+    if not running:
+        return {}
+    ev: dict = {}
+    for entry in _KEV_CATALOG:
+        if entry["product"] == technology and running <= _ver_tuple(entry["vulnerable_through"]):
+            if entry.get("known_exploited"):
+                ev["known_exploited"] = True
+            if entry.get("public_exploit"):
+                ev["public_exploit"] = True
+    return ev
+
+
+@declares("kev", ("known_exploited", "public_exploit"))
+def enrich_kev(g) -> int:
+    """Attach exploit evidence where a host's (technology, version) matches the
+    catalog. Reads only what the probe already established — offline, no
+    engagement. Returns the number of hosts matched."""
+    matched = 0
+    for e in g.nodes.values():
+        ev = kev_evidence(e.evidence.get("technology"), getattr(e, "observed", {}).get("version"))
+        if ev:
+            e.evidence.update(ev)
+            matched += 1
+    return matched
+
+
+# --- TLS probe + certificate analysis -------------------------------------
+# Two provider classes, cleanly split (see the Provider Contract in
+# docs/ENGINEERING_PRINCIPLES.md): the TLS *probe* RECORDS a certificate
+# fingerprint — an observation about one host — and never claims reuse. The
+# *analyzer*, reading the whole graph, DERIVES `certificate_reused`. A probe has
+# only ever seen one host; reuse is a graph-wide judgement, so it is the
+# analyzer's, exclusively.
+def cert_fingerprint(der: bytes) -> str:
+    """Pure: DER-encoded cert -> its SHA-256 fingerprint. The minimum a reuse
+    analyzer needs — nothing else is persisted until a rule consumes it
+    (Provider Contract, checklist #7: smallest observation set that reasons)."""
+    return hashlib.sha256(der).hexdigest()
+
+
+def _tls_fetch(host: str, timeout: float = 8.0) -> bytes | None:
+    """Return the peer certificate (DER) served on 443, or None.
+
+    Verification is OFF on purpose: this observes whatever cert the host presents
+    — self-signed or expired included — and only fingerprints it; it is never
+    trusted for a secure session. Unreachable / no TLS => None (established
+    nothing, invariant I-1)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False          # recon: observe the cert, don't validate it
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, 443), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:  # noqa: S501 (recon: observe, never trust)
+                return ss.getpeercert(binary_form=True)
+    except (OSError, ssl.SSLError, ValueError):
+        return None
+
+
+def tls_probe(host: str, timeout: float = 8.0) -> dict:
+    """Probe one host's TLS cert. Returns an observation (fingerprint), never a
+    predicate — 'reused' is the analyzer's graph-wide call, not this probe's."""
+    if not _resolvable_and_global(host):
+        return {}
+    der = _tls_fetch(host, timeout)
+    return {"cert_fingerprint": cert_fingerprint(der)} if der else {}
+
+
+def enrich_tls(g, timeout: float = 8.0, workers: int = 8) -> int:
+    """Record each probeable host's cert fingerprint into `observed`. Writes no
+    predicate and no graph shape — a pure observation pass. Returns hosts reached."""
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    reached = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, obs in zip(targets, ex.map(lambda e: tls_probe(e.value, timeout), targets)):
+            if obs:
+                ent.observed.update(obs)
+                reached += 1
+    return reached
+
+
+def _reused_fingerprints(fingerprints) -> set:
+    """Pure: the fingerprints that appear on more than one host."""
+    seen, reused = set(), set()
+    for fp in fingerprints:
+        (reused if fp in seen else seen).add(fp)
+    return reused
+
+
+@declares("cert_analysis", ("certificate_reused",))
+def analyze_certificates(g) -> int:
+    """Analysis provider: where the SAME cert (fingerprint) is served by two or
+    more hosts, assert `certificate_reused` on each. Reads the graph, touches no
+    network, mutates no graph shape — the first Analysis-class provider. Returns
+    the number of hosts marked."""
+    reused = _reused_fingerprints(
+        fp for e in g.nodes.values() if (fp := getattr(e, "observed", {}).get("cert_fingerprint")))
+    marked = 0
+    for e in g.nodes.values():
+        if getattr(e, "observed", {}).get("cert_fingerprint") in reused:
+            e.evidence["certificate_reused"] = True
+            marked += 1
+    return marked

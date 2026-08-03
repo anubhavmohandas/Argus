@@ -59,6 +59,7 @@ class Entity:
     depth: int
     via: str = "seed"          # how we discovered it
     evidence: dict = field(default_factory=dict)  # predicate flags for the rule engine (set by evidence providers)
+    observed: dict = field(default_factory=dict)  # non-predicate facts a provider saw (e.g. version) — input for OTHER providers, invisible to the engine
 
     @property
     def key(self) -> str:

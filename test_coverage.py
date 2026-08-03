@@ -1,0 +1,42 @@
+"""Provider manifest + coverage map: self-documenting, and it can't drift.
+
+Providers declare the predicates they establish next to their own code; the
+coverage map is derived from that manifest and the engine's live vocabulary.
+So "which predicates still have no evidence source" is answered by the code,
+not a hand-maintained table.
+
+    python3 test_coverage.py
+"""
+from argus import engine, providers
+
+
+def test_manifest_declares_http_probe():
+    assert providers.PROVIDES["http_probe"] == (
+        "internet_facing", "technology", "authentication_required")
+
+
+def test_coverage_maps_every_predicate_once():
+    cov = providers.coverage()
+    assert set(cov) == set(engine._PREDICATES), "coverage must span exactly the vocabulary"
+    # what the HTTP probe fills
+    assert cov["technology"] == "http_probe"
+    assert cov["internet_facing"] == "http_probe"
+    assert cov["authentication_required"] == "http_probe"
+    # what discovery establishes from the name/graph
+    assert cov["publicly_discoverable"] == "discovery"
+    assert cov["name_suggests_admin"] == "discovery"
+    # the version-gated KEV provider fills these
+    assert cov["public_exploit"] == "kev"
+    assert cov["known_exploited"] == "kev"
+    # the certificate analyzer (Analysis-class provider) fills this
+    assert cov["certificate_reused"] == "cert_analysis"
+    # the last gap IS the roadmap — no provider asserts it yet
+    assert cov["has_admin_interface"] is None
+
+
+if __name__ == "__main__":
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            print(f"  PASS {name}")
+    print("all coverage checks passed")

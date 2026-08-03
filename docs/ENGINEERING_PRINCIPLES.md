@@ -331,12 +331,95 @@ investigator says, and it is all Argus claims.
 
 ---
 
+## The Provider Contract
+
+Principle 10 says a provider contributes observations, never conclusions. This
+is its operational form: the fixed shape every provider must satisfy so that the
+hundredth one is mechanical and still never reopens `engine.py`. Freezing it
+before the first Analysis provider is the same investment already paid for probe
+providers — define the interface once, and implementation becomes almost
+copy-work.
+
+### Three classes, one contract
+
+Providers differ only in *where the observation comes from*. What they may **do**
+with it is identical.
+
+| Class | Reads | Example | Contributes |
+|---|---|---|---|
+| **Discovery** | public sources | DNS, CT logs, RDAP | new entities — grows the graph |
+| **Probe** | the target, over the network | HTTP, TLS | facts about a host it contacted |
+| **Analysis** | the graph itself — no network | certificate reuse, ASN clustering | facts derived by comparing nodes |
+
+**Analysis** is the newest and strictest class: it reads `observed` and
+`evidence` across nodes, compares, and asserts a predicate — touching no network
+and mutating no graph shape. The separation that holds everywhere else holds
+here too: the TLS *probe* records a certificate fingerprint; the *analyzer*
+notices the same fingerprint on two hosts and asserts `certificate_reused`. The
+probe never claims reuse — it has only ever seen one host.
+
+### The completion checklist
+
+A provider is not done until every answer is "yes". These are Principle 10 made
+checkable:
+
+1. **Observations only** — it asserts facts, never priority, confidence, or risk.
+2. **No conclusions** — "what it means" is left entirely to the rules.
+3. **Declares its predicates** — registered with `@declares(...)`, so
+   `argus coverage` sees it and the coverage map cannot drift.
+4. **Independently testable** — its core runs with no network and no engine.
+5. **No engine change** — it plugs in without touching `engine.py` or a rule file.
+6. **Preserves the ledger** — every predicate it sets appears, signed and
+   sourced, in the explanation.
+7. **Minimum evidence** — it persists the *smallest* observation set that enables
+   downstream reasoning, and nothing more.
+
+Item 7 is the guard on the observation channel. Persist the certificate
+fingerprint, issuer, SANs, and validity dates a rule will actually use — not the
+whole certificate, the raw HTML, or every header. The moment a provider stores
+what nothing consumes, the channel stops being evidence and becomes a database
+nobody queries. Smallest set that enables the reasoning; no more.
+
+### Two per-entity channels: `evidence` and `observed`
+
+The split is load-bearing — it is what lets a provider establish a fact from data
+that is not itself a predicate:
+
+- **`evidence`** — engine-vocabulary predicates only (`technology`,
+  `known_exploited`). The Rule Engine reads it through `_ev()`; it feeds the
+  fingerprint, and therefore the conclusions.
+- **`observed`** — non-predicate facts one provider records for another
+  (`version` → the KEV provider; `cert_fingerprint` → the certificate analyzer).
+  The engine never reads it, so — by design, and consistent with
+  [`EVIDENCE_MODEL.md`](EVIDENCE_MODEL.md) Trap 1 — it never enters the
+  reproducibility hash. Raw observation stays here; only the *derived* predicate
+  crosses into `evidence`.
+
+That seam is why the KEV provider could assert `known_exploited` from a version
+it never had to make a predicate, and it is the same seam the TLS provider and
+certificate analyzer will use. `observed` is the lightweight form of the fuller
+observation model in [`EVIDENCE_MODEL.md`](EVIDENCE_MODEL.md); when a third
+provider makes provenance matter, that document — not this contract — is where
+the representation grows.
+
+**The observation channel is intentionally minimal, not unfinished.** It is
+expected to evolve into the Claim model in [`EVIDENCE_MODEL.md`](EVIDENCE_MODEL.md)
+*when multiple providers or conflicting observations require it* — the trigger is
+a real disagreement (two providers, one exclusive field, incompatible values),
+not a provider count. Until then, do not introduce structure that has no
+consumer: a single provider writing a single value per field is honestly
+representable today, and `Entity.observed` is right-sized for exactly that.
+
+---
+
 ## For contributors
 
 Before you add code, check it against the constitution:
 
 - Adding intelligence? It goes in a **rule (data)**, not in the engine, and it
   must be explainable and traceable (Principles 2–4).
+- Adding a provider? It satisfies the **Provider Contract** — observations only,
+  declares its predicates, independently testable, no engine change (Principle 10).
 - Reaching for an LLM? Only if the task is explain / summarize / converse /
   synthesize / answer. Anything that collects, correlates, scores, or decides
   stays deterministic (Principle 7).

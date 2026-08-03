@@ -81,6 +81,7 @@ def main(argv=None):
     al.add_argument("--json", action="store_true")
 
     sub.add_parser("modules", help="List available modules")
+    sub.add_parser("coverage", help="Which engine predicates have an evidence provider (the roadmap)")
 
     args = p.parse_args(argv)
 
@@ -89,14 +90,23 @@ def main(argv=None):
             print(f"  {name:<12} [{m.kind:<9}] {m.help}")
         return 0
 
+    if args.cmd == "coverage":
+        for pred, prov in providers.coverage().items():
+            print(f"  {pred:<28} {prov or '— NO PROVIDER'}")
+        return 0
+
     if args.cmd == "pivot":
         print(f"[argus] seed {args.seed!r} classified as: {classify(args.seed)}", file=sys.stderr)
         past = [] if args.no_memory else store.history(args.seed)
         g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
                                     expand_subdomains=args.deep))
         if args.probe:   # providers add evidence only — the engine is untouched by this
-            n = providers.enrich(g)
-            print(f"[argus] probed {n} host(s) — evidence attached", file=sys.stderr)
+            n = providers.enrich(g)                 # HTTP probe -> evidence + version
+            t = providers.enrich_tls(g)             # TLS probe -> observed cert fingerprint
+            k = providers.enrich_kev(g)             # analysis: version -> known_exploited
+            r = providers.analyze_certificates(g)   # analysis: shared cert -> certificate_reused
+            print(f"[argus] probed {n} HTTP, {t} TLS; {k} known-exploit, {r} cert-reuse — evidence attached",
+                  file=sys.stderr)
         result = investigate(g)   # discovery -> reasoning: the one result object
         if past:  # investigation memory — "I've seen this before"
             prev = past[-1]

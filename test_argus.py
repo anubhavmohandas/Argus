@@ -271,7 +271,7 @@ def test_evidence_provider():
     g.add(Entity("username", "someone", 1))     # not probeable — must be skipped
     shape = (len(g.nodes), len(g.edges), len(g.findings))
     real_probe = providers.probe
-    providers.probe = lambda host, timeout=8.0: {"internet_facing": True}
+    providers.probe = lambda host, timeout=8.0: ({"internet_facing": True}, {})  # (evidence, observed)
     try:
         assert providers.enrich(g) == 1, "only the subdomain is probeable"
     finally:
