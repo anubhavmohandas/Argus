@@ -68,6 +68,8 @@ def main(argv=None):
     pv.add_argument("--deep", type=int, default=0, help="re-pivot into N discovered subdomains (default 0)")
     pv.add_argument("--probe", action="store_true",
                     help="ACTIVE: connect to discovered hosts to establish evidence (off by default)")
+    pv.add_argument("--probe-paths", action="store_true",
+                    help="ACTIVE, louder: also request administrative paths (~5 requests/host). Implies --probe")
     pv.add_argument("--no-memory", action="store_true", help="don't save this run or compare against past ones")
     pv.add_argument("--json", action="store_true")
 
@@ -100,13 +102,15 @@ def main(argv=None):
         past = [] if args.no_memory else store.history(args.seed)
         g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
                                     expand_subdomains=args.deep))
-        if args.probe:   # providers add evidence only — the engine is untouched by this
+        if args.probe or args.probe_paths:   # providers add evidence only — the engine is untouched by this
             n = providers.enrich(g)                 # HTTP probe -> evidence + version
             t = providers.enrich_tls(g)             # TLS probe -> observed cert fingerprint
             k = providers.enrich_kev(g)             # analysis: version -> known_exploited
             r = providers.analyze_certificates(g)   # analysis: shared cert -> certificate_reused
-            print(f"[argus] probed {n} HTTP, {t} TLS; {k} known-exploit, {r} cert-reuse — evidence attached",
-                  file=sys.stderr)
+            line = f"probed {n} HTTP, {t} TLS; {k} known-exploit, {r} cert-reuse"
+            if args.probe_paths:   # its own flag: ~5x the requests against the target
+                line += f", {providers.enrich_admin(g)} admin-surface"
+            print(f"[argus] {line} — evidence attached", file=sys.stderr)
         result = investigate(g)   # discovery -> reasoning: the one result object
         if past:  # investigation memory — "I've seen this before"
             prev = past[-1]

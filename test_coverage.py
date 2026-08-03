@@ -30,8 +30,9 @@ def test_coverage_maps_every_predicate_once():
     assert cov["known_exploited"] == "kev"
     # the certificate analyzer (Analysis-class provider) fills this
     assert cov["certificate_reused"] == "cert_analysis"
-    # the last gap IS the roadmap — no provider asserts it yet
-    assert cov["has_admin_interface"] is None
+    # the path-based probe fills the last gap
+    assert cov["has_admin_interface"] == "admin_probe"
+    assert all(cov.values()), f"uncovered: {[p for p, v in cov.items() if not v]}"
 
 
 if __name__ == "__main__":

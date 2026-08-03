@@ -373,12 +373,36 @@ checkable:
    sourced, in the explanation.
 7. **Minimum evidence** — it persists the *smallest* observation set that enables
    downstream reasoning, and nothing more.
+8. **Minimum request surface** — it requests the *smallest* set of endpoints that
+   establishes its predicates, and nothing more.
 
 Item 7 is the guard on the observation channel. Persist the certificate
 fingerprint, issuer, SANs, and validity dates a rule will actually use — not the
 whole certificate, the raw HTML, or every header. The moment a provider stores
 what nothing consumes, the channel stops being evidence and becomes a database
 nobody queries. Smallest set that enables the reasoning; no more.
+
+Item 8 is the same discipline pointed outward, and it is the newer of the two.
+Item 7 governs what we *keep*; item 8 governs what we *send*. Every request a
+provider makes is traffic against infrastructure that is not ours: it shows up in
+someone's logs, spends someone's rate limit, and may trip someone's monitoring.
+So a path is probed because a predicate needs it, never because it might be
+interesting — the same rule that keeps speculative fields out of `observed` keeps
+speculative requests off the wire.
+
+`admin_probe` is the worked example. It asks for four unambiguously
+administrative paths and one **control** path that cannot exist. The control is
+not overhead — it is what makes the result evidence: plenty of hosts answer `200`
+for every path, so until you know what *nothing* looks like on this host, a live
+`/admin` proves nothing. `/login` is deliberately absent: a login page
+establishes authentication, which `authentication_required` already carries, so
+probing for it would spend a request on a predicate that is already covered.
+
+A provider that expands the request surface is a **scope decision, not an
+implementation detail**, and it surfaces in the CLI as its own flag
+(`--probe-paths`) rather than quietly multiplying the traffic of an existing one.
+Active engagement stays something the operator chooses at the granularity it is
+paid for.
 
 ### Two per-entity channels: `evidence` and `observed`
 

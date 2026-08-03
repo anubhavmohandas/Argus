@@ -12,8 +12,10 @@ The contract, and it is the whole point:
 
 So this file asserts `technology`, `internet_facing`, `authentication_required`
 — things it directly observed on the wire. It does not assert "high risk",
-"exploitable", or even "this is an admin interface". Those are the rule
-engine's, exclusively. Adding a provider must never require an engine change:
+"exploitable", or "this host matters". Those are the rule engine's, exclusively.
+`has_admin_interface` is the line worth studying: a provider may assert it only
+by *reaching* an administrative surface and observing how it answers, never by
+reasoning from a hostname or from `technology == "jenkins"`. Adding a provider must never require an engine change:
 that property is what makes Argus grow by adding evidence instead of rewriting
 intelligence.
 
@@ -178,10 +180,10 @@ def version_from(headers: dict) -> str | None:
     return None
 
 
-# occam: no has_admin_interface — asserting it from `technology == "jenkins"`
-#        would be the provider drawing a conclusion. That mapping is the rule
-#        engine's job (see rules/jenkins_confirmed.toml). Assert it only when a
-#        probe actually reaches an admin surface.
+# No has_admin_interface here — asserting it from `technology == "jenkins"` would
+# be the provider drawing a conclusion. That mapping is the rule engine's job
+# (see rules/jenkins_confirmed.toml). The predicate is earned by reaching an
+# admin surface and observing it: `admin_probe`, at the bottom of this file.
 # occam: no certificate_reused — it compares entities, so it is reasoning, not
 #        observation. It belongs to a predicate over the graph, not here.
 def probe(host: str, timeout: float = 8.0) -> tuple[dict, dict]:
@@ -392,4 +394,105 @@ def analyze_certificates(g) -> int:
         if getattr(e, "observed", {}).get("cert_fingerprint") in reused:
             e.evidence["certificate_reused"] = True
             marked += 1
+    return marked
+
+
+# --- administrative surface probe -----------------------------------------
+# The first provider that requests more than `/`. Every probe until now asked
+# the host one question; this one asks five, so the contract gains item 8:
+# request the minimum path set that establishes the predicate. Four
+# unambiguously administrative paths, plus one control.
+#
+# The control is what makes this evidence instead of a guess. Plenty of hosts
+# answer 200 (or a redirect) for *every* path — a catch-all, an SPA router, a
+# soft-404. So we first ask for a path that cannot exist, learn what "nothing
+# here" looks like on this host, and only count a path that answers differently.
+#
+# `/login` is deliberately NOT in the set: a login page is evidence of
+# authentication, not of an administrative surface, and `authentication_required`
+# already carries that. Every path here is administrative or it isn't probed.
+_ADMIN_PATHS = ("/admin/", "/administrator/", "/manager/", "/wp-admin/")
+_CONTROL_PATH = "/argus-control-path-that-does-not-exist"
+_ADMIN_TITLE_HINTS = ("admin", "dashboard", "console", "control panel", "manager")
+
+
+def _shape(status: int, headers: dict, body: str) -> tuple:
+    """The comparable shape of one response: status + title. Two paths with the
+    same shape are the same page — which is the catch-all case, not two surfaces."""
+    m = _TITLE_RE.search(body) if body else None
+    return status, (m.group(1).strip().lower() if m else "")
+
+
+def _is_admin_surface(status: int, headers: dict, title: str) -> bool:
+    """Pure: does this response look like a real administrative interface?
+
+    An auth challenge, a redirect into a login flow, or a served page whose title
+    names an admin surface. A bare 200 with no such marker is a page we cannot
+    characterise — and an uncharacterised page is not an admin interface.
+    """
+    if status in (401, 403) or "www-authenticate" in headers:
+        return True
+    if status in (301, 302, 303, 307, 308):
+        return any(h in headers.get("location", "").lower() for h in _LOGIN_HINTS)
+    if status == 200:
+        return any(h in title for h in _LOGIN_HINTS + _ADMIN_TITLE_HINTS)
+    return False
+
+
+def admin_evidence(control: tuple, responses: dict) -> dict:
+    """Pure: (control response, {path: response}) -> evidence. No I/O.
+
+    Two conditions, and both are required. The path must not answer the way this
+    host answers for something that isn't there — otherwise it's a catch-all and
+    the path proves nothing. And what it returns must actually look like an
+    administrative surface. `/admin` existing is not the claim; `/admin` behaving
+    like an admin interface is.
+
+    Never asserts False. Four paths came back empty-handed means we checked four
+    paths, not that the host has no admin surface — so the predicate stays
+    `unknown` (invariant I-1) rather than claiming a negative we did not establish.
+    """
+    for status, headers, body in responses.values():
+        if not status:
+            continue                      # never reached it: established nothing
+        shape = _shape(status, headers, body)
+        if shape == control:
+            continue                      # answers like a path that isn't there
+        if _is_admin_surface(status, headers, shape[1]):
+            return {"has_admin_interface": True}
+    return {}
+
+
+def admin_probe(host: str, timeout: float = 8.0) -> dict:
+    """Probe one host's administrative paths. Returns evidence; {} establishes
+    nothing. Control request first — it both picks the scheme and defines what
+    'nothing here' looks like, so an unreachable host costs exactly one request."""
+    if not _resolvable_and_global(host):
+        return {}
+    for scheme in ("https", "http"):
+        status, headers, body = _fetch(f"{scheme}://{host}{_CONTROL_PATH}", timeout)
+        if status:
+            return admin_evidence(
+                _shape(status, headers, body),
+                {p: _fetch(f"{scheme}://{host}{p}", timeout) for p in _ADMIN_PATHS})
+    return {}
+
+
+@declares("admin_probe", ("has_admin_interface",))
+def enrich_admin(g, timeout: float = 8.0, workers: int = 8) -> int:
+    """Attach admin-surface evidence to every probeable node. Returns hosts marked.
+
+    Costs up to 5 requests per host against someone else's infrastructure, which
+    is why the CLI puts it behind its own flag rather than folding it into
+    `--probe`. Writes only to `Entity.evidence`; no nodes, edges, or findings.
+    """
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    marked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, ev in zip(targets, ex.map(lambda e: admin_probe(e.value, timeout), targets)):
+            if ev:
+                ent.evidence.update(ev)
+                marked += 1
     return marked
