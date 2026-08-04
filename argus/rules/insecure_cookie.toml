@@ -1,0 +1,20 @@
+# A probe saw a Set-Cookie that shipped without HttpOnly (or, over TLS, without
+# Secure). A session cookie readable from JavaScript or sent in the clear is a
+# classic low/medium finding and a lead toward session-handling weaknesses.
+id = "insecure_cookie"
+name = "Cookie set without security flags"
+description = "A publicly reachable host set a cookie missing HttpOnly, or missing Secure over HTTPS."
+base_confidence = 30
+tags = ["exposure", "session", "bug-bounty"]
+version = 1
+
+[requires]
+insecure_cookie = true
+internet_facing = true
+
+[outputs]
+priority = "low"
+recommendation = [
+    "Set HttpOnly on session cookies, and Secure on all cookies served over HTTPS",
+]
+hypothesis = ["A cookie without HttpOnly/Secure may be stealable via XSS or a downgraded connection"]

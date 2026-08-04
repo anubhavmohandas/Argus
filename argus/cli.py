@@ -69,7 +69,7 @@ def main(argv=None):
     pv.add_argument("--probe", action="store_true",
                     help="ACTIVE: connect to discovered hosts to establish evidence (off by default)")
     pv.add_argument("--probe-paths", action="store_true",
-                    help="ACTIVE, louder: also request administrative paths (~5 requests/host). Implies --probe")
+                    help="ACTIVE, louder: also request administrative + sensitive-file paths (~9 requests/host). Implies --probe")
     pv.add_argument("--no-memory", action="store_true", help="don't save this run or compare against past ones")
     pv.add_argument("--json", action="store_true")
 
@@ -108,8 +108,8 @@ def main(argv=None):
             k = providers.enrich_kev(g)             # analysis: version -> known_exploited
             r = providers.analyze_certificates(g)   # analysis: shared cert -> certificate_reused
             line = f"probed {n} HTTP, {t} TLS; {k} known-exploit, {r} cert-reuse"
-            if args.probe_paths:   # its own flag: ~5x the requests against the target
-                line += f", {providers.enrich_admin(g)} admin-surface"
+            if args.probe_paths:   # its own flag: multiplies the requests against the target
+                line += f", {providers.enrich_admin(g)} admin-surface, {providers.enrich_exposure(g)} exposed-file"
             print(f"[argus] {line} — evidence attached", file=sys.stderr)
         result = investigate(g)   # discovery -> reasoning: the one result object
         if past:  # investigation memory — "I've seen this before"

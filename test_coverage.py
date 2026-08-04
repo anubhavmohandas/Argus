@@ -12,7 +12,8 @@ from argus import engine, providers
 
 def test_manifest_declares_http_probe():
     assert providers.PROVIDES["http_probe"] == (
-        "internet_facing", "technology", "authentication_required")
+        "internet_facing", "technology", "authentication_required",
+        "security_headers_missing", "insecure_cookie")
 
 
 def test_coverage_maps_every_predicate_once():
@@ -32,6 +33,11 @@ def test_coverage_maps_every_predicate_once():
     assert cov["certificate_reused"] == "cert_analysis"
     # the path-based probe fills the last gap
     assert cov["has_admin_interface"] == "admin_probe"
+    # web-exposure predicates: two come free from the base HTTP probe, one from
+    # the path-based exposure probe (owasp_scanner patterns as evidence)
+    assert cov["security_headers_missing"] == "http_probe"
+    assert cov["insecure_cookie"] == "http_probe"
+    assert cov["exposed_sensitive_file"] == "exposure_probe"
     assert all(cov.values()), f"uncovered: {[p for p, v in cov.items() if not v]}"
 
 

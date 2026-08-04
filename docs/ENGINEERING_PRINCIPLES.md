@@ -264,7 +264,7 @@ the confidence does *not* yet account for.
 | Tier | Examples | Established by |
 |---|---|---|
 | **Discovery** — observations | `publicly_discoverable`, `name_suggests_admin`, `name_suggests_preprod`, `name_suggests_cdn`, `name_suggests_technology` | a public source, or the hostname itself. Determinate — the name is fully known. |
-| **Probe** — facts about the host | `internet_facing`, `has_admin_interface`, `technology`, `authentication_required`, `public_exploit` | something that actually checked. `unknown` until then; never inferred from a name or an entity type. |
+| **Probe** — facts about the host | `internet_facing`, `has_admin_interface`, `technology`, `authentication_required`, `public_exploit`, `security_headers_missing`, `insecure_cookie`, `exposed_sensitive_file` | something that actually checked. `unknown` until then; never inferred from a name or an entity type. |
 
 A hostname containing `admin` is a **lead**, not a finding. Calling that
 predicate `has_admin_interface` would have Argus reporting a name as a fact —

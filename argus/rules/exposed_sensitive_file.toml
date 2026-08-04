@@ -1,0 +1,26 @@
+# A probe reached a sensitive file (.git/.env/.DS_Store) and its body confirmed
+# the real thing — not a soft-404. This is the disclosure a hunter sits down
+# hoping to find: an exposed .git or .env is often a straight line to source or
+# secrets. High base: the file was fetched and verified, it is a fact.
+id = "exposed_sensitive_file"
+name = "Sensitive file exposed"
+description = "A publicly reachable host served a sensitive file (source-control metadata, environment config, or filesystem metadata) whose contents confirmed it is the real file."
+base_confidence = 70
+tags = ["exposure", "disclosure", "bug-bounty"]
+version = 1
+
+[requires]
+exposed_sensitive_file = true
+internet_facing = true
+
+[[adjustments]]
+if = "authentication_required"
+subtract = 10
+
+[outputs]
+priority = "high"
+recommendation = [
+    "Block access to dotfiles and VCS metadata (.git, .env, .DS_Store) at the web server",
+    "Rotate any credentials that may have been exposed via the leaked file",
+]
+hypothesis = ["Exposed source-control or environment data may reveal secrets or internal structure"]

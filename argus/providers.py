@@ -62,6 +62,38 @@ _TECH_BY_TITLE = ["jenkins", "gitlab", "grafana", "kibana", "phpmyadmin",
 _LOGIN_HINTS = ("sign in", "log in", "login", "authentication required",
                 "unauthorized", "sso")
 
+# Web-exposure observations, harvested from the owasp_scanner misconfig/crypto
+# patterns and reshaped to fit the Provider Contract: the probe RECORDS what a
+# single ordinary GET revealed (which hardening headers were absent, whether a
+# cookie shipped without its flags) and asserts nothing about what it means. The
+# rules in rules/*.toml draw the conclusion. Both come free from the `/` response
+# the base probe already fetches — zero extra requests (checklist item 8).
+_SECURITY_HEADERS = ("strict-transport-security", "content-security-policy",
+                     "x-content-type-options", "x-frame-options")
+
+
+def missing_security_headers(headers: dict) -> list:
+    """Pure: which core hardening headers this response did NOT carry.
+
+    Headers arrive already lowercased from `_fetch`. The list is the observation;
+    the boolean predicate `security_headers_missing` is derived from it."""
+    return [h for h in _SECURITY_HEADERS if h not in headers]
+
+
+def cookie_is_insecure(headers: dict, scheme: str = "https"):
+    """Pure: does the response's Set-Cookie lack Secure/HttpOnly? None if it set
+    no cookie — 'no cookie' is not 'a secure cookie', so it stays unknown (I-1).
+
+    occam: inspects the last Set-Cookie header only (urllib collapses repeats);
+    a response juggling several cookies is judged on its last one. Upgrade path =
+    read the raw header list if per-cookie flags start to matter. `Secure` is
+    only meaningful over TLS, so its absence counts only when scheme is https."""
+    sc = headers.get("set-cookie")
+    if not sc:
+        return None
+    low = sc.lower()
+    return "httponly" not in low or (scheme == "https" and "secure" not in low)
+
 
 def _resolvable_and_global(host: str) -> bool:
     """True only if every address `host` resolves to is public.
@@ -117,7 +149,7 @@ def _fetch(url: str, timeout: float) -> tuple[int, dict, str]:
         return 0, {}, ""
 
 
-def evidence_from(status: int, headers: dict, body: str) -> dict:
+def evidence_from(status: int, headers: dict, body: str, scheme: str = "https") -> dict:
     """Pure: one HTTP response -> the evidence it establishes. No I/O.
 
     Only facts we actually observed go in. What the response doesn't show stays
@@ -156,6 +188,14 @@ def evidence_from(status: int, headers: dict, body: str) -> dict:
         # We got the page. This is a real observation either way — the probe
         # checked, so False here is established evidence, not invented silence.
         ev["authentication_required"] = any(h in title for h in _LOGIN_HINTS)
+        # Hardening posture is only judgeable on a page that actually served.
+        # A 200 with every header present is an established negative (checked,
+        # fine), not silence — same honesty as authentication_required above.
+        ev["security_headers_missing"] = bool(missing_security_headers(headers))
+
+    cookie = cookie_is_insecure(headers, scheme)
+    if cookie is not None:                       # None => no cookie set => unknown
+        ev["insecure_cookie"] = cookie
     return ev
 
 
@@ -199,7 +239,10 @@ def probe(host: str, timeout: float = 8.0) -> tuple[dict, dict]:
             ver = version_from(headers)
             if ver:
                 observed["version"] = ver
-            return evidence_from(status, headers, body), observed
+            missing = missing_security_headers(headers) if status == 200 else []
+            if missing:                       # the specifics, for a human/NYX to read
+                observed["missing_headers"] = missing
+            return evidence_from(status, headers, body, scheme), observed
     return {}, {}
 
 
@@ -221,7 +264,8 @@ def declares(name: str, provides):
     return deco
 
 
-@declares("http_probe", ("internet_facing", "technology", "authentication_required"))
+@declares("http_probe", ("internet_facing", "technology", "authentication_required",
+                         "security_headers_missing", "insecure_cookie"))
 def enrich(g, timeout: float = 8.0, workers: int = 8) -> int:
     """Attach probe evidence to every probeable node. Returns hosts reached.
 
@@ -492,6 +536,84 @@ def enrich_admin(g, timeout: float = 8.0, workers: int = 8) -> int:
     marked = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         for ent, ev in zip(targets, ex.map(lambda e: admin_probe(e.value, timeout), targets)):
+            if ev:
+                ent.evidence.update(ev)
+                marked += 1
+    return marked
+
+
+# --- exposed sensitive-file probe -----------------------------------------
+# The owasp_scanner "information disclosure / exposed files" pattern, reshaped to
+# the Provider Contract. Same control-gated discipline as admin_probe: a host
+# that answers 200 for everything proves nothing, so we first learn what "not
+# here" looks like, then only count a path that answers differently AND whose
+# body actually looks like the sensitive file it claims to be. `/.git/HEAD`
+# returning a soft-404 branded 200 is not an exposed repo; `/.git/HEAD` returning
+# "ref: refs/heads/main" is. A signature per path is what makes this evidence
+# instead of a guess — and it is exactly the disclosure that turns a domain into
+# a lead when you sit down to hunt.
+_SENSITIVE_PATHS = ("/.git/HEAD", "/.env", "/.DS_Store")
+_ENV_LINE = re.compile(r"(?m)^[A-Z_][A-Z0-9_]*=")
+
+
+def _looks_like(path: str, body: str) -> bool:
+    """Pure: does `body` match the real content signature for `path`?
+    occam: one cheap signature per path — enough to reject a soft-404. Add more
+    paths (and their signatures) here; the provider itself never changes."""
+    if path == "/.git/HEAD":
+        return body.lstrip().startswith("ref:")            # a real git HEAD ref
+    if path == "/.env":
+        return bool(_ENV_LINE.search(body))                # KEY=VALUE dotenv lines
+    if path == "/.DS_Store":
+        return "Bud1" in body[:64]                          # DS_Store magic
+    return False
+
+
+def sensitive_evidence(control: tuple, responses: dict) -> dict:
+    """Pure: (control response shape, {path: (status, headers, body)}) -> evidence.
+
+    Both conditions required, same as admin_evidence: the path must not answer
+    the way this host answers for something absent (else it's a catch-all), and
+    the body must actually be the file. Never asserts False — three paths coming
+    back empty means we checked three paths, not that nothing is exposed (I-1)."""
+    for path, (status, headers, body) in responses.items():
+        if not status:
+            continue                          # never reached it: established nothing
+        if _shape(status, headers, body) == control:
+            continue                          # answers like a path that isn't there
+        if status == 200 and _looks_like(path, body):
+            return {"exposed_sensitive_file": True}
+    return {}
+
+
+def exposure_probe(host: str, timeout: float = 8.0) -> dict:
+    """Probe one host's sensitive paths. Returns evidence; {} establishes nothing.
+    Control request first — it picks the scheme and defines 'nothing here', so an
+    unreachable host costs exactly one request (same shape as admin_probe)."""
+    if not _resolvable_and_global(host):
+        return {}
+    for scheme in ("https", "http"):
+        status, headers, body = _fetch(f"{scheme}://{host}{_CONTROL_PATH}", timeout)
+        if status:
+            return sensitive_evidence(
+                _shape(status, headers, body),
+                {p: _fetch(f"{scheme}://{host}{p}", timeout) for p in _SENSITIVE_PATHS})
+    return {}
+
+
+@declares("exposure_probe", ("exposed_sensitive_file",))
+def enrich_exposure(g, timeout: float = 8.0, workers: int = 8) -> int:
+    """Attach exposed-file evidence to every probeable node. Returns hosts marked.
+
+    Requests up to 4 paths per host (control + 3 files) against someone else's
+    infrastructure, so it rides the same opt-in active tier as admin_probe rather
+    than the default probe. Writes only to `Entity.evidence`."""
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    marked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, ev in zip(targets, ex.map(lambda e: exposure_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
                 marked += 1

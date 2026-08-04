@@ -77,6 +77,23 @@ Add a module: write a `@module(...)`-decorated function in
 [`argus/modules.py`](argus/modules.py) that yields `Finding`s. It
 auto-registers and the pivot engine can chain it.
 
+## Evidence providers (the probes)
+
+Providers don't grow the graph — they establish facts about hosts it already
+found, and write them where the rules read (`--probe` / `--probe-paths`, opt-in
+because probing is active). Web-exposure evidence is harvested from the
+`owasp_scanner` misconfiguration/disclosure patterns:
+
+| Predicate | Provider | Establishes |
+|---|---|---|
+| `security_headers_missing` / `insecure_cookie` | `http_probe` | hardening gaps + cookie flags — free, from the one `/` response |
+| `exposed_sensitive_file` | `exposure_probe` | a reachable `.git` / `.env` / `.DS_Store` whose body confirms the real file |
+
+Each is an *observation* only; the conclusion is a TOML rule
+([`rules/exposed_sensitive_file.toml`](argus/rules/exposed_sensitive_file.toml),
+`missing_security_headers`, `insecure_cookie`). `argus coverage` maps every
+predicate to its provider.
+
 ## Architecture
 
 ```
@@ -126,8 +143,12 @@ Pre-1.0: the surface is deliberate, but not yet frozen.
 - **Optional LLM layer (NYX)** — sits *above* the engine to explain,
   summarize, converse, and answer questions over its output. It never decides
   investigation logic — that stays deterministic (Rule 7).
-- **Your `MY OWN` tools** — recon_scanner / owasp_scanner / whoisuser /
-  secure_gen / CyberTrace register as modules and feed the same graph.
+- **Your `MY OWN` tools** — `owasp_scanner`'s observation-class checks are in,
+  as the web-exposure providers above. Its active-injection modules and
+  `secure_gen`'s payload generation stay *out* of the engine by design
+  (Principle 7: Argus observes and reasons; it does not exploit) — they belong
+  above it. recon_scanner / whoisuser / CyberTrace patterns (more subdomain
+  sources, wider username lists, more seed types) land as further modules.
 - **Persistence** — SQLite findings store (pentest-ai schema) for
   cross-run engagements.
 - **Person-OSINT modules** — breach correlation, reverse-image, more
@@ -147,4 +168,5 @@ Strengths adapted (all MIT): secret catalog from
 from [Shadowbroker](https://github.com/bigbodycobain/Shadowbroker) ·
 findings-DB schema from
 [pentest-ai-agents](https://github.com/0xSteph/pentest-ai-agents) · engine
-concept from [CAI](https://github.com/aliasrobotics/cai).
+concept from [CAI](https://github.com/aliasrobotics/cai) · web-exposure evidence
+patterns from `owasp_scanner`.

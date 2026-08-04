@@ -1,0 +1,26 @@
+# A probe served a 200 page that was missing one or more core hardening headers
+# (HSTS / CSP / X-Content-Type-Options / X-Frame-Options). Low base on purpose:
+# missing headers are a hardening gap, not a vulnerability on their own — but
+# they are a real, reportable observation and a signal the surface is worth a
+# closer look. The *which* is in Entity.observed["missing_headers"].
+id = "missing_security_headers"
+name = "Security headers missing"
+description = "A publicly reachable host served a page without one or more core hardening headers (HSTS, CSP, X-Content-Type-Options, X-Frame-Options)."
+base_confidence = 25
+tags = ["exposure", "hardening"]
+version = 1
+
+[requires]
+security_headers_missing = true
+internet_facing = true
+
+[[adjustments]]
+if = "insecure_cookie"
+add = 10
+
+[outputs]
+priority = "low"
+recommendation = [
+    "Set the missing hardening headers (HSTS, CSP, X-Content-Type-Options, X-Frame-Options)",
+]
+hypothesis = ["Weak response hardening may widen the impact of another finding (e.g. XSS, clickjacking)"]

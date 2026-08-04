@@ -183,6 +183,10 @@ _PREDICATES = {
     "public_exploit": _ev("public_exploit"),
     "known_exploited": _ev("known_exploited"),
     "certificate_reused": _ev("certificate_reused"),
+    # web-exposure facts (owasp_scanner patterns, provider-established)
+    "security_headers_missing": _ev("security_headers_missing"),
+    "insecure_cookie": _ev("insecure_cookie"),
+    "exposed_sensitive_file": _ev("exposed_sensitive_file"),
 }
 # occam: no dns_resolves / http_reachable / tls_valid / certificate_seen yet —
 #        nothing asserts them and no rule reads them. Add each with its probe.
