@@ -71,24 +71,30 @@ def test_normalize_child_drops_junk():
 
 
 def test_priority():
-    # triage folded into the engine: priority is now one read-only engine output.
+    # priority is a conclusion kind, not a second output type: same Conclusion,
+    # same ledger, ranked by score instead of confidence.
     from argus import engine
     g = Graph()
     for v in ("admin.example.com", "cdn-static.example.com", "shop.example.com"):
         g.add(Entity("subdomain", v, 1))
     r = engine.investigate(g)
-    score = {p.value: p.score for p in r.priority}
+    score = {p.target: p.score for p in r.priority}
     assert score["admin.example.com"] > score["shop.example.com"] > score["cdn-static.example.com"], score
-    assert r.interesting[0].value == "admin.example.com"          # look here first
-    assert "admin surface" in r.interesting[0].why
-    assert [p.value for p in r.noise] == ["cdn-static.example.com"]
+    assert r.interesting[0].target == "admin.example.com"         # look here first
+    assert "admin surface" in r.interesting[0].name
+    assert [p.target for p in r.noise] == ["cdn-static.example.com"]
+    # the score is traceable, exactly like a confidence — no opaque number (I-2)
+    top = r.interesting[0]
+    assert top.kind == "priority" and top.confidence == 100
+    assert {"predicate": "name:admin", "applied": True, "delta": 5} in top.ledger["evidence"]
+    assert top.ledger["final"] == top.score
     # read-only: scoring must not mutate the evidence graph
     before = g.to_dict()
     engine.investigate(g)
     assert g.to_dict() == before
     # a critical finding on an otherwise-boring host lifts it above the bare name
     g.findings.append(Finding("secrets", "shop.example.com", "AWS_ACCESS_KEY", core.CRITICAL))
-    score2 = {p.value: p.score for p in engine.investigate(g).priority}
+    score2 = {p.target: p.score for p in engine.investigate(g).priority}
     assert score2["shop.example.com"] > score2["admin.example.com"]
 
 
@@ -104,7 +110,7 @@ def test_rules():
     assert jc, [c.rule for c in c1]
     # name-only lead (40) + public exploit (10). Reaching 65 needs probe facts —
     # the name alone must never score like a verified finding.
-    assert jc[0].confidence == 50 and jc[0].priority == "high", jc[0]
+    assert jc[0].confidence == 50 and jc[0].severity == "high", jc[0]
     calc = jc[0].ledger["calculation"]                    # 40 base, +10 public_exploit -> traceable
     assert calc[0] == {"step": "base", "delta": 40}
     assert {"step": "public_exploit", "delta": 10} in calc

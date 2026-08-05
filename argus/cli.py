@@ -41,6 +41,87 @@ def _color_enabled() -> bool:
 _COLOR = _color_enabled()
 
 
+# --- banner ---------------------------------------------------------------
+# ANSI Shadow "ARGUS", coloured with a magenta->cyan vertical gradient using
+# 24-bit truecolor. Hardcoded art keeps the tool dependency-free (no figlet).
+# Everything degrades to plain text when colour is off (NO_COLOR / piped /
+# legacy console), so the same code is safe in a script or a redirect.
+_BANNER_ART = [
+    " █████╗ ██████╗  ██████╗ ██╗   ██╗███████╗",
+    "██╔══██╗██╔══██╗██╔════╝ ██║   ██║██╔════╝",
+    "███████║██████╔╝██║  ███╗██║   ██║███████╗",
+    "██╔══██║██╔══██╗██║   ██║██║   ██║╚════██║",
+    "██║  ██║██║  ██║╚██████╔╝╚██████╔╝███████║",
+    "╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝",
+]
+_BANNER_TAGLINE = "  autonomous correlation recon engine · by Anubhav Mohandas"
+_GRAD_START, _GRAD_END = (255, 0, 153), (0, 224, 255)   # magenta -> cyan
+
+
+def banner() -> str:
+    """The ARGUS wordmark. Coloured only when the terminal will render it."""
+    if not _COLOR:
+        return "\n".join(_BANNER_ART) + "\n\n" + _BANNER_TAGLINE
+    n = len(_BANNER_ART)
+    out = []
+    for i, line in enumerate(_BANNER_ART):
+        t = i / (n - 1)
+        r, g, b = (round(a + (z - a) * t) for a, z in zip(_GRAD_START, _GRAD_END))
+        out.append(f"\033[1;38;2;{r};{g};{b}m{line}{_RESET}")
+    out.append("")
+    out.append(f"\033[2;38;2;0;224;255m{_BANNER_TAGLINE}{_RESET}")
+    return "\n".join(out)
+
+
+# --- interactive menu -----------------------------------------------------
+# Menu choice -> the pivot flags for that engagement level. The heavy lifting
+# is NOT reimplemented here: the menu builds an argv and re-enters main(), so
+# there is exactly one pivot code path whether you use flags or the menu.
+_MODES = {
+    "1": ("Passive", "public sources only — never touches the target", []),
+    "2": ("Active", "+ probe hosts: HTTP/TLS, known-exploit, cert reuse", ["--probe"]),
+    "3": ("Active+", "+ request admin & sensitive paths (.git/.env)", ["--probe-paths"]),
+    "4": ("Full scan", "+ TCP port scan & service-CVE match (loudest)", ["--scan"]),
+}
+
+
+def _confirm_active() -> bool:
+    """Active modes connect to the target's own servers — a real authorization
+    boundary, so it is an explicit, defaulted-to-no confirmation, never assumed."""
+    warn = "\n  ⚠  ACTIVE mode connects to the target's OWN servers."
+    print(f"\033[33m{warn}\033[0m" if _COLOR else warn)
+    print("     Only run this on assets you own or are authorized to test.")
+    return input("     Proceed? [y/N]: ").strip().lower() in ("y", "yes")
+
+
+def interactive() -> int:
+    """The 'main menu': banner, seed prompt, mode picker. Bare `argus` on a
+    terminal lands here; scripts (no TTY) get --help instead so nothing hangs."""
+    print(banner())
+    try:
+        seed = input("\n  Seed (domain / ip / email / username / phone): ").strip()
+        if not seed:
+            print("  no seed given — bye.")
+            return 0
+        print("\n  Engagement level:")
+        for key, (label, desc, _) in _MODES.items():
+            tag = "  (safe default)" if key == "1" else ""
+            print(f"   [{key}] {label:<9} {desc}{tag}")
+        choice = input("\n  Mode [1-4, default 1]: ").strip() or "1"
+        if choice not in _MODES:
+            print("  not a valid choice — staying passive.")
+            choice = "1"
+        flags = _MODES[choice][2]
+        if flags and not _confirm_active():
+            print("  cancelled — nothing sent to the target.")
+            return 0
+    except (EOFError, KeyboardInterrupt):
+        print("\n  cancelled.")
+        return 0
+    print()
+    return main(["pivot", seed] + flags)
+
+
 def _print_findings(findings, as_json: bool):
     if as_json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))
@@ -70,6 +151,10 @@ def main(argv=None):
                     help="ACTIVE: connect to discovered hosts to establish evidence (off by default)")
     pv.add_argument("--probe-paths", action="store_true",
                     help="ACTIVE, louder: also request administrative + sensitive-file paths (~9 requests/host). Implies --probe")
+    pv.add_argument("--scan", action="store_true",
+                    help="ACTIVE, loudest: TCP-connect scan discovered hosts for open ports + service versions, then match a CVE catalog")
+    pv.add_argument("--ports", default=None,
+                    help="port spec for --scan, e.g. '1-1024' or '22,80,443' (default: common service ports)")
     pv.add_argument("--no-memory", action="store_true", help="don't save this run or compare against past ones")
     pv.add_argument("--json", action="store_true")
 
@@ -111,6 +196,14 @@ def main(argv=None):
             if args.probe_paths:   # its own flag: multiplies the requests against the target
                 line += f", {providers.enrich_admin(g)} admin-surface, {providers.enrich_exposure(g)} exposed-file"
             print(f"[argus] {line} — evidence attached", file=sys.stderr)
+        if args.scan:   # loudest tier: a TCP connect scan is unmistakable in the target's logs
+            try:
+                ports = providers.parse_ports(args.ports) if args.ports else None
+            except ValueError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            v = providers.enrich_scan(g, ports=ports)
+            print(f"[argus] port-scanned hosts; {v} with a catalog CVE — evidence attached", file=sys.stderr)
         result = investigate(g)   # discovery -> reasoning: the one result object
         if past:  # investigation memory — "I've seen this before"
             prev = past[-1]
@@ -137,6 +230,10 @@ def main(argv=None):
         _print_findings(run_all(args.target), args.json)
         return 0
 
+    # No subcommand: on a real terminal, open the interactive menu; piped or
+    # scripted (no TTY), print help so nothing ever blocks on input().
+    if args.cmd is None and sys.stdin.isatty() and sys.stdout.isatty():
+        return interactive()
     p.print_help()
     return 0
 

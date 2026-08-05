@@ -106,7 +106,7 @@ def test_exposed_file_produces_a_conclusion_with_no_engine_change():
     concl = engine.evaluate(g, engine.load_rules())
     fired = [c for c in concl if c.rule == "exposed_sensitive_file"]
     assert fired, "the exposed-file rule must fire on the provider's evidence"
-    assert fired[0].confidence == 70 and fired[0].priority == "high"
+    assert fired[0].confidence == 70 and fired[0].severity == "high"
 
 
 if __name__ == "__main__":

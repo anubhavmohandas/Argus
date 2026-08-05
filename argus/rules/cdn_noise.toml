@@ -10,5 +10,5 @@ version = 2
 name_suggests_cdn = true
 
 [outputs]
-priority = "noise"
+severity = "info"          # deprioritized via tags = ["noise"], not a fake severity
 recommendation = ["Deprioritize unless it fronts an origin you can reach"]

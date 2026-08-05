@@ -618,3 +618,178 @@ def enrich_exposure(g, timeout: float = 8.0, workers: int = 8) -> int:
                 ent.evidence.update(ev)
                 marked += 1
     return marked
+
+
+# --- TCP port scan + service-version CVE match ----------------------------
+# The first provider that speaks TCP instead of HTTP — the `nmap -p` half of a
+# recon pass. It connects to a set of ports, records which answer, reads the
+# banner a service volunteers on connect, and parses (product, version) out of
+# it. That is pure observation: exactly the same move as reading a version out of
+# X-Jenkins, just off a raw socket. It asserts NOTHING about risk.
+#
+# A second, offline step matches those versions against a local CVE catalog (same
+# discipline and same ceiling as _KEV_CATALOG) and establishes ONE predicate,
+# `known_vulnerable_service` — "a service on this host reported a version with a
+# known CVE". WHICH CVEs, and whether each is exploited, ride in
+# `observed["cves"]` for the dossier and NYX to read; the predicate is the single
+# trigger a rule concludes on. The scan owns only that one predicate, so it never
+# collides with the HTTP probe's `technology`/`version` (a host can run both).
+#
+# This is the loudest provider Argus has: a connect scan is unmistakable in the
+# target's logs, so the CLI gates it behind its own flag, never the default probe.
+_DEFAULT_PORTS = (21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445,
+                  993, 995, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200)
+
+# banner substring -> canonical product name in the CVE catalog (lowercased).
+_PRODUCT_ALIASES = {"openssh": "openssh", "vsftpd": "vsftpd", "proftpd": "proftpd",
+                    "exim": "exim", "nginx": "nginx", "apache": "apache",
+                    "microsoft-iis": "iis"}
+# First dotted version in a banner. Numeric-only on purpose: OpenSSH's "8.9p1"
+# keeps the "p1" out, so _ver_tuple (numeric dotted) can compare it. occam.
+_VER_IN_BANNER = re.compile(r"\d+\.\d+(?:\.\d+){0,2}")
+
+
+def parse_ports(spec: str) -> list[int]:
+    """'22,80,8000-8100' -> sorted unique port list. Trust boundary (CLI input):
+    rejects out-of-range or reversed ranges with ValueError, never silently."""
+    ports: set[int] = set()
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        lo = int(lo)
+        hi = int(hi) if hi else lo
+        if not 1 <= lo <= hi <= 65535:
+            raise ValueError(f"invalid port range: {part!r} (want 1..65535, low<=high)")
+        ports.update(range(lo, hi + 1))
+    return sorted(ports)
+
+
+def parse_banner(banner: str) -> tuple:
+    """Pure: a service banner -> (product, version) or (None, None).
+
+    occam: substring product match + the first dotted version AFTER the product
+    name (so "SSH-2.0-OpenSSH_7.4" reads 7.4, the product version, not 2.0, the
+    protocol version). Good for services that name product and version together on
+    connect (OpenSSH, vsFTPd, ProFTPd, Exim). A product that speaks only after a
+    protocol handshake needs a protocol probe — add its alias/pattern here."""
+    if not banner:
+        return None, None
+    low = banner.lower()
+    for needle, canon in _PRODUCT_ALIASES.items():
+        idx = low.find(needle)
+        if idx != -1:
+            m = _VER_IN_BANNER.search(banner, idx + len(needle))
+            return canon, (m.group(0) if m else None)
+    return None, None
+
+
+# occam: a static demo catalog, same shape and same `<=` ceiling as _KEV_CATALOG
+# — NOT the live NVD feed. Wire NVD CPE matching when breadth matters; the seam
+# (scan -> version -> match -> report) and the honesty (version-gated, never a
+# guess) are what this proves. `known_exploited`/`public_exploit` here are report
+# metadata for observed["cves"], not predicates this provider claims to own.
+_CVE_CATALOG = [
+    {"product": "vsftpd", "vulnerable_through": "2.3.4", "cve": "CVE-2011-2523",
+     "summary": "vsftpd 2.3.4 backdoor grants an unauthenticated root shell",
+     "severity": "critical", "known_exploited": True, "public_exploit": True},
+    {"product": "proftpd", "vulnerable_through": "1.3.5", "cve": "CVE-2015-3306",
+     "summary": "ProFTPD mod_copy allows unauthenticated file read/write (RCE)",
+     "severity": "critical", "known_exploited": True, "public_exploit": True},
+    {"product": "openssh", "vulnerable_through": "7.7", "cve": "CVE-2018-15473",
+     "summary": "OpenSSH username enumeration via authentication response timing",
+     "severity": "medium", "known_exploited": False, "public_exploit": True},
+    {"product": "exim", "vulnerable_through": "4.91", "cve": "CVE-2019-10149",
+     "summary": "Exim 'Return of the WIZard' remote command execution",
+     "severity": "critical", "known_exploited": True, "public_exploit": True},
+]
+
+
+def cve_matches(product, version) -> list:
+    """Pure: (product, version) -> the catalog entries that apply, version-gated.
+
+    Same honesty as kev_evidence: no product or no parseable version means no
+    match — silence, never a guess (invariant I-1). Sorted by CVE id so the
+    observation, and any fingerprint over it, is deterministic."""
+    if not product or not version:
+        return []
+    running = _ver_tuple(version)
+    if not running:
+        return []
+    return sorted(
+        (e for e in _CVE_CATALOG
+         if e["product"] == product and running <= _ver_tuple(e["vulnerable_through"])),
+        key=lambda e: e["cve"])
+
+
+def _grab_banner(host: str, port: int, timeout: float):
+    """Connect to one TCP port; return the banner it volunteers (may be ''), or
+    None if the port did not accept a connection.
+
+    occam: passive banner grab — reads only what a service says first, sends
+    nothing. Services that speak first (SSH/FTP/SMTP) yield a version; HTTP-style
+    ports stay open with an empty banner (recorded, no version). '' (open, silent)
+    and None (closed/filtered) are different answers and stay different (I-1)."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            try:
+                return s.recv(256).decode("latin-1", "replace").strip()
+            except (socket.timeout, OSError):
+                return ""            # open, but volunteered nothing
+    except (OSError, ValueError):
+        return None                  # closed / filtered / unreachable
+
+
+def scan_host(host: str, ports=None, timeout: float = 4.0, workers: int = 32) -> dict:
+    """Scan `host` over TCP. Returns an observation dict (never a risk claim):
+      open_ports: [int]                              — ports that answered
+      services:   [{port, banner, product, version}] — what each open port said
+      cves:       [{port, product, version, cve, summary, severity, ...}]
+    {} if `host` is not a safe, globally-routable target — the same SSRF guard
+    every probe uses: a discovered name pointing inward is never connected to."""
+    ports = list(_DEFAULT_PORTS) if ports is None else list(ports)   # [] means none, not default
+    if not ports or not _resolvable_and_global(host):
+        return {}
+    open_ports, services, cves = [], [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(ports))) as ex:
+        for port, banner in zip(ports, ex.map(lambda p: _grab_banner(host, p, timeout), ports)):
+            if banner is None:
+                continue             # port didn't answer — established nothing
+            open_ports.append(port)
+            product, version = parse_banner(banner)
+            services.append({"port": port, "banner": banner[:200],
+                             "product": product, "version": version})
+            for hit in cve_matches(product, version):
+                cves.append({"port": port, "product": product, "version": version, **hit})
+    obs: dict = {}
+    if open_ports:
+        obs["open_ports"] = sorted(open_ports)
+    if services:
+        obs["services"] = services
+    if cves:
+        obs["cves"] = cves
+    return obs
+
+
+@declares("port_scan", ("known_vulnerable_service",))
+def enrich_scan(g, ports=None, timeout: float = 4.0, workers: int = 8) -> int:
+    """Scan every probeable host's TCP ports, record open ports + service versions
+    in `observed`, and establish `known_vulnerable_service` where a version matches
+    the CVE catalog. Returns hosts with >=1 catalog CVE.
+
+    Loud and active — a connect scan is unmistakable in the target's logs, which
+    is why the CLI gates it behind its own flag. Writes only to `observed`/
+    `evidence`; no nodes, edges, or findings (Provider Contract)."""
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    vulnerable = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, obs in zip(targets, ex.map(lambda e: scan_host(e.value, ports, timeout), targets)):
+            if obs:
+                ent.observed.update(obs)
+                if obs.get("cves"):
+                    ent.evidence["known_vulnerable_service"] = True
+                    vulnerable += 1
+    return vulnerable

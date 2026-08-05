@@ -29,7 +29,7 @@ if = "authentication_required"
 subtract = 20
 
 [outputs]
-priority = "high"
+severity = "high"
 recommendation = [
     "Confirm authentication is enforced on the Jenkins instance",
     "Check Jenkins core + plugin versions against known CVEs",

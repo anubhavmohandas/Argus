@@ -19,7 +19,7 @@ if = "insecure_cookie"
 add = 10
 
 [outputs]
-priority = "low"
+severity = "low"
 recommendation = [
     "Set the missing hardening headers (HSTS, CSP, X-Content-Type-Options, X-Frame-Options)",
 ]

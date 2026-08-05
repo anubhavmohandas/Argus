@@ -164,12 +164,13 @@ deterministic reasoning layer, fed by the graph, keeps it maintainable — and
 makes every new discovery module *compound* in value (new evidence → new rules
 fire → better investigation) instead of just producing more JSON.
 
-Triage was the standalone proto of this layer. As of Phase 3.1 it is **folded
-in**: priority and interestingness are `engine.investigate()`'s read-only
-scoring output, not a separate subsystem. Every consumer — the dossier, JSON,
-a future API, NYX — reads one `InvestigationResult` (`conclusions`, `priority`,
-`interesting`, `recommendations`, `ledger`, `fingerprint`), never engine
-internals. There is one reasoning authority.
+Triage was the standalone proto of this layer. It is now **folded in twice
+over**: priority is not a separate subsystem, and not even a separate output —
+it is a `Conclusion` whose `kind` is `priority`. Every consumer — the dossier,
+JSON, a future API, NYX — reads one `InvestigationResult` carrying one list of
+one type (`conclusions`, plus the `risks` / `priority` / `interesting` / `noise`
+/ `recommendations` views over it, `fingerprint`, `error`), never engine
+internals. There is one reasoning authority, and it speaks one shape.
 
 ### Two levels, so it stays both deterministic and extensible
 
@@ -214,7 +215,7 @@ adjustments:
   - if: public_exploit
     add: 10
 outputs:
-  priority: high
+  severity: high
   recommendation:
     - Inspect authentication
     - Check plugin versions
@@ -436,6 +437,86 @@ representable today, and `Entity.observed` is right-sized for exactly that.
 
 ---
 
+## Public contract stability
+
+> **A contract becomes stable when more than one independent component depends
+> on it. From that point, changing it requires compatibility reasoning — not
+> just a passing test suite.**
+
+This is a policy, not a milestone. It is deliberately *not* written as "Core
+1.0", because the same thing will happen again: `InvestigationResult` is stable
+today, and the provider interface, the rule schema, the entity graph, and the
+observation model will each cross the same line later. A document that records
+version declarations fills up with history; a document that records the rule
+stays the same size and keeps applying.
+
+"Independent component" is the whole test. Two call sites in the same module are
+one consumer. The dossier renderer, the JSON output, the memory store, and an
+external reader of that JSON are four — none of them can be fixed by the commit
+that breaks them.
+
+### The three questions
+
+Every change answers exactly one of these, and the third is the only one that
+costs anything:
+
+1. **Is this new evidence?** — a new observation, provider, or module. Additive
+   by construction: the engine never learns about it.
+2. **Is this new investigator knowledge?** — a new rule, or a new predicate.
+   Rules are data and cost nothing; a new predicate is the deliberate governance
+   gate described above.
+3. **Is this changing a public contract?** — result shape, provider API, rule
+   schema, graph model. This one, and only this one, needs compatibility
+   reasoning: who reads it, what breaks, and what the migration is.
+
+If a change is none of the three, it probably does not belong in the core.
+
+### First stable contract: `InvestigationResult`
+
+Everything downstream of the engine reads this object and nothing else — the
+dossier, the JSON output, the memory store, and every consumer not written yet
+(NYX, an HTTP API, an HTML report, a graph export). Its fields, its properties,
+and the key set of `to_dict()` are frozen; [`test_public_contract.py`](../test_public_contract.py)
+fails if any of them move.
+
+Adding a field is compatible — update the frozen list in the same commit, on
+purpose. Removing or renaming one is a breaking change, and the test exists so
+that it cannot happen quietly.
+
+**The shape is only half of it.** The other half is a behavioural guarantee:
+
+> A malformed rule pack costs you **reasoning**, never the **investigation**.
+
+`investigate()` still ranks the graph when the rules fail to load, and carries
+the failure on `.error` so no consumer mistakes a config bug for a clean result.
+That is why `_INTERESTING` stays in `engine.py` instead of migrating to data with
+the rest of the investigator knowledge — a floor whose vocabulary lives in a file
+that can fail to load is not a floor. Both halves are covered by the same test.
+
+An earlier draft of this section claimed the guarantee was also the reason
+`priority` had to be a *sibling* of `conclusions` rather than a kind of one. It
+isn't, and the distinction is worth keeping written down: the floor is a property
+of **where the code runs** — `_priority()` is engine code, called outside
+`investigate()`'s `try`, on every path — not of which list its output lands in.
+Shape and guarantee are separable, so unification cost nothing here.
+
+### One output type
+
+Every engine output is a `Conclusion`; `kind` says which sort. A `risk` comes
+from a rule file, a `priority` from the built-in name evaluator. `.risks`,
+`.priority`, `.interesting` and `.noise` are filtered *views* over the one list,
+never parallel state — a consumer learns one type and can read the whole result.
+
+The cost of one list is one footgun, and it is named in the code: **confidence is
+comparable within a kind, never across one.** A priority is 100% confident about
+what a hostname contains, which is not the claim a risk makes about a host.
+`max(c.confidence for c in result.conclusions)` reads a name-only run as
+probe-verified — the exact false confidence invariant I-1 exists to prevent. Read
+`.risks` for the confidence band and `.priority` for the ranking;
+`test_investigation_invariants.py` holds that line.
+
+---
+
 ## For contributors
 
 Before you add code, check it against the constitution:
@@ -449,6 +530,8 @@ Before you add code, check it against the constitution:
   stays deterministic (Principle 7).
 - Adding an output? It reads from and writes to the **graph** (Principle 6).
 - Adding memory? It stores **evidence**, not conversation (Principle 5).
+- Changing a shape something else reads? That is question 3 above — **public
+  contract stability**, and it needs compatibility reasoning, not just green tests.
 
 If a change can't satisfy these, it isn't an Argus change — it's a NYX change,
 or it doesn't belong.

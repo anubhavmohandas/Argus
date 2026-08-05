@@ -39,7 +39,7 @@ if = "authentication_required"
 subtract = 20
 
 [outputs]
-priority = "high"
+severity = "high"
 recommendation = [
     "Probe the host to confirm it is reachable and actually runs Jenkins",
     "Confirm authentication is enforced on the Jenkins instance",

@@ -26,23 +26,41 @@ def _has_open_unknowns(c) -> bool:
 
 
 def test_discovery_only_is_never_overconfident():
-    """Names are leads. With zero probes, no conclusion may reach the
-    probe-confirmed band (>=65), every lead must still surface its unknowns,
-    and the run must still produce investigative recommendations."""
+    """Names are leads. With zero probes, no risk may reach the probe-confirmed
+    band (>=65), every lead must still surface its unknowns, and the run must
+    still produce investigative recommendations."""
     g = Graph()
     for v in ("jenkins.example.com", "admin.example.com", "staging.example.com",
               "cdn-static.example.com", "www.example.com"):
         g.add(Entity("subdomain", v, 1))
     r = engine.investigate(g, _RULES)
 
-    assert r.conclusions, "discovery should still yield leads"
-    assert max(c.confidence for c in r.conclusions) < 65, \
+    assert r.risks, "discovery should still yield leads"
+    assert max(c.confidence for c in r.risks) < 65, \
         "a name-only lead must never score like a verified finding"
-    for c in r.conclusions:
-        if c.priority == "noise":
+    for c in r.risks:
+        if "noise" in c.tags:
             continue  # noise rules are static deprioritize notes, no probes to open
         assert _has_open_unknowns(c), f"{c.rule} hides that nothing was probed"
     assert r.recommendations, "leads must produce investigative recommendations"
+
+
+def test_confidence_is_only_meaningful_within_a_kind():
+    """The footgun that arrives with one list: a priority conclusion is 100%
+    confident *that the name says what it says*, which is not a claim about the
+    host. Comparing it against a risk's confidence reads a name-only run as
+    probe-verified. Kinds answer different questions, so they never share a
+    scale — `.risks` is the band, `.priority` is the ranking."""
+    g = Graph()
+    g.add(Entity("subdomain", "admin.example.com", 1))   # a name, nothing probed
+    r = engine.investigate(g, _RULES)
+
+    assert max(c.confidence for c in r.priority) == 100, "a known name is not uncertain"
+    assert max(c.confidence for c in r.risks) < 65, "yet nothing here is probe-verified"
+    for c in r.priority:
+        assert c.ledger["evidence"], "a priority score must show the tokens it counted"
+        assert all(chk["predicate"].startswith(("name:", "finding:")) for chk in c.ledger["evidence"]), \
+            "priority reasons only from the name and existing findings — never from a probe it never ran"
 
 
 def test_verified_outranks_suspected():
@@ -106,7 +124,7 @@ def test_broken_rules_never_read_as_a_clean_result():
     # `adjustment` is a typo for `adjustments`: a rule that would quietly never fire
     r = engine.investigate(g, [{"id": "typo", "adjustment": [{"if": "public_exploit"}]}])
 
-    assert r.conclusions == [], "a malformed rule must not fire"
+    assert r.risks == [], "a malformed rule must not fire"
     assert "RuleError" in r.error, r.error
     assert r.error in dossier(g, r), "the human path must show the degradation"
     assert r.to_dict()["error"] == r.error, "the JSON path must show it too"

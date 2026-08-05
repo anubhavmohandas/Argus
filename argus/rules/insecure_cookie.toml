@@ -13,7 +13,7 @@ insecure_cookie = true
 internet_facing = true
 
 [outputs]
-priority = "low"
+severity = "low"
 recommendation = [
     "Set HttpOnly on session cookies, and Secure on all cookies served over HTTPS",
 ]

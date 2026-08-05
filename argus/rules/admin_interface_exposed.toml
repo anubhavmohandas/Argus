@@ -24,7 +24,7 @@ if = "authentication_required"
 subtract = 20
 
 [outputs]
-priority = "high"
+severity = "high"
 recommendation = [
     "Probe the host to confirm an administrative surface actually exists",
     "Verify authentication and IP allow-listing on the admin surface",

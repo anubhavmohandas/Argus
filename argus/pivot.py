@@ -86,7 +86,7 @@ class Graph:
         """Serialize the whole graph. Used by --json output and the memory store."""
         return {
             "nodes": [{"type": e.type, "value": e.value, "depth": e.depth, "via": e.via,
-                       "evidence": e.evidence}
+                       "evidence": e.evidence, "observed": e.observed}
                       for e in self.nodes.values()],
             "edges": [{"src": s, "rel": r, "dst": d} for (s, r, d) in self.edges],
             "findings": [f.to_dict() for f in self.findings],
@@ -225,21 +225,35 @@ def dossier(g: Graph, result) -> str:
     if top_p:
         lines.append("\n PRIORITY  (what an investigator looks at first)")
         for p in top_p:
-            lines.append(f"   [{p.score:>4.0f}] {p.type:<9} {p.value:<34} {p.why}")
+            lines.append(f"   [{p.score:>4.0f}] {p.target_type:<9} {p.target:<34} {p.name}")
         if result.noise:
             lines.append(f"   deprioritized (CDN/static/plumbing): {len(result.noise)}")
 
-    concl = [c for c in result.conclusions if c.priority != "noise"]
+    concl = [c for c in result.risks if "noise" not in c.tags]
     if concl:
         lines.append("\n INVESTIGATOR CONCLUSIONS  (deterministic — every score is traceable)")
         for c in concl[:8]:
-            lines.append(f"   [{c.confidence:>3}%] {c.target:<34} {c.name}  · priority: {c.priority}")
+            lines.append(f"   [{c.confidence:>3}%] {c.target:<34} {c.name}  · severity: {c.severity}")
             for l in ledger_lines(c):
                 lines.append(f"          {l}")
             for h in c.hypotheses:
                 lines.append(f"          ↳ hypothesis: {h}")
             for r in c.recommendations:
                 lines.append(f"          ↳ recommend:  {r}")
+
+    # Known CVEs: the port scan's payoff, read straight from observed['cves'].
+    # Rule conclusions carry the risk; the specific CVE ids/versions live here.
+    cve_hosts = sorted((e.value, e.observed["cves"]) for e in g.nodes.values()
+                       if e.observed.get("cves"))
+    if cve_hosts:
+        lines.append("\n KNOWN CVEs  (scanned service version matched the catalog)")
+        for host, cves in cve_hosts:
+            for c in cves:
+                flags = [f for f, on in (("KEV", c.get("known_exploited")),
+                                         ("public-exploit", c.get("public_exploit"))) if on]
+                tag = f"  [{', '.join(flags)}]" if flags else ""
+                lines.append(f"   [{c.get('severity', 'info'):<8}] {host}:{c['port']}  {c['cve']}  "
+                             f"{c['product']} {c.get('version') or '?'}  {c['summary']}{tag}")
 
     sev_counts: dict[str, int] = {}
     for f in g.findings:

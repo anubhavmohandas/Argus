@@ -100,7 +100,7 @@ predicate to its provider.
 core.py     finding model · module registry · validated HTTP · input guards
 modules.py  built-in recon modules (the hands)
 pivot.py    discovery — bounded BFS correlation into an entity graph
-engine.py   Investigator Rule Engine — read-only reasoning: rules, priority, conclusions, ledger
+engine.py   Investigator Rule Engine — read-only reasoning: rules, predicates, conclusions, ledger
 rules/      declarative TOML rule files (data, never code)
 cli.py      pivot / run / all / modules
 ```

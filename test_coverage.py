@@ -33,6 +33,8 @@ def test_coverage_maps_every_predicate_once():
     assert cov["certificate_reused"] == "cert_analysis"
     # the path-based probe fills the last gap
     assert cov["has_admin_interface"] == "admin_probe"
+    # the TCP port scan establishes the service-version CVE predicate
+    assert cov["known_vulnerable_service"] == "port_scan"
     # web-exposure predicates: two come free from the base HTTP probe, one from
     # the path-based exposure probe (owasp_scanner patterns as evidence)
     assert cov["security_headers_missing"] == "http_probe"

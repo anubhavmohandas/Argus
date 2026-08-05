@@ -41,14 +41,24 @@ def _tokens(value: str) -> set[str]:
     return {t for t in _TOK.split(value.lower()) if t}
 
 
-# --- investigator name vocabulary (folded in from the old triage.py) ------
+# --- investigator name vocabulary -----------------------------------------
 # One home for the name-signal knowledge, two views of it:
 #  · _TECH/_ADMIN/_PREPROD/_NOISE feed the name_suggests_* DISCOVERY predicates
 #    (categorical: does the name suggest admin? tech? cdn?).
 #  · _INTERESTING is the weighted view — how much an investigator should care —
 #    that drives the priority output.
-# occam: overlapping tokens, but they answer different questions (is-it-admin vs
-#        how-interesting); unify only if they start to drift.
+#
+# THIS TABLE STAYS IN CODE ON PURPOSE. Read Principle 2 ("intelligence lives in
+# rules, not the engine") and the obvious next move is to migrate these weights
+# into a data file like the rule pack. Do not. `_priority()` is Argus's floor:
+# investigate() is specified to answer "where do I look first?" even when the
+# rule pack is missing or malformed (see its docstring). A floor whose vocabulary
+# lives in a file that can fail to load is not a floor. The rule pack is
+# investigator knowledge and belongs in data; this is the last-resort vocabulary
+# that has to survive the rule pack being gone, and that is a different job.
+#
+# occam: overlapping tokens with the sets above, but they answer different
+#        questions (is-it-admin vs how-interesting); unify only if they drift.
 _TECH = {"jenkins", "gitlab", "grafana", "kibana", "phpmyadmin", "jira", "confluence"}
 _ADMIN = {"admin", "portal", "dashboard", "phpmyadmin", "sso"}
 _PREPROD = {"staging", "stage", "dev", "uat", "test"}
@@ -105,7 +115,7 @@ _SEV_WEIGHT = {CRITICAL: 6, HIGH: 4, MEDIUM: 2, LOW: 1, INFO: 0}
 _ALLOWED_KEYS = {"id", "name", "description", "base_confidence", "tags",
                  "version", "requires", "adjustments", "outputs"}
 _ALLOWED_ADJUSTMENT_KEYS = {"if", "add", "subtract"}
-_ALLOWED_OUTPUT_KEYS = {"priority", "recommendation", "hypothesis"}
+_ALLOWED_OUTPUT_KEYS = {"severity", "recommendation", "hypothesis"}
 
 
 class RuleError(ValueError):
@@ -182,6 +192,7 @@ _PREDICATES = {
     "authentication_required": _ev("authentication_required"),
     "public_exploit": _ev("public_exploit"),
     "known_exploited": _ev("known_exploited"),
+    "known_vulnerable_service": _ev("known_vulnerable_service"),
     "certificate_reused": _ev("certificate_reused"),
     # web-exposure facts (owasp_scanner patterns, provider-established)
     "security_headers_missing": _ev("security_headers_missing"),
@@ -194,22 +205,44 @@ _PREDICATES = {
 
 @dataclass
 class Conclusion:
+    """Every engine output is one of these — there is no second output type.
+
+    `kind` says what sort of investigator statement it is: `risk` comes from a
+    rule file, `priority` from the built-in name evaluator below. Both carry the
+    same ledger, so both are equally explainable. The set is closed like the
+    predicate vocabulary — a rule cannot declare its own kind; a new one arrives
+    with the engine code that emits it.
+
+    Confidence is comparable *within* a kind, never across one: a priority is
+    100% certain about what a name contains, which is not the same claim as a
+    risk being 100% certain about a host. Read `.risks` for the confidence band,
+    `.priority` for the ranking — never max() over the whole list.
+    """
     rule: str
     name: str
     target: str            # the entity value the conclusion is about
-    confidence: int        # clamped 0..100
-    priority: str
-    ledger: dict           # traceable: evidence checks + the confidence arithmetic
+    confidence: int        # clamped 0..100 — how sure, never how important
+    ledger: dict           # traceable: evidence checks + the arithmetic
+    kind: str = "risk"
+    target_type: str = ""  # entity type the target is (subdomain/ip/...)
+    severity: str = "info" # urgency label the rule attached
     recommendations: list = field(default_factory=list)
     hypotheses: list = field(default_factory=list)
     tags: list = field(default_factory=list)
     rule_version: int = 0  # provenance: which version of the rule concluded this
 
+    @property
+    def score(self) -> float:
+        """The number this conclusion computed — its confidence for a risk, its
+        attention weight for a priority. Always the ledger's own total, so it
+        cannot drift away from the arithmetic that produced it."""
+        return self.ledger.get("final", self.confidence)
+
     def to_dict(self) -> dict:
         return {
-            "rule": self.rule, "rule_version": self.rule_version,
-            "name": self.name, "target": self.target,
-            "confidence": self.confidence, "priority": self.priority,
+            "kind": self.kind, "rule": self.rule, "rule_version": self.rule_version,
+            "name": self.name, "target": self.target, "target_type": self.target_type,
+            "confidence": self.confidence, "severity": self.severity, "score": self.score,
             "ledger": self.ledger, "recommendations": self.recommendations,
             "hypotheses": self.hypotheses, "tags": self.tags,
         }
@@ -217,7 +250,17 @@ class Conclusion:
 
 # --- validation (trust boundary — rule files are data, never code) --------
 def _validate_rules(rules: list[dict]) -> None:
+    # Shape first. Everything below assumes a list of tables, and a rule set that
+    # isn't one must arrive here as a RuleError — investigate() degrades on
+    # ValueError, so an uncaught TypeError/AttributeError would crash the
+    # investigation instead of falling back to priority. The guarantee is
+    # "malformed rules cost you reasoning, never the whole run"; these two lines
+    # are what make it true for malformed *containers*, not just malformed rules.
+    if not isinstance(rules, list):
+        raise RuleError(f"rule set must be a list of tables, got {type(rules).__name__}")
     for r in rules:
+        if not isinstance(r, dict):
+            raise RuleError(f"rule must be a table, got {type(r).__name__}: {r!r}")
         rid = r.get("id")
         if not rid:
             raise RuleError(f"rule missing 'id': {r!r}")
@@ -295,9 +338,9 @@ def _evaluate_rule(rule: dict, e, g) -> Conclusion | None:
 
     out = rule.get("outputs", {})
     return Conclusion(
-        rule=rule["id"], rule_version=int(rule.get("version", 0)),
-        name=rule.get("name", rule["id"]), target=e.value,
-        confidence=final, priority=out.get("priority", "info"),
+        rule=rule["id"], rule_version=int(rule.get("version", 0)), kind="risk",
+        name=rule.get("name", rule["id"]), target=e.value, target_type=e.type,
+        confidence=final, severity=out.get("severity", "info"),
         ledger={"evidence": evidence, "calculation": calc, "final": final},
         recommendations=list(out.get("recommendation", [])),
         hypotheses=list(out.get("hypothesis", [])),
@@ -380,67 +423,86 @@ def ledger_lines(c: Conclusion) -> list[str]:
     return lines
 
 
-# --- priority (triage, folded in as an engine output) ---------------------
-@dataclass
-class PriorityItem:
-    """Where an investigator should look, and why. A read-only score over the
-    name + findings — the old triage.py, now one output of this engine."""
-    value: str
-    type: str
-    score: float
-    why: str
-    reasons: list = field(default_factory=list)   # the interesting tokens matched
-    noise: bool = False
+# --- priority (an investigator conclusion, not a second output type) ------
+def _priority(g) -> list[Conclusion]:
+    """Rank every entity by how much it deserves attention → priority-kind
+    conclusions ("200 CDN, ignore; 4 admin portals, look first"). Pure read over
+    the graph — like the whole engine, it never mutates a node.
 
-    def to_dict(self) -> dict:
-        return {"value": self.value, "type": self.type, "score": self.score,
-                "why": self.why, "reasons": self.reasons, "noise": self.noise}
+    Confidence is 100 and the ranking rides on `score`, because those are two
+    different claims: what a fully-known name contains is certain, how much it
+    deserves attention is a weight. Collapsing them would make "look here first"
+    read as "I am only 5% sure", which is not what the ledger says.
 
-
-def _priority(g) -> list[PriorityItem]:
-    """Rank every entity by how much it deserves attention. Pure read over the
-    graph — like the whole engine, it never mutates a node ("200 CDN, ignore;
-    4 admin portals, look first")."""
+    The ledger has the same shape as a rule conclusion's, so the score is as
+    traceable as any confidence — no opaque number reaches a consumer (I-2)."""
     findings_by_target: dict[str, list] = {}
     for f in g.findings:
         findings_by_target.setdefault(f.target.lower(), []).append(f)
 
-    items = []
+    out = []
     for e in g.nodes.values():
         toks = _tokens(e.value)
         matched = sorted(toks & _INTERESTING.keys())
-        score = float(sum(_INTERESTING[t][0] for t in matched))
         noise = bool(toks & _NOISE)
+        evidence = [{"predicate": f"name:{t}", "applied": True, "delta": _INTERESTING[t][0]}
+                    for t in matched]
         if noise:
-            score -= 3
+            evidence.append({"predicate": "name:cdn/static", "applied": True, "delta": -3})
         for f in findings_by_target.get(e.value.lower(), []):
-            score += _SEV_WEIGHT.get(f.severity, 0)
+            weight = _SEV_WEIGHT.get(f.severity, 0)
+            if weight:   # an info finding moves nothing — don't pad the ledger with zeros
+                evidence.append({"predicate": f"finding:{f.severity}", "applied": True, "delta": weight})
+        score = float(sum(chk["delta"] for chk in evidence))
         why = ", ".join(dict.fromkeys(_INTERESTING[t][1] for t in matched))
-        if not why and noise:
-            why = "public CDN/static plumbing"
-        items.append(PriorityItem(e.value, e.type, score, why, matched, noise))
-    items.sort(key=lambda p: (-p.score, p.value))   # deterministic
-    return items
+        if not why:
+            why = "public CDN/static plumbing" if noise else "nothing notable in the name"
+        out.append(Conclusion(
+            rule="name_priority", kind="priority", name=why,
+            target=e.value, target_type=e.type, confidence=100,
+            ledger={"evidence": evidence,
+                    "calculation": [{"step": "base", "delta": 0}]
+                                   + [{"step": c["predicate"], "delta": c["delta"]} for c in evidence],
+                    "final": score},
+            tags=["noise"] if noise else [],
+        ))
+    out.sort(key=lambda c: (-c.score, c.target))   # deterministic
+    return out
 
 
 # --- the one result object every consumer reads ---------------------------
 @dataclass
 class InvestigationResult:
     """The single object the dossier, JSON output, an API, or NYX all consume —
-    never engine internals. Everything the Rule Engine concluded about a graph."""
-    conclusions: list          # Conclusion, ranked by confidence
-    priority: list             # PriorityItem, every entity ranked by score
+    never engine internals. Everything the Rule Engine concluded about a graph.
+
+    One list, one type. Every output is a Conclusion and the `kind` says what
+    sort; the views below are filters over that list, never parallel state."""
+    conclusions: list          # every Conclusion: risks (confidence desc), then priorities (score desc)
     fingerprint: str           # reproducibility hash of (graph + rules)
     error: str = ""            # why reasoning degraded, if it did — see investigate()
+
+    def of_kind(self, kind: str) -> list:
+        return [c for c in self.conclusions if c.kind == kind]
+
+    @property
+    def risks(self) -> list:
+        """What the rule pack concluded, ranked by confidence."""
+        return self.of_kind("risk")
+
+    @property
+    def priority(self) -> list:
+        """Every entity ranked by how much it deserves attention."""
+        return self.of_kind("priority")
 
     @property
     def interesting(self) -> list:
         """What to look at first: scored above zero and not plumbing."""
-        return [p for p in self.priority if p.score > 0 and not p.noise]
+        return [c for c in self.priority if c.score > 0 and "noise" not in c.tags]
 
     @property
     def noise(self) -> list:
-        return [p for p in self.priority if p.noise]
+        return [c for c in self.priority if "noise" in c.tags]
 
     @property
     def recommendations(self) -> list:
@@ -455,7 +517,6 @@ class InvestigationResult:
     def to_dict(self) -> dict:
         return {
             "conclusions": [c.to_dict() for c in self.conclusions],
-            "priority": [p.to_dict() for p in self.priority],
             "recommendations": self.recommendations,
             "fingerprint": self.fingerprint,
             "error": self.error,
@@ -470,14 +531,16 @@ def investigate(g, rules=None) -> InvestigationResult:
     — a broken rule set must not blank out a live investigation. But the failure
     is *carried*, on `.error`, and every consumer shows it: a malformed rule file
     turning into "zero conclusions" would be a config bug reported as a clean
-    result, which is exactly the false negative Argus must never produce."""
-    conclusions: list = []
+    result, which is exactly the false negative Argus must never produce.
+
+    Note where `_priority(g)` sits: outside the try, in engine code, on every
+    path. That — not its shape in the result — is what makes it the floor."""
+    risks: list = []
     fp = error = ""
     try:
         rules = rules if rules is not None else load_rules()
-        conclusions = evaluate(g, rules)
+        risks = evaluate(g, rules)
         fp = fingerprint(g, rules)
     except (ValueError, OSError) as e:   # RuleError is a ValueError — degrade, never silently
         error = f"{type(e).__name__}: {e}"
-    return InvestigationResult(conclusions=conclusions, priority=_priority(g),
-                               fingerprint=fp, error=error)
+    return InvestigationResult(conclusions=risks + _priority(g), fingerprint=fp, error=error)

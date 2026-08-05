@@ -1,0 +1,34 @@
+# A TCP port scan read a service's banner, parsed its version, and matched it
+# against the CVE catalog: this host runs a service with a known vulnerability.
+# The specific CVEs (id, severity, whether exploited) are in the dossier's
+# KNOWN CVEs section — they come from observed['cves'], which a rule can't carry.
+# This rule concludes the risk. High base: the version was observed on the wire
+# and matched a catalog entry, it is a fact, not a name signal.
+#
+# It requires publicly_discoverable rather than internet_facing on purpose: only
+# a real connection can set known_vulnerable_service, so reaching the host is
+# already proven — and internet_facing is the HTTP probe's, which a scan of a
+# non-HTTP service (ssh/ftp) never runs.
+id = "vulnerable_service"
+name = "Service with a known CVE exposed"
+description = "A TCP service on a publicly reachable host reported a version that matches a known CVE."
+base_confidence = 65
+tags = ["exposure", "cve", "vulnerable-version"]
+version = 1
+
+[requires]
+known_vulnerable_service = true
+publicly_discoverable = true
+
+[[adjustments]]
+if = "authentication_required"
+subtract = 15
+
+[outputs]
+severity = "high"
+recommendation = [
+    "Upgrade the affected service to a patched release",
+    "Restrict the service to trusted networks if it need not be internet-facing",
+    "Confirm the reported version against the listed CVEs before exploitation testing",
+]
+hypothesis = ["A running service version matches a publicly known vulnerability and may be exploitable"]

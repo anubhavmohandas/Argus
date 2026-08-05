@@ -18,7 +18,7 @@ if = "authentication_required"
 subtract = 10
 
 [outputs]
-priority = "high"
+severity = "high"
 recommendation = [
     "Block access to dotfiles and VCS metadata (.git, .env, .DS_Store) at the web server",
     "Rotate any credentials that may have been exposed via the leaked file",

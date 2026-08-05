@@ -24,7 +24,7 @@ if = "authentication_required"
 subtract = 15
 
 [outputs]
-priority = "medium"
+severity = "medium"
 recommendation = [
     "Confirm pre-prod is not sharing credentials or data with production",
 ]
