@@ -40,6 +40,8 @@ def test_coverage_maps_every_predicate_once():
     assert cov["security_headers_missing"] == "http_probe"
     assert cov["insecure_cookie"] == "http_probe"
     assert cov["exposed_sensitive_file"] == "exposure_probe"
+    # the path-traversal probe (another active path probe on the --probe-paths tier)
+    assert cov["path_traversal"] == "traversal_probe"
     assert all(cov.values()), f"uncovered: {[p for p, v in cov.items() if not v]}"
 
 

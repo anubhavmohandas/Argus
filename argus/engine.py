@@ -198,6 +198,7 @@ _PREDICATES = {
     "security_headers_missing": _ev("security_headers_missing"),
     "insecure_cookie": _ev("insecure_cookie"),
     "exposed_sensitive_file": _ev("exposed_sensitive_file"),
+    "path_traversal": _ev("path_traversal"),
 }
 # occam: no dns_resolves / http_reachable / tls_valid / certificate_seen yet —
 #        nothing asserts them and no rule reads them. Add each with its probe.

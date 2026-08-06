@@ -241,6 +241,29 @@ def dossier(g: Graph, result) -> str:
             for r in c.recommendations:
                 lines.append(f"          ↳ recommend:  {r}")
 
+    # Port map: what the TCP scan saw, per host. open ports carry their service +
+    # version; filtered (firewall/CDN dropped us) and closed (refused) are the
+    # distinction that matters on a modern host, so both are shown, not collapsed.
+    scanned = sorted((e.value, e.observed) for e in g.nodes.values()
+                     if e.observed.get("scanned"))
+    if scanned:
+        lines.append("\n PORT SCAN")
+        for host, obs in scanned:
+            total = obs.get("scanned", 0)
+            openp, filt = obs.get("open_ports", []), obs.get("filtered_ports", [])
+            closed = total - len(openp) - len(filt)
+            lines.append(f"   {host}  ({total} scanned: {len(openp)} open, "
+                         f"{len(filt)} filtered, {closed} closed)")
+            svc = {s["port"]: s for s in obs.get("services", [])}
+            for p in openp:
+                s = svc.get(p, {})
+                ver = f"  {s['product']} {s.get('version') or ''}".rstrip() if s.get("product") else ""
+                lines.append(f"      {p:>5}/tcp  open{ver}")
+            if filt:
+                shown = ", ".join(str(p) for p in filt[:16])
+                more = f"  (+{len(filt) - 16} more)" if len(filt) > 16 else ""
+                lines.append(f"      filtered: {shown}{more}")
+
     # Known CVEs: the port scan's payoff, read straight from observed['cves'].
     # Rule conclusions carry the risk; the specific CVE ids/versions live here.
     cve_hosts = sorted((e.value, e.observed["cves"]) for e in g.nodes.values()

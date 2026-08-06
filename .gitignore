@@ -5,6 +5,12 @@ Tools/
 *.zip
 
 
+# Case files — argus/store.py writes here when ARGUS_HOME points inside the repo
+.argus/
+
+# Secrets. Argus's own secret_scan module flags these; don't ship one.
+.env
+
 # macOS + Python noise
 .DS_Store
 *.jpeg

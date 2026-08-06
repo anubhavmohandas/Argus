@@ -51,6 +51,24 @@ def test_cve_match_is_version_gated_and_deterministic():
     assert providers.cve_matches("openssh", "9.6") == []
 
 
+def test_probe_port_distinguishes_open_from_closed():
+    # the state mapping is real socket logic — one runnable check, localhost only
+    # (no external egress), deterministic on macOS/Linux.
+    import socket as _s
+    srv = _s.socket()
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(1)
+    try:
+        state, banner = providers._probe_port("127.0.0.1", port, 0.5)
+        assert state == "open" and banner == "", (state, banner)  # accepted, said nothing
+    finally:
+        srv.close()
+    # nothing listening now -> the OS refuses the connection -> closed (not filtered)
+    state, banner = providers._probe_port("127.0.0.1", port, 0.5)
+    assert state == "closed" and banner == "", (state, banner)
+
+
 def test_scan_never_touches_a_non_global_target():
     # the SSRF guard every probe shares: inward names are never connected to,
     # and the function returns offline without a socket.

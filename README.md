@@ -54,6 +54,7 @@ you can drop anywhere.
 
 | Command | What it does |
 |---|---|
+| `argus` | **Interactive menu.** Run with no arguments on a terminal: banner, then pick a seed and an engagement level (passive → full scan). |
 | `argus pivot <seed>` | **Headline.** Autonomous correlation from one seed (domain/ip/username/phone/email). |
 | `argus run <module> <target>` | Run a single module. |
 | `argus all <target>` | Run every module that fits the target. |
@@ -62,6 +63,12 @@ you can drop anywhere.
 Flags on `pivot`: `--depth N` (pivot depth, default 2), `--max N` (entity
 cap, default 40), `--deep N` (re-pivot into N discovered subdomains),
 `--json` (machine output — the full node/edge/finding graph).
+
+**Engagement levels** (the menu's choice, or the flags directly): passive by
+default (public sources only — never touches the target); `--probe` connects to
+discovered hosts for evidence; `--probe-paths` also requests admin/sensitive
+paths; `--scan` adds a TCP port scan. Everything past passive is **active** — the
+menu makes you confirm you're authorized before it sends a single request.
 
 ## Modules (the fuel)
 

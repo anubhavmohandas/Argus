@@ -1,0 +1,27 @@
+# A probe requested a directory-traversal payload and the response body was a
+# real /etc/passwd — arbitrary file read confirmed on a publicly reachable host.
+# This is one of the highest-signal findings a hunter can get: the file was
+# fetched and its contents verified, not inferred. Very high base.
+#
+# Requires publicly_discoverable (always true for a probeable host) rather than
+# internet_facing so the rule stands on its own evidence: only a real HTTP
+# response can set path_traversal, so reaching the host is already proven.
+id = "path_traversal"
+name = "Path traversal / arbitrary file read"
+description = "A publicly reachable host returned the contents of /etc/passwd in response to a directory-traversal payload, confirming arbitrary file read."
+base_confidence = 80
+tags = ["exposure", "traversal", "arbitrary-file-read", "bug-bounty"]
+version = 1
+
+[requires]
+path_traversal = true
+publicly_discoverable = true
+
+[outputs]
+severity = "critical"
+recommendation = [
+    "Canonicalize and confine all file paths to an allowlisted directory before serving",
+    "Reject request paths containing '..' or their encoded forms at the web server / proxy",
+    "Rotate any secrets reachable through the traversal and review access logs for prior exploitation",
+]
+hypothesis = ["An attacker can read arbitrary files on the host, likely including configuration and secrets"]

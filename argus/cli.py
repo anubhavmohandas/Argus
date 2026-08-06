@@ -54,23 +54,49 @@ _BANNER_ART = [
     "██║  ██║██║  ██║╚██████╔╝╚██████╔╝███████║",
     "╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝",
 ]
-_BANNER_TAGLINE = "  autonomous correlation recon engine · by Anubhav Mohandas"
+_TAGLINE = "autonomous correlation recon engine"
+_AUTHOR = "ANUBHAV MOHANDAS"
 _GRAD_START, _GRAD_END = (255, 0, 153), (0, 224, 255)   # magenta -> cyan
 
 
-def banner() -> str:
-    """The ARGUS wordmark. Coloured only when the terminal will render it."""
-    if not _COLOR:
-        return "\n".join(_BANNER_ART) + "\n\n" + _BANNER_TAGLINE
-    n = len(_BANNER_ART)
+def _mix(a, z, t):
+    """Linear-interpolate two RGB tuples at position t (0..1)."""
+    return tuple(round(x + (y - x) * t) for x, y in zip(a, z))
+
+
+def _grad_text(text: str, start, end, bold: bool = True) -> str:
+    """Paint each character along a horizontal start->end gradient (truecolor).
+    Returns the text untouched when colour is off — same string, no escapes."""
+    if not _COLOR or not text:
+        return text
+    n = max(len(text) - 1, 1)
+    b = "1;" if bold else ""
     out = []
-    for i, line in enumerate(_BANNER_ART):
-        t = i / (n - 1)
-        r, g, b = (round(a + (z - a) * t) for a, z in zip(_GRAD_START, _GRAD_END))
-        out.append(f"\033[1;38;2;{r};{g};{b}m{line}{_RESET}")
-    out.append("")
-    out.append(f"\033[2;38;2;0;224;255m{_BANNER_TAGLINE}{_RESET}")
-    return "\n".join(out)
+    for i, ch in enumerate(text):
+        r, g, bl = _mix(start, end, i / n)
+        out.append(f"\033[{b}38;2;{r};{g};{bl}m{ch}")
+    return "".join(out) + _RESET
+
+
+def banner() -> str:
+    """The ARGUS wordmark + author credit — magenta→cyan throughout: the letters
+    fade top-to-bottom, the rule and the name fade left-to-right. Plain when
+    colour is off (NO_COLOR / piped / legacy console)."""
+    art = _BANNER_ART
+    w = len(art[0])
+    rule_plain = "─" * w
+    if not _COLOR:
+        return (f"{chr(10).join(art)}\n\n{rule_plain}\n  {_TAGLINE}\n"
+                f"  ✦ crafted by  {_AUTHOR}\n{rule_plain}")
+    lines = []
+    for i, line in enumerate(art):
+        r, g, b = _mix(_GRAD_START, _GRAD_END, i / (len(art) - 1))
+        lines.append(f"\033[1;38;2;{r};{g};{b}m{line}{_RESET}")
+    rule = _grad_text(rule_plain, _GRAD_START, _GRAD_END, bold=False)
+    tagline = f"\033[3;38;2;130;205;235m  {_TAGLINE}{_RESET}"          # soft cyan, italic
+    author = (f"\033[2;38;2;150;150;150m  ✦ crafted by  {_RESET}"     # dim label
+              + _grad_text(_AUTHOR, _GRAD_START, _GRAD_END))          # name in the gradient
+    return "\n".join([*lines, rule, tagline, author, rule])
 
 
 # --- interactive menu -----------------------------------------------------
@@ -83,6 +109,9 @@ _MODES = {
     "3": ("Active+", "+ request admin & sensitive paths (.git/.env)", ["--probe-paths"]),
     "4": ("Full scan", "+ TCP port scan & service-CVE match (loudest)", ["--scan"]),
 }
+# green → red: the colour itself tells you how loud the level is (safe → loudest)
+_MODE_COLOR = {"1": "38;2;80;220;120", "2": "38;2;230;200;60",
+               "3": "38;5;208", "4": "38;2;235;70;70"}
 
 
 def _confirm_active() -> bool:
@@ -106,7 +135,10 @@ def interactive() -> int:
         print("\n  Engagement level:")
         for key, (label, desc, _) in _MODES.items():
             tag = "  (safe default)" if key == "1" else ""
-            print(f"   [{key}] {label:<9} {desc}{tag}")
+            head = f"[{key}] {label:<9}"
+            if _COLOR:
+                head = f"\033[1;{_MODE_COLOR[key]}m{head}{_RESET}"
+            print(f"   {head} {desc}{tag}")
         choice = input("\n  Mode [1-4, default 1]: ").strip() or "1"
         if choice not in _MODES:
             print("  not a valid choice — staying passive.")
@@ -194,7 +226,9 @@ def main(argv=None):
             r = providers.analyze_certificates(g)   # analysis: shared cert -> certificate_reused
             line = f"probed {n} HTTP, {t} TLS; {k} known-exploit, {r} cert-reuse"
             if args.probe_paths:   # its own flag: multiplies the requests against the target
-                line += f", {providers.enrich_admin(g)} admin-surface, {providers.enrich_exposure(g)} exposed-file"
+                line += (f", {providers.enrich_admin(g)} admin-surface"
+                         f", {providers.enrich_exposure(g)} exposed-file"
+                         f", {providers.enrich_traversal(g)} path-traversal")
             print(f"[argus] {line} — evidence attached", file=sys.stderr)
         if args.scan:   # loudest tier: a TCP connect scan is unmistakable in the target's logs
             try:
