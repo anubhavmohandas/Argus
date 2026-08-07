@@ -213,6 +213,8 @@ _ACTIONS = {
 def interactive() -> int:
     """The 'main menu': banner + action picker exposing every capability. Bare
     `argus` on a terminal lands here; scripts (no TTY) get --help so nothing hangs."""
+    if _COLOR:  # only when attached to a real terminal
+        print("\033[2J\033[3J\033[H", end="")  # clear screen + scrollback, cursor home
     print(banner())
     try:
         print("\n  What do you want to do?")
