@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import sys
+import threading
 
 from . import core, providers, store
 from .core import MODULES, run_module, run_all, sort_by_severity
@@ -105,9 +107,9 @@ def banner() -> str:
 # there is exactly one pivot code path whether you use flags or the menu.
 _MODES = {
     "1": ("Passive", "public sources only — never touches the target", []),
-    "2": ("Active", "+ probe hosts: HTTP/TLS, known-exploit, cert reuse", ["--probe"]),
-    "3": ("Active+", "+ request admin & sensitive paths (.git/.env)", ["--probe-paths"]),
-    "4": ("Full scan", "+ TCP port scan & service-CVE match (loudest)", ["--scan"]),
+    "2": ("Active", "+ probe hosts + live NVD CVEs & write-ups", ["--probe", "--cve"]),
+    "3": ("Active+", "+ request admin & sensitive paths (.git/.env)", ["--probe-paths", "--cve"]),
+    "4": ("Full scan", "+ TCP port scan, service versions & live CVEs (loudest)", ["--scan", "--cve"]),
 }
 # green → red: the colour itself tells you how loud the level is (safe → loudest)
 _MODE_COLOR = {"1": "38;2;80;220;120", "2": "38;2;230;200;60",
@@ -236,6 +238,46 @@ def interactive() -> int:
     return main(argv)
 
 
+# What each module is doing + which ones are slow, so the pivot loop never looks
+# frozen. Printed to stderr (like every other [argus] status line) so --json stays clean.
+_STEP_LABEL = {
+    "rdap": "registrar / RDAP", "dns": "DNS records (A/AAAA/MX/NS/TXT)",
+    "subdomains": "subdomains via crt.sh — slow, up to ~25s", "ip": "IP geo / ASN",
+    "username": "social-profile enumeration", "phone": "phone intel",
+}
+
+
+_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # braille cycle — reads as motion without needing color
+
+
+def _progress(mod_name: str, value: str):
+    """Live per-module status during a pivot — kills the 'nothing is happening'
+    feel while a slow crt.sh/RDAP fetch blocks (crt.sh alone can take ~25s).
+    Returns a done() the engine calls when the module finishes, which stops the
+    animation. Animates only on a real terminal; piped/JSON runs get one static
+    stderr line so machine output stays clean."""
+    label = _STEP_LABEL.get(mod_name, mod_name)
+    msg = f"{mod_name:<10} {value}  · {label}"
+    if not sys.stderr.isatty():
+        print(f"  → {msg}", file=sys.stderr, flush=True)
+        return lambda: None
+    stop = threading.Event()
+    dim, reset = ("\033[90m", _RESET) if _COLOR else ("", "")
+
+    def spin():
+        for frame in itertools.cycle(_SPIN):
+            sys.stderr.write(f"\r{dim}  {frame} {msg}{reset}\033[K")
+            sys.stderr.flush()
+            if stop.wait(0.08):
+                break
+        sys.stderr.write("\r\033[K")   # erase the line so the dossier prints clean
+        sys.stderr.flush()
+
+    t = threading.Thread(target=spin, daemon=True)
+    t.start()
+    return lambda: (stop.set(), t.join())
+
+
 def _print_findings(findings, as_json: bool):
     if as_json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))
@@ -253,6 +295,17 @@ def _print_findings(findings, as_json: bool):
 
 
 def main(argv=None):
+    """Console entrypoint. Wraps the real dispatch so a Ctrl-C during a slow
+    pivot prints one clean line instead of a socket-level traceback. interactive()
+    re-enters through here, so the guard covers menu-driven runs too."""
+    try:
+        return _run(argv)
+    except KeyboardInterrupt:
+        print("\n  interrupted.", file=sys.stderr)
+        return 130
+
+
+def _run(argv=None):
     p = argparse.ArgumentParser(prog="argus", description="Autonomous correlation recon engine.")
     sub = p.add_subparsers(dest="cmd")
 
@@ -269,6 +322,8 @@ def main(argv=None):
                     help="ACTIVE, loudest: TCP-connect scan discovered hosts for open ports + service versions, then match a CVE catalog")
     pv.add_argument("--ports", default=None,
                     help="port spec for --scan, e.g. '1-1024' or '22,80,443' (default: common service ports)")
+    pv.add_argument("--cve", action="store_true",
+                    help="look up observed service versions against NVD live and attach the real CVEs + reference write-ups (needs --probe or --scan to have observed a version; set NVD_API_KEY to lift rate limits)")
     pv.add_argument("--no-memory", action="store_true", help="don't save this run or compare against past ones")
     pv.add_argument("--json", action="store_true")
 
@@ -300,7 +355,7 @@ def main(argv=None):
         print(f"[argus] seed {args.seed!r} classified as: {classify(args.seed)}", file=sys.stderr)
         past = [] if args.no_memory else store.history(args.seed)
         g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
-                                    expand_subdomains=args.deep))
+                                    expand_subdomains=args.deep), on_step=_progress)
         if args.probe or args.probe_paths:   # providers add evidence only — the engine is untouched by this
             n = providers.enrich(g)                 # HTTP probe -> evidence + version + clickjacking
             t = providers.enrich_tls(g)             # TLS probe -> observed cert fingerprint
@@ -325,6 +380,9 @@ def main(argv=None):
                 return 2
             v = providers.enrich_scan(g, ports=ports)
             print(f"[argus] port-scanned hosts; {v} with a catalog CVE — evidence attached", file=sys.stderr)
+        if getattr(args, "cve", False):   # live NVD lookup over versions the probe/scan observed
+            v = providers.enrich_nvd(g)
+            print(f"[argus] NVD live lookup; {v} host(s) with a live CVE + references — evidence attached", file=sys.stderr)
         result = investigate(g)   # discovery -> reasoning: the one result object
         if past:  # investigation memory — "I've seen this before"
             prev = past[-1]

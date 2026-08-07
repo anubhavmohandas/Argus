@@ -148,7 +148,12 @@ class Budget:
     expand_subdomains: int = 0   # how many discovered subdomains to re-pivot (0 = list only)
 
 
-def pivot(seed: str, budget: Budget | None = None) -> Graph:
+def pivot(seed: str, budget: Budget | None = None, on_step=None) -> Graph:
+    """on_step(mod_name, value), if given, is called right before each module
+    runs — the seam the CLI uses for live progress so a slow crt.sh/RDAP fetch
+    doesn't look frozen. It may return a done() callable, which is invoked when
+    the module finishes (or fails) so the CLI can stop a spinner. Default None
+    keeps the library silent."""
     budget = budget or Budget()
     g = Graph()
     root = Entity(classify(seed), seed.strip(), depth=0)
@@ -176,10 +181,14 @@ def pivot(seed: str, budget: Budget | None = None) -> Graph:
         if ent.depth > budget.max_depth:
             continue
         for mod_name in _PLAN.get(ent.type, []):
+            done = on_step(mod_name, ent.value) if on_step else None
             try:
                 findings = run_module(mod_name, ent.value)
             except (KeyError, ValueError):
                 continue
+            finally:
+                if done:
+                    done()   # stop the spinner whether the module returned, raised, or was ^C'd
             g.findings.extend(findings)
             for f in findings:
                 for ctype, cvalue, rel in _extract(f):
@@ -221,17 +230,22 @@ def dossier(g: Graph, result) -> str:
             more = f"  (+{len(ents) - 12} more)" if len(ents) > 12 else ""
             lines.append(f"   {t:<10} {len(ents):>3}  {vals}{more}")
 
+    # Always print PRIORITY + CONCLUSIONS, even when empty: silently ending after
+    # FINDINGS reads as "Argus stopped halfway". Empty = engine ran, nothing fired.
     top_p = result.interesting[:10]
+    lines.append("\n PRIORITY  (what an investigator looks at first)")
     if top_p:
-        lines.append("\n PRIORITY  (what an investigator looks at first)")
         for p in top_p:
             lines.append(f"   [{p.score:>4.0f}] {p.target_type:<9} {p.target:<34} {p.name}")
         if result.noise:
             lines.append(f"   deprioritized (CDN/static/plumbing): {len(result.noise)}")
+    else:
+        depr = f" ({len(result.noise)} deprioritized as CDN/static/plumbing)" if result.noise else ""
+        lines.append(f"   — no entity exceeded the prioritization threshold{depr}.")
 
     concl = [c for c in result.risks if "noise" not in c.tags]
+    lines.append("\n INVESTIGATOR CONCLUSIONS  (deterministic — every score is traceable)")
     if concl:
-        lines.append("\n INVESTIGATOR CONCLUSIONS  (deterministic — every score is traceable)")
         for c in concl[:8]:
             lines.append(f"   [{c.confidence:>3}%] {c.target:<34} {c.name}  · severity: {c.severity}")
             for l in ledger_lines(c):
@@ -240,6 +254,14 @@ def dossier(g: Graph, result) -> str:
                 lines.append(f"          ↳ hypothesis: {h}")
             for r in c.recommendations:
                 lines.append(f"          ↳ recommend:  {r}")
+    else:
+        # distinguish "nothing matched" from "everything that matched was noise"
+        noisy = len(result.risks)
+        why = (f"all {noisy} matched conclusion(s) were plumbing/CDN noise"
+               if noisy else "no predicate matched the collected evidence")
+        lines.append(f"   — no deterministic conclusion reached: {why}.")
+        if not any(e.evidence for e in g.nodes.values()):
+            lines.append("     tip: no evidence was collected — try Active mode (2-4) to probe hosts for evidence.")
 
     # Port map: what the TCP scan saw, per host. open ports carry their service +
     # version; filtered (firewall/CDN dropped us) and closed (refused) are the
@@ -269,14 +291,19 @@ def dossier(g: Graph, result) -> str:
     cve_hosts = sorted((e.value, e.observed["cves"]) for e in g.nodes.values()
                        if e.observed.get("cves"))
     if cve_hosts:
-        lines.append("\n KNOWN CVEs  (scanned service version matched the catalog)")
+        lines.append("\n KNOWN CVEs  (observed service version matched a known CVE)")
         for host, cves in cve_hosts:
             for c in cves:
                 flags = [f for f, on in (("KEV", c.get("known_exploited")),
                                          ("public-exploit", c.get("public_exploit"))) if on]
                 tag = f"  [{', '.join(flags)}]" if flags else ""
-                lines.append(f"   [{c.get('severity', 'info'):<8}] {host}:{c['port']}  {c['cve']}  "
+                port = f":{c['port']}" if c.get("port") else ""
+                lines.append(f"   [{c.get('severity', 'info'):<8}] {host}{port}  {c['cve']}  "
                              f"{c['product']} {c.get('version') or '?'}  {c['summary']}{tag}")
+                # References: the advisories / PoCs / write-ups NVD carries for the
+                # CVE — "how it was used", for the human and NYX to read, never fired.
+                for u in (c.get("references") or [])[:3]:
+                    lines.append(f"              ↳ {u}")
 
     sev_counts: dict[str, int] = {}
     for f in g.findings:

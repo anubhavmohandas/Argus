@@ -30,6 +30,7 @@ import concurrent.futures
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import socket
 import ssl
@@ -361,7 +362,8 @@ def coverage() -> dict:
     owner: dict = {}
     for name, preds in PROVIDES.items():
         for pred in preds:
-            owner[pred] = name
+            owner.setdefault(pred, name)   # a predicate may have >1 source (scan + nvd both
+                                           # establish known_vulnerable_service); list the first.
     for pred in engine._PREDICATES:
         if pred.startswith("name_suggests_") or pred == "publicly_discoverable":
             owner.setdefault(pred, "discovery")
@@ -875,6 +877,162 @@ def enrich_scan(g, ports=None, timeout: float = 4.0, workers: int = 8) -> int:
                     ent.evidence["known_vulnerable_service"] = True
                     vulnerable += 1
     return vulnerable
+
+
+# --- live NVD lookup: observed version -> real CVEs + reference write-ups ---
+# The _CVE_CATALOG / _KEV_CATALOG above are a four-product demo ceiling, frozen
+# in the file. This provider replaces that ceiling with the live feed and closes
+# the loop the whole feature is about: take a (product, version) some earlier
+# provider already observed — a scan banner, or an HTTP version header — ask NVD
+# which CVEs affect THAT version, and pull each CVE's references: the advisories,
+# exploit-db entries, GitHub PoCs and blog write-ups that show how the bug was
+# used. We refer to them; we never fire them.
+#
+# NVD does the version-range match server-side, so the same honesty holds as the
+# static path: a version at/above the fixed one simply gets no hit (I-1). And it
+# never touches the target — it asks NVD about a version we already saw — so it
+# is offline w.r.t. the target, the same engagement level as enrich_kev.
+#
+# occam: a static product->CPE-vendor map. Vendors change rarely; the CVE data
+# is what has to be live. A product not in the map gets no lookup — silence,
+# never a guess. HackerOne has no clean public search API; NVD's tagged
+# references (Exploit / Third Party Advisory) are the queryable equivalent and
+# carry the same write-ups. Add a GitHub-PoC search provider if you outgrow what
+# NVD indexes. Set NVD_API_KEY to lift the 5-req/30s anonymous rate limit.
+_NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+_CPE = {   # product name (as we fingerprint it) -> CPE "vendor:product"
+    "openssh": "openbsd:openssh", "apache": "apache:http_server",
+    "exim": "exim:exim", "proftpd": "proftpd:proftpd",
+    "jenkins": "jenkins:jenkins", "gitlab": "gitlab:gitlab",
+    "jira": "atlassian:jira", "grafana": "grafana:grafana",
+    "phpmyadmin": "phpmyadmin:phpmyadmin",
+}
+# A reference tagged like these is a "how it was exploited" link — surface first.
+_EXPLOIT_TAGS = ("exploit", "third party advisory")
+
+
+def _nvd_severity(cve: dict) -> tuple:
+    """Pure: NVD cve object -> (severity, base_score). Prefers CVSS v3.1, then
+    v3.0, then v2. ('unknown', None) when the record carries no metric."""
+    metrics = cve.get("metrics", {})
+    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        arr = metrics.get(key)
+        if arr:
+            m = arr[0]
+            data = m.get("cvssData", {})
+            sev = data.get("baseSeverity") or m.get("baseSeverity")  # v2 puts it on the metric
+            return (sev or "unknown").lower(), data.get("baseScore")
+    return "unknown", None
+
+
+def _nvd_refs(cve: dict, cap: int = 5) -> list:
+    """Pure: the CVE's reference URLs, exploit/advisory-tagged ones first — the
+    write-ups this feature exists to surface. Deterministic, capped."""
+    refs = cve.get("references", [])
+    def rank(r):
+        tags = [t.lower() for t in r.get("tags", [])]
+        return (0 if any(t in _EXPLOIT_TAGS for t in tags) else 1, r.get("url", ""))
+    out: list = []
+    for r in sorted(refs, key=rank):          # NVD repeats a URL across tag entries
+        u = r.get("url")
+        if u and u not in out:
+            out.append(u)
+    return out[:cap]
+
+
+def parse_nvd(payload: dict, product: str, version: str, port=None) -> list:
+    """Pure: an NVD cves/2.0 response -> observed['cves']-shaped entries.
+
+    Same shape the port scan writes, so the dossier renders both the same way,
+    plus a `references` list. `known_exploited` rides NVD's own CISA-KEV field
+    (`cisaExploitAdd`); `public_exploit` is any Exploit-tagged reference. Empty
+    response -> [] (I-1: no data, no claim)."""
+    out = []
+    for item in (payload or {}).get("vulnerabilities", []):
+        cve = item.get("cve", {})
+        cid = cve.get("id")
+        if not cid:
+            continue
+        summary = next((d.get("value", "") for d in cve.get("descriptions", [])
+                        if d.get("lang") == "en"), "")
+        severity, score = _nvd_severity(cve)
+        exploit_ref = any("exploit" in [t.lower() for t in r.get("tags", [])]
+                          for r in cve.get("references", []))
+        out.append({"port": port, "product": product, "version": version,
+                    "cve": cid, "summary": summary[:300], "severity": severity,
+                    "cvss": score, "known_exploited": bool(cve.get("cisaExploitAdd")),
+                    "public_exploit": exploit_ref, "references": _nvd_refs(cve)})
+    return sorted(out, key=lambda e: e["cve"])
+
+
+def _nvd_get(url: str, timeout: float) -> dict:
+    """Fetch NVD JSON. NVD is a trusted API (not the target), so the untrusted-
+    body cap in _fetch doesn't apply — a CVE-heavy response exceeds 64 KB. {} on
+    any failure: a lookup that didn't complete establishes nothing."""
+    hdrs = {"User-Agent": _UA, "Accept": "application/json"}
+    key = os.environ.get("NVD_API_KEY")
+    if key:
+        hdrs["apiKey"] = key
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with _OPENER.open(req, timeout=timeout) as r:   # noqa: S310 (trusted NVD API)
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+
+
+def nvd_cves(product: str, version: str, port=None, timeout: float = 20.0) -> list:
+    """(product, version) -> live CVE list from NVD, with references. [] for an
+    unknown product or unparseable version — silence, never a guess (I-1)."""
+    vendor_product = _CPE.get(product)
+    if not vendor_product or not _ver_tuple(version):
+        return []
+    cpe = f"cpe:2.3:a:{vendor_product}:{version}:*:*:*:*:*:*:*"
+    url = (f"{_NVD_API}?cpeName={urllib.parse.quote(cpe, safe='')}"
+           "&resultsPerPage=50")
+    return parse_nvd(_nvd_get(url, timeout), product, version, port)
+
+
+def _version_pairs(e) -> list:
+    """(product, version, port) an entity has observed — from a scan's service
+    banners and from an HTTP probe's technology+version. De-duped on (product,
+    version) so the same box isn't queried twice."""
+    pairs = [(s["product"], s["version"], s.get("port"))
+             for s in e.observed.get("services", [])
+             if s.get("product") and s.get("version")]
+    tech, ver = e.evidence.get("technology"), e.observed.get("version")
+    if tech and ver:
+        pairs.append((tech, ver, None))
+    seen, out = set(), []
+    for p, v, port in pairs:
+        if (p, v) not in seen:
+            seen.add((p, v))
+            out.append((p, v, port))
+    return out
+
+
+@declares("nvd", ("known_vulnerable_service",))
+def enrich_nvd(g, timeout: float = 20.0) -> int:
+    """For every (product, version) any provider already observed, ask NVD which
+    CVEs affect that version and attach them — with reference write-ups — to
+    observed['cves']; set known_vulnerable_service where any matched. Live feed,
+    so it extends the static catalog rather than replacing what's already there.
+
+    Sequential on purpose: NVD rate-limits anonymous callers (5 req/30s); set
+    NVD_API_KEY to lift it. Writes only observed/evidence (Provider Contract).
+    Returns hosts with >=1 live CVE."""
+    hosts = 0
+    for e in g.nodes.values():
+        found = []
+        for product, version, port in _version_pairs(e):
+            found.extend(nvd_cves(product, version, port, timeout))
+        if found:
+            seen = {(c["cve"], c.get("port")) for c in e.observed.get("cves", [])}
+            e.observed["cves"] = e.observed.get("cves", []) + [
+                c for c in found if (c["cve"], c.get("port")) not in seen]
+            e.evidence["known_vulnerable_service"] = True
+            hosts += 1
+    return hosts
 
 
 # --- path-traversal probe -------------------------------------------------
