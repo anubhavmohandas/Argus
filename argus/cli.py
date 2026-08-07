@@ -123,35 +123,115 @@ def _confirm_active() -> bool:
     return input("     Proceed? [y/N]: ").strip().lower() in ("y", "yes")
 
 
+def _ask(prompt: str, default: str = "") -> str:
+    """Prompt with an inline default shown in [brackets]; empty input keeps it."""
+    hint = f" [{default}]" if default else ""
+    return input(f"  {prompt}{hint}: ").strip() or default
+
+
+def _yes(prompt: str, default: str = "n") -> bool:
+    return _ask(prompt, default).lower() in ("y", "yes")
+
+
+def _pivot_flow():
+    """Interactive pivot: seed, engagement level, then every option (all defaulted).
+    Builds the argv only — main() runs the one real pivot path. None = cancel."""
+    seed = input("\n  Seed (domain / ip / email / username / phone): ").strip()
+    if not seed:
+        print("  no seed given.")
+        return None
+    print("\n  Engagement level:")
+    for key, (label, desc, _) in _MODES.items():
+        tag = "  (safe default)" if key == "1" else ""
+        head = f"[{key}] {label:<9}"
+        if _COLOR:
+            head = f"\033[1;{_MODE_COLOR[key]}m{head}{_RESET}"
+        print(f"   {head} {desc}{tag}")
+    choice = _ask("Mode 1-4", "1")
+    if choice not in _MODES:
+        print("  not a valid choice — staying passive.")
+        choice = "1"
+    flags = list(_MODES[choice][2])
+    argv = ["pivot", seed]
+    if _yes("Customise options (depth/max/deep/ports/memory/json)?"):
+        argv += ["--depth", _ask("Pivot depth", "2"),
+                 "--max", _ask("Max entities", "40"),
+                 "--deep", _ask("Re-pivot into N subdomains", "0")]
+        if choice == "4":
+            ports = _ask("Ports (blank = common service ports)")
+            if ports:
+                argv += ["--ports", ports]
+        if not _yes("Save to investigation memory?", "y"):
+            argv.append("--no-memory")
+        if _yes("JSON output?"):
+            argv.append("--json")
+    if flags and not _confirm_active():
+        print("  cancelled — nothing sent to the target.")
+        return None
+    return argv + flags
+
+
+def _module_flow():
+    """Interactive `run`: pick one module by number, give it a target."""
+    names = sorted(MODULES)
+    print("\n  Modules:")
+    for i, name in enumerate(names, 1):
+        print(f"   [{i:>2}] {name:<11} {MODULES[name].help}")
+    pick = _ask("Module number", "1")
+    if not pick.isdigit() or not 1 <= int(pick) <= len(names):
+        print("  not a valid choice.")
+        return None
+    name = names[int(pick) - 1]
+    target = input(f"  Target for {name}: ").strip()
+    if not target:
+        print("  no target given.")
+        return None
+    return ["run", name, target] + (["--json"] if _yes("JSON output?") else [])
+
+
+def _all_flow():
+    """Interactive `all`: one target, every module that fits it."""
+    target = input("\n  Target (every fitting module runs): ").strip()
+    if not target:
+        print("  no target given.")
+        return None
+    return ["all", target] + (["--json"] if _yes("JSON output?") else [])
+
+
+# Every CLI capability, reachable from the menu. Each flow returns an argv (or
+# None to cancel); the menu re-enters main() with it, so there is exactly one
+# code path whether Argus is driven by flags or by menu.
+_ACTIONS = {
+    "1": ("Pivot", "autonomous correlation from one seed (the headline)", _pivot_flow),
+    "2": ("Run module", "one recon module against one target", _module_flow),
+    "3": ("Run all", "every module that fits a target", _all_flow),
+    "4": ("Modules", "list the available recon modules", lambda: ["modules"]),
+    "5": ("Coverage", "which engine predicates have an evidence provider", lambda: ["coverage"]),
+}
+
+
 def interactive() -> int:
-    """The 'main menu': banner, seed prompt, mode picker. Bare `argus` on a
-    terminal lands here; scripts (no TTY) get --help instead so nothing hangs."""
+    """The 'main menu': banner + action picker exposing every capability. Bare
+    `argus` on a terminal lands here; scripts (no TTY) get --help so nothing hangs."""
     print(banner())
     try:
-        seed = input("\n  Seed (domain / ip / email / username / phone): ").strip()
-        if not seed:
-            print("  no seed given — bye.")
+        print("\n  What do you want to do?")
+        for key, (label, desc, _) in _ACTIONS.items():
+            print(f"   [{key}] {label:<11} {desc}")
+        action = _ask("Choose 1-5", "1")
+        entry = _ACTIONS.get(action)
+        if entry is None:
+            print("  not a valid choice — bye.")
             return 0
-        print("\n  Engagement level:")
-        for key, (label, desc, _) in _MODES.items():
-            tag = "  (safe default)" if key == "1" else ""
-            head = f"[{key}] {label:<9}"
-            if _COLOR:
-                head = f"\033[1;{_MODE_COLOR[key]}m{head}{_RESET}"
-            print(f"   {head} {desc}{tag}")
-        choice = input("\n  Mode [1-4, default 1]: ").strip() or "1"
-        if choice not in _MODES:
-            print("  not a valid choice — staying passive.")
-            choice = "1"
-        flags = _MODES[choice][2]
-        if flags and not _confirm_active():
-            print("  cancelled — nothing sent to the target.")
+        argv = entry[2]()
+        if argv is None:
+            print("  cancelled.")
             return 0
     except (EOFError, KeyboardInterrupt):
         print("\n  cancelled.")
         return 0
     print()
-    return main(["pivot", seed] + flags)
+    return main(argv)
 
 
 def _print_findings(findings, as_json: bool):
@@ -220,15 +300,20 @@ def main(argv=None):
         g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
                                     expand_subdomains=args.deep))
         if args.probe or args.probe_paths:   # providers add evidence only — the engine is untouched by this
-            n = providers.enrich(g)                 # HTTP probe -> evidence + version
+            n = providers.enrich(g)                 # HTTP probe -> evidence + version + clickjacking
             t = providers.enrich_tls(g)             # TLS probe -> observed cert fingerprint
+            c = providers.enrich_cors(g)            # CORS probe -> cors_misconfig (one GET/host)
             k = providers.enrich_kev(g)             # analysis: version -> known_exploited
             r = providers.analyze_certificates(g)   # analysis: shared cert -> certificate_reused
-            line = f"probed {n} HTTP, {t} TLS; {k} known-exploit, {r} cert-reuse"
+            m = providers.enrich_email_spoof(g)     # analysis: DMARC over DoH -> email_spoofable (no target engagement)
+            line = f"probed {n} HTTP, {t} TLS, {c} CORS; {k} known-exploit, {r} cert-reuse, {m} email-spoofable"
             if args.probe_paths:   # its own flag: multiplies the requests against the target
                 line += (f", {providers.enrich_admin(g)} admin-surface"
                          f", {providers.enrich_exposure(g)} exposed-file"
-                         f", {providers.enrich_traversal(g)} path-traversal")
+                         f", {providers.enrich_traversal(g)} path-traversal"
+                         f", {providers.enrich_graphql(g)} graphql-introspection"
+                         f", {providers.enrich_redirect(g)} open-redirect"
+                         f", {providers.enrich_injection(g)} xss/ssti")
             print(f"[argus] {line} — evidence attached", file=sys.stderr)
         if args.scan:   # loudest tier: a TCP connect scan is unmistakable in the target's logs
             try:

@@ -13,7 +13,8 @@ from argus import engine, providers
 def test_manifest_declares_http_probe():
     assert providers.PROVIDES["http_probe"] == (
         "internet_facing", "technology", "authentication_required",
-        "security_headers_missing", "insecure_cookie")
+        "security_headers_missing", "insecure_cookie", "clickjacking",
+        "subdomain_takeover")
 
 
 def test_coverage_maps_every_predicate_once():
@@ -42,6 +43,19 @@ def test_coverage_maps_every_predicate_once():
     assert cov["exposed_sensitive_file"] == "exposure_probe"
     # the path-traversal probe (another active path probe on the --probe-paths tier)
     assert cov["path_traversal"] == "traversal_probe"
+    # the three PortSwigger web-class probes: clickjacking rides the base HTTP
+    # probe (header-only), CORS its own base-tier GET, GraphQL the active tier
+    assert cov["clickjacking"] == "http_probe"
+    assert cov["cors_misconfig"] == "cors_probe"
+    assert cov["graphql_introspection"] == "graphql_probe"
+    # subdomain takeover: a body fingerprint from the base HTTP probe (zero extra requests)
+    assert cov["subdomain_takeover"] == "http_probe"
+    # open redirect + reflected XSS/SSTI: active param-injection probes (--probe-paths)
+    assert cov["open_redirect"] == "redirect_probe"
+    assert cov["reflected_xss"] == "injection_probe"
+    assert cov["ssti"] == "injection_probe"
+    # email spoofing: DMARC analysis over DoH (DNS-only, no target engagement)
+    assert cov["email_spoofable"] == "email_spoof"
     assert all(cov.values()), f"uncovered: {[p for p, v in cov.items() if not v]}"
 
 

@@ -1,0 +1,25 @@
+# A GraphQL endpoint answered an introspection query with a live __schema result,
+# so introspection is enabled in production. That hands an attacker the full schema
+# — every type, field, and mutation — the map they use to plan every other attack.
+# The signature is definitive (an error/soft-404 can't forge a __schema), so
+# confidence is high; impact is information disclosure rather than direct RCE, so
+# severity is low. Only a real introspection result sets the predicate.
+id = "graphql_introspection"
+name = "GraphQL introspection enabled"
+description = "A publicly reachable GraphQL endpoint returned a full introspection result, exposing its entire schema (types, fields, and mutations) to unauthenticated clients."
+base_confidence = 65
+tags = ["exposure", "graphql", "information-disclosure", "bug-bounty"]
+version = 1
+
+[requires]
+graphql_introspection = true
+publicly_discoverable = true
+
+[outputs]
+severity = "low"
+recommendation = [
+    "Disable introspection in production (or restrict it to authenticated internal clients)",
+    "Enforce query allowlisting / persisted queries so only known operations run",
+    "Add depth and cost limits to blunt schema-driven abusive queries",
+]
+hypothesis = ["An attacker has the complete API schema and can enumerate every query and mutation to plan further attacks"]

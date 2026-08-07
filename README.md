@@ -43,12 +43,15 @@ the deliverable, not a flat list.
 ## Install
 
 ```bash
-python3 -m argus modules              # no install step — core is stdlib-only
-pip install 'phonenumbers>=8.13'      # optional, only for the `phone` module
+pip install .            # installs the `argus` command (core is stdlib-only)
+argus                    # bare command on a terminal → interactive menu
+pip install '.[phone]'   # optional extra: the `phone` module (libphonenumber)
 ```
 
-Core is **stdlib-only** and dependency-light on purpose — it stays a tool
-you can drop anywhere.
+No install needed to try it — `python3 -m argus <cmd>` runs from the source
+tree. Rule-based reasoning uses stdlib `tomllib`, so the **engine needs Python
+3.11+**; discovery runs on any Python 3. Core is **stdlib-only** and
+dependency-light on purpose — it stays a tool you can drop anywhere.
 
 ## Commands
 
@@ -59,6 +62,7 @@ you can drop anywhere.
 | `argus run <module> <target>` | Run a single module. |
 | `argus all <target>` | Run every module that fits the target. |
 | `argus modules` | List modules. |
+| `argus coverage` | Which engine predicates have an evidence provider (the roadmap, live from the code). |
 
 Flags on `pivot`: `--depth N` (pivot depth, default 2), `--max N` (entity
 cap, default 40), `--deep N` (re-pivot into N discovered subdomains),
@@ -87,29 +91,48 @@ auto-registers and the pivot engine can chain it.
 ## Evidence providers (the probes)
 
 Providers don't grow the graph — they establish facts about hosts it already
-found, and write them where the rules read (`--probe` / `--probe-paths`, opt-in
-because probing is active). Web-exposure evidence is harvested from the
-`owasp_scanner` misconfiguration/disclosure patterns:
+found, and write them where the rules read. They're grouped by **engagement
+tier**, so you only send what you opt into:
 
-| Predicate | Provider | Establishes |
+**`--probe`** — reaches each host once (or reads public DNS), low engagement:
+
+| Predicate(s) | Provider | Establishes |
 |---|---|---|
-| `security_headers_missing` / `insecure_cookie` | `http_probe` | hardening gaps + cookie flags — free, from the one `/` response |
-| `exposed_sensitive_file` | `exposure_probe` | a reachable `.git` / `.env` / `.DS_Store` whose body confirms the real file |
+| `internet_facing`, `technology`, `authentication_required`, `security_headers_missing`, `insecure_cookie`, `clickjacking`, `subdomain_takeover` | `http_probe` | everything a single `/` response reveals — reachability, tech fingerprint, auth gate, hardening headers, cookie flags, framability, and a dangling-DNS takeover fingerprint |
+| `certificate_reused` | `cert_analysis` | the same TLS cert served across unrelated hosts (analysis over the graph) |
+| `known_exploited`, `public_exploit` | `kev` | an observed product version matched against a known-exploited catalog |
+| `cors_misconfig` | `cors_probe` | a credentialed reflected-origin CORS grant (one extra GET) |
+| `email_spoofable` | `email_spoof` | missing / unenforced DMARC — DNS-only, never touches the target |
 
-Each is an *observation* only; the conclusion is a TOML rule
-([`rules/exposed_sensitive_file.toml`](argus/rules/exposed_sensitive_file.toml),
-`missing_security_headers`, `insecure_cookie`). `argus coverage` maps every
-predicate to its provider.
+**`--probe-paths`** — sends multiple requests / payloads per host, louder:
+
+| Predicate(s) | Provider | Establishes |
+|---|---|---|
+| `has_admin_interface` | `admin_probe` | a reachable admin surface, confirmed by what it serves |
+| `exposed_sensitive_file` | `exposure_probe` | a reachable `.git` / `.env` / `.DS_Store` whose body confirms the real file |
+| `path_traversal` | `traversal_probe` | a `../` payload that returned real file content (self-gating) |
+| `graphql_introspection` | `graphql_probe` | a GraphQL endpoint that answered a live `__schema` query |
+| `open_redirect` | `redirect_probe` | a redirect param that bounced to a canary host we injected |
+| `reflected_xss`, `ssti` | `injection_probe` | a unique canary reflected unescaped, or `{{7*7}}` rendered to `49` |
+
+**`--scan`** — loudest: `known_vulnerable_service` from a `port_scan` (TCP-connect
++ banner) matched against a service-CVE catalog.
+
+Each predicate is an *observation* only; the conclusion is a TOML rule in
+[`argus/rules/`](argus/rules/). `argus coverage` maps every predicate to its
+provider, live from the code — the ones with no provider are the roadmap.
 
 ## Architecture
 
 ```
-core.py     finding model · module registry · validated HTTP · input guards
-modules.py  built-in recon modules (the hands)
-pivot.py    discovery — bounded BFS correlation into an entity graph
-engine.py   Investigator Rule Engine — read-only reasoning: rules, predicates, conclusions, ledger
-rules/      declarative TOML rule files (data, never code)
-cli.py      pivot / run / all / modules
+core.py       finding model · module registry · validated HTTP · input guards
+modules.py    built-in recon modules (the hands)
+pivot.py      discovery — bounded BFS correlation into an entity graph
+providers.py  evidence providers — probe/analysis facts written to Entity.evidence
+engine.py     Investigator Rule Engine — read-only reasoning: rules, predicates, conclusions, ledger
+rules/        declarative TOML rule files (data, never code)
+store.py      investigation memory — per-seed case files + cross-run diff
+cli.py        pivot / run / all / modules / coverage + interactive menu
 ```
 
 Discovery (`pivot`) builds the evidence graph; the **Investigator Rule Engine**
@@ -144,9 +167,12 @@ Pre-1.0: the surface is deliberate, but not yet frozen.
 
 ## Roadmap
 
-- **Evidence providers** — modules that assert probe facts (e.g. ExploitDB →
-  `public_exploit`, a TLS probe → `certificate_reused`) so existing rules fire
-  on real evidence. No engine/rule changes — just better evidence.
+- **More evidence providers** — the seam grows by adding evidence, never by
+  changing the engine. Shipped so far: HTTP/TLS probe, KEV catalog, certificate
+  reuse, admin surface, sensitive-file exposure, path traversal, clickjacking,
+  CORS, GraphQL introspection, subdomain takeover, open redirect, reflected
+  XSS / SSTI, DMARC email-spoofing, and a port-scan service-CVE match. Next: a
+  live CISA KEV / NVD feed behind the same seam, and wider fingerprint sets.
 - **Optional LLM layer (NYX)** — sits *above* the engine to explain,
   summarize, converse, and answer questions over its output. It never decides
   investigation logic — that stays deterministic (Rule 7).

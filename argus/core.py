@@ -90,7 +90,7 @@ def check_target(kind: str, target: str) -> str:
 
 
 # --- HTTP (stdlib only — keeps Argus dependency-light) --------------------
-_UA = "Argus-Recon/0.1 (+https://github.com/)"
+_UA = "Argus-Recon/0.1.0"
 
 
 def http_get(url: str, timeout: float = 12.0) -> tuple[int, str]:

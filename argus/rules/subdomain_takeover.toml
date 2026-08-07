@@ -1,0 +1,27 @@
+# The host served a cloud/SaaS vendor's "this name isn't claimed" page — the exact
+# vendor fingerprint string, not a generic 404. That means a dangling DNS record
+# points at a deprovisioned service anyone can re-register, handing an attacker
+# control of content served on this trusted subdomain (phishing, cookie theft,
+# OAuth-redirect abuse). Only a real vendor unclaimed-page match sets
+# `subdomain_takeover`, so the rule stands on publicly_discoverable + its own
+# evidence. The fingerprint is a strong lead a hunter confirms by claiming the
+# name, so confidence is high, not certain.
+id = "subdomain_takeover"
+name = "Subdomain takeover — dangling record to a claimable service"
+description = "A publicly reachable host resolves to a deprovisioned cloud/SaaS service that serves its unclaimed-name page, so an attacker can re-register it and control content on this subdomain."
+base_confidence = 70
+tags = ["exposure", "subdomain-takeover", "dangling-dns", "bug-bounty"]
+version = 1
+
+[requires]
+subdomain_takeover = true
+publicly_discoverable = true
+
+[outputs]
+severity = "high"
+recommendation = [
+    "Remove the dangling DNS record, or re-claim the service it points at, immediately",
+    "Audit every CNAME/ALIAS for targets at deprovisioned SaaS/cloud endpoints",
+    "Confirm by attempting to claim the name on the fingerprinted provider (in scope)",
+]
+hypothesis = ["An attacker can register the abandoned service and serve arbitrary content from this trusted subdomain"]

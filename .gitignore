@@ -11,6 +11,11 @@ Tools/
 # Secrets. Argus's own secret_scan module flags these; don't ship one.
 .env
 
+# Packaging build artifacts (pip install . / build)
+build/
+dist/
+*.egg-info/
+
 # macOS + Python noise
 .DS_Store
 *.jpeg

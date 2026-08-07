@@ -1,0 +1,26 @@
+# A served page carried no framing constraint — no X-Frame-Options DENY/SAMEORIGIN
+# and no CSP frame-ancestors — so an attacker page can frame it (clickjacking).
+# Only a real 200 response can set `clickjacking`, so reaching the host is already
+# proven; the rule stands on publicly_discoverable + its own evidence, like the
+# traversal rule. Framability is necessary-not-sufficient — the payoff needs a
+# sensitive action to overlay — so this is a moderate-confidence medium, not a
+# critical.
+id = "clickjacking"
+name = "Clickjacking — page is framable"
+description = "A publicly reachable page served without X-Frame-Options or a CSP frame-ancestors directive, so it can be embedded in an attacker-controlled frame."
+base_confidence = 40
+tags = ["exposure", "clickjacking", "missing-header", "bug-bounty"]
+version = 1
+
+[requires]
+clickjacking = true
+publicly_discoverable = true
+
+[outputs]
+severity = "medium"
+recommendation = [
+    "Send Content-Security-Policy: frame-ancestors 'self' (or an explicit allowlist) on HTML responses",
+    "Add X-Frame-Options: DENY (or SAMEORIGIN) for legacy-browser coverage",
+    "Confirm exploitability by checking whether any framed action is state-changing or sensitive",
+]
+hypothesis = ["An attacker can overlay this page in a frame and trick a user into interacting with it (UI redressing)"]

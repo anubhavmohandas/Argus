@@ -1,0 +1,25 @@
+# A publicly reachable host reflected our injected HTML back into the response
+# with its markup intact — the page did not encode it, so an attacker-supplied
+# <svg onload=…> executes in a victim's browser (reflected XSS). Only a raw,
+# unescaped reflection of our unique canary sets the predicate — an HTML-encoded
+# echo does not — so the rule stands on publicly_discoverable + its own evidence.
+# High: script execution in the victim's session (session theft, action forgery).
+id = "reflected_xss"
+name = "Reflected cross-site scripting (XSS)"
+description = "A publicly reachable host reflects request input into its HTML response without encoding it, so attacker-supplied markup executes in a victim's browser."
+base_confidence = 70
+tags = ["exposure", "xss", "injection", "bug-bounty"]
+version = 1
+
+[requires]
+reflected_xss = true
+publicly_discoverable = true
+
+[outputs]
+severity = "high"
+recommendation = [
+    "Context-aware output-encode all request-derived data on the way into HTML (and JS/attribute contexts)",
+    "Add a strict Content-Security-Policy to blunt script execution as defense in depth",
+    "Prefer a framework/template engine that auto-escapes by default over manual string building",
+]
+hypothesis = ["An attacker can run arbitrary script in a victim's session on this origin — stealing session tokens or forging actions"]

@@ -1,0 +1,25 @@
+# The server reflected an arbitrary Origin we chose into Access-Control-Allow-Origin
+# AND set Access-Control-Allow-Credentials: true. That combination lets any website
+# read this host's authenticated responses on a logged-in victim's behalf — a
+# directly exploitable cross-origin data leak, not a hardening nit. Only a real
+# reflection of our unique probe origin can set `cors_misconfig`, so the rule
+# stands on publicly_discoverable + its own evidence. High confidence, high sev.
+id = "cors_misconfig"
+name = "CORS — credentialed reflected-origin trust"
+description = "A publicly reachable host echoes an arbitrary request Origin into Access-Control-Allow-Origin with Access-Control-Allow-Credentials: true, letting any site read its authenticated responses."
+base_confidence = 70
+tags = ["exposure", "cors", "cross-origin", "bug-bounty"]
+version = 1
+
+[requires]
+cors_misconfig = true
+publicly_discoverable = true
+
+[outputs]
+severity = "high"
+recommendation = [
+    "Never reflect the request Origin — validate it against a strict server-side allowlist",
+    "Do not combine Access-Control-Allow-Credentials: true with a dynamic or wildcard origin",
+    "Scope credentialed CORS to the exact known front-end origins and nothing else",
+]
+hypothesis = ["An attacker site can read this host's authenticated responses for any user it can lure to visit it"]

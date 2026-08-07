@@ -1,0 +1,28 @@
+# Argus packaging — turns `python3 -m argus` into an installed `argus` command.
+# Core is stdlib-only, so there are no runtime dependencies; the one optional
+# module (phone) is an extra. Rule reasoning needs stdlib tomllib => 3.11+.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argus"
+version = "0.1.0"
+description = "Autonomous correlation recon engine — one seed to a scored entity-graph dossier."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Anubhav Mohandas", email = "anubhav.manav147@gmail.com" }]
+keywords = ["recon", "osint", "security", "attack-surface", "correlation"]
+dependencies = []          # core is stdlib-only, on purpose
+
+[project.optional-dependencies]
+phone = ["phonenumbers>=8.13"]   # only the `phone` module uses it
+
+[project.scripts]
+argus = "argus.cli:main"
+
+[tool.setuptools]
+packages = ["argus"]
+
+[tool.setuptools.package-data]
+argus = ["rules/*.toml"]   # rules load from __file__/rules — ship them with the package

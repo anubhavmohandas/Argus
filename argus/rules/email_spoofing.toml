@@ -1,0 +1,25 @@
+# A publicly discoverable domain publishes no enforcing DMARC record (absent, or
+# p=none), so mail claiming to come from it can be spoofed and will not be
+# quarantined or rejected by receivers honoring DMARC. This is a DNS observation,
+# not a host probe — the domain being publicly discoverable is enough. Low
+# severity (enabling, not a direct compromise) but a routinely reported finding,
+# and definitive: the DMARC policy is read straight from DNS.
+id = "email_spoofing"
+name = "Email spoofing — DMARC not enforced"
+description = "A publicly discoverable domain has no enforcing DMARC policy (missing or p=none), so forged mail from the domain will not be rejected by receivers that honor DMARC."
+base_confidence = 55
+tags = ["exposure", "email", "dmarc", "spoofing", "bug-bounty"]
+version = 1
+
+[requires]
+email_spoofable = true
+publicly_discoverable = true
+
+[outputs]
+severity = "low"
+recommendation = [
+    "Publish a DMARC record and move the policy to p=quarantine, then p=reject once monitoring is clean",
+    "Ensure SPF and DKIM are aligned so legitimate mail passes under the enforced policy",
+    "Set a strict subdomain policy (sp=reject) so unused subdomains can't be spoofed either",
+]
+hypothesis = ["An attacker can send mail that appears to come from this domain, aiding phishing and business-email-compromise"]

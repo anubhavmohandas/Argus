@@ -29,13 +29,15 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import ipaddress
+import json
 import re
 import socket
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 
-_UA = "Argus-Recon/0.1 (+https://github.com/)"
+_UA = "Argus-Recon/0.1.0"
 _BODY_CAP = 65536          # enough for <head>; we only ever read the title
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 
@@ -95,6 +97,55 @@ def cookie_is_insecure(headers: dict, scheme: str = "https"):
     return "httponly" not in low or (scheme == "https" and "secure" not in low)
 
 
+# --- subdomain-takeover fingerprints --------------------------------------
+# A dangling DNS record (a CNAME to a deprovisioned SaaS bucket/app) leaves the
+# subdomain pointing at a service that will hand control to whoever claims the
+# name next. Each vendor serves a DISTINCTIVE "this isn't claimed" page, and that
+# exact string is the signal — a generic 404 is not. Matching a vendor error is
+# self-gating like the traversal /etc/passwd body: ordinary content can't forge
+# it. Comes free from the body the base probe already fetched (zero extra
+# requests, like clickjacking). occam: a curated high-signal set — extend it as
+# new services appear; the provider never changes. A match is a strong lead a
+# hunter still confirms by trying to claim the name.
+_TAKEOVER_FINGERPRINTS = (
+    ("github-pages", "there isn't a github pages site here"),
+    ("aws-s3", "the specified bucket does not exist"),
+    ("aws-s3", "nosuchbucket"),
+    ("heroku", "no such app"),
+    ("shopify", "sorry, this shop is currently unavailable"),
+    ("fastly", "fastly error: unknown domain"),
+    ("surge", "project not found"),
+    ("bitbucket", "repository not found"),
+    ("pantheon", "the gods are wise, but do not know of the site which you seek"),
+    ("readthedocs", "unknown to read the docs"),
+    ("wpengine", "the site you were looking for couldn't be found"),
+    ("tilda", "please renew your subscription"),
+)
+
+
+def takeover_service(body: str) -> str | None:
+    """Pure: which claimable service this response fingerprints, or None. The
+    match IS the evidence — a vendor's unclaimed-name page, not a generic 404."""
+    low = body.lower()
+    for service, needle in _TAKEOVER_FINGERPRINTS:
+        if needle in low:
+            return service
+    return None
+
+
+def is_framable(headers: dict) -> bool:
+    """Pure: can an attacker's page frame this one (clickjacking)? True unless the
+    response constrains framing with X-Frame-Options DENY/SAMEORIGIN or a CSP
+    frame-ancestors directive. occam: presence of frame-ancestors counts as
+    protection without parsing its value — a directive that lists only trusted
+    origins still blocks an arbitrary attacker frame; deprecated ALLOW-FROM is
+    ignored by modern browsers, so it reads as framable (which it is)."""
+    xfo = headers.get("x-frame-options", "").lower()
+    if "deny" in xfo or "sameorigin" in xfo:
+        return False
+    return "frame-ancestors" not in headers.get("content-security-policy", "").lower()
+
+
 def _resolvable_and_global(host: str) -> bool:
     """True only if every address `host` resolves to is public.
 
@@ -130,10 +181,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def _fetch(url: str, timeout: float) -> tuple[int, dict, str]:
-    """GET without redirects. Returns (status, lowercased headers, body).
-    Unreachable => (0, {}, "") — a failure to connect establishes nothing."""
-    req = urllib.request.Request(url, headers={"User-Agent": _UA, "Accept": "*/*"})
+def _fetch(url: str, timeout: float, data: bytes | None = None,
+           extra_headers: dict | None = None) -> tuple[int, dict, str]:
+    """GET (or POST when `data` is given) without redirects. Returns (status,
+    lowercased headers, body). Unreachable => (0, {}, "") — a failure to connect
+    establishes nothing. `extra_headers` add to the defaults (Origin for CORS,
+    Content-Type for a GraphQL POST); they never override the User-Agent."""
+    hdrs = {"User-Agent": _UA, "Accept": "*/*", **(extra_headers or {})}
+    req = urllib.request.Request(url, data=data, headers=hdrs)
     try:
         with _OPENER.open(req, timeout=timeout) as r:  # noqa: S310 (probes external targets by design)
             body = r.read(_BODY_CAP).decode("utf-8", "replace")
@@ -160,6 +215,10 @@ def evidence_from(status: int, headers: dict, body: str, scheme: str = "https") 
         return {}          # never reached it: we learned nothing, not "it's down"
 
     ev: dict = {"internet_facing": True}
+    # Subdomain takeover reads a vendor "unclaimed" page, which is usually a 404 —
+    # so it runs on any real response, before the status-specific branches below.
+    if takeover_service(body):
+        ev["subdomain_takeover"] = True
     title = (_TITLE_RE.search(body).group(1).strip().lower()
              if body and _TITLE_RE.search(body) else "")
 
@@ -192,6 +251,9 @@ def evidence_from(status: int, headers: dict, body: str, scheme: str = "https") 
         # A 200 with every header present is an established negative (checked,
         # fine), not silence — same honesty as authentication_required above.
         ev["security_headers_missing"] = bool(missing_security_headers(headers))
+        # Framability is judgeable on the same served page — a False here means we
+        # checked and it's protected, not silence (I-1). Costs zero extra requests.
+        ev["clickjacking"] = is_framable(headers)
 
     cookie = cookie_is_insecure(headers, scheme)
     if cookie is not None:                       # None => no cookie set => unknown
@@ -242,6 +304,9 @@ def probe(host: str, timeout: float = 8.0) -> tuple[dict, dict]:
             missing = missing_security_headers(headers) if status == 200 else []
             if missing:                       # the specifics, for a human/NYX to read
                 observed["missing_headers"] = missing
+            svc = takeover_service(body)      # which service, for the dossier/NYX
+            if svc:
+                observed["takeover_service"] = svc
             return evidence_from(status, headers, body, scheme), observed
     return {}, {}
 
@@ -265,7 +330,8 @@ def declares(name: str, provides):
 
 
 @declares("http_probe", ("internet_facing", "technology", "authentication_required",
-                         "security_headers_missing", "insecure_cookie"))
+                         "security_headers_missing", "insecure_cookie", "clickjacking",
+                         "subdomain_takeover"))
 def enrich(g, timeout: float = 8.0, workers: int = 8) -> int:
     """Attach probe evidence to every probeable node. Returns hosts reached.
 
@@ -880,6 +946,316 @@ def enrich_traversal(g, timeout: float = 8.0, workers: int = 8) -> int:
     marked = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         for ent, ev in zip(targets, ex.map(lambda e: traversal_probe(e.value, timeout), targets)):
+            if ev:
+                ent.evidence.update(ev)
+                marked += 1
+    return marked
+
+
+# --- CORS misconfiguration probe ------------------------------------------
+# One GET carrying an Origin header we chose. The exploitable misconfiguration is
+# a server that ECHOES an arbitrary origin into Access-Control-Allow-Origin AND
+# sets Access-Control-Allow-Credentials: true — that combination lets any website
+# read this host's authenticated responses on a victim's behalf. Reflecting our
+# unique random origin is inherently control-gated: a soft-404 / catch-all cannot
+# forge back the exact origin string we sent, so no separate control request is
+# needed. Low engagement (one benign GET), so it rides the base --probe tier.
+#
+# occam: flags only reflected-specific-origin + credentials, the classic high-
+# signal case. ACAO:* is browser-rejected with credentials (not exploitable), and
+# `Origin: null` reflection is a narrower variant — add each when a target needs
+# it. Non-credentialed reflection exposes only public data, so it isn't claimed.
+_CORS_PROBE_ORIGIN = "https://argus-cors-probe.example"
+
+
+def cors_evidence(headers: dict, probe_origin: str = _CORS_PROBE_ORIGIN) -> dict:
+    """Pure: does the response grant our arbitrary Origin credentialed access?
+
+    No Access-Control-Allow-Origin at all => no claim (unknown, I-1). It counts
+    only when the server echoed the exact origin we sent AND allows credentials.
+    """
+    acao = headers.get("access-control-allow-origin", "").strip()
+    if not acao:
+        return {}
+    acac = headers.get("access-control-allow-credentials", "").strip().lower() == "true"
+    if acao == probe_origin and acac:
+        return {"cors_misconfig": True}
+    return {}
+
+
+def cors_probe(host: str, timeout: float = 8.0) -> dict:
+    """Probe one host for a credentialed reflected-origin CORS grant. Returns
+    evidence; {} establishes nothing. One GET with our probe Origin — an
+    unreachable or non-global host costs nothing (SSRF guard first)."""
+    if not _resolvable_and_global(host):
+        return {}
+    for scheme in ("https", "http"):
+        status, headers, _ = _fetch(f"{scheme}://{host}/", timeout,
+                                    extra_headers={"Origin": _CORS_PROBE_ORIGIN})
+        if status:
+            return cors_evidence(headers)
+    return {}
+
+
+@declares("cors_probe", ("cors_misconfig",))
+def enrich_cors(g, timeout: float = 8.0, workers: int = 8) -> int:
+    """Attach CORS-misconfiguration evidence to every probeable node. Returns hosts
+    marked. One GET per host (same low engagement as the base HTTP probe), so the
+    CLI folds it into --probe. Writes only to `Entity.evidence`."""
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    marked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, ev in zip(targets, ex.map(lambda e: cors_probe(e.value, timeout), targets)):
+            if ev:
+                ent.evidence.update(ev)
+                marked += 1
+    return marked
+
+
+# --- GraphQL introspection probe ------------------------------------------
+# POST a minimal introspection query to a short list of conventional GraphQL
+# paths. Introspection enabled in production hands an attacker the entire schema
+# — every type, field, and mutation — which is the map they use for everything
+# else. The signature is self-gating like the traversal /etc/passwd body: a
+# response is only counted if its JSON actually carries a live __schema result,
+# which a soft-404 or error page cannot forge, so no separate control request is
+# needed. Multiple POSTs against someone else's server => the active --probe-paths
+# tier, alongside admin/exposure/traversal.
+#
+# occam: a short conventional path list, not endpoint discovery; a query-only
+# introspection, not the full type walk. Add paths / GET-transport / persisted-
+# query bypass when a target needs it.
+_GRAPHQL_PATHS = ("/graphql", "/api/graphql", "/graphql/console", "/v1/graphql", "/query")
+_INTROSPECTION_QUERY = b'{"query":"{__schema{queryType{name}}}"}'
+
+
+def introspection_confirmed(body: str) -> bool:
+    """Pure: does this body prove GraphQL introspection is live? True only when the
+    JSON carries data.__schema.queryType.name — a shape an error/soft-404 can't fake."""
+    try:
+        data = (json.loads(body).get("data") or {}).get("__schema") or {}
+        return bool((data.get("queryType") or {}).get("name"))
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def graphql_probe(host: str, timeout: float = 8.0) -> dict:
+    """Probe one host's conventional GraphQL paths for enabled introspection.
+    Returns evidence; {} establishes nothing. A cheap reachability GET first, so
+    an unreachable host costs one request before any POSTs (SSRF guard first)."""
+    if not _resolvable_and_global(host):
+        return {}
+    for scheme in ("https", "http"):
+        if not _fetch(f"{scheme}://{host}/", timeout)[0]:
+            continue                       # host didn't answer on this scheme
+        for path in _GRAPHQL_PATHS:
+            status, _, body = _fetch(f"{scheme}://{host}{path}", timeout,
+                                     data=_INTROSPECTION_QUERY,
+                                     extra_headers={"Content-Type": "application/json"})
+            if status == 200 and introspection_confirmed(body):
+                return {"graphql_introspection": True}
+        return {}                          # reached the host; no open introspection
+    return {}
+
+
+@declares("graphql_probe", ("graphql_introspection",))
+def enrich_graphql(g, timeout: float = 8.0, workers: int = 8) -> int:
+    """Attach GraphQL-introspection evidence to every probeable node. Returns hosts
+    marked. Up to 1 + len(_GRAPHQL_PATHS) requests per host, so it rides the active
+    --probe-paths tier with admin/exposure/traversal. Writes only to `Entity.evidence`."""
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    marked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, ev in zip(targets, ex.map(lambda e: graphql_probe(e.value, timeout), targets)):
+            if ev:
+                ent.evidence.update(ev)
+                marked += 1
+    return marked
+
+
+# --- email-spoofing analysis (DMARC enforcement over DoH) ------------------
+# An Analysis-class provider like KEV/cert_analysis: it reads DNS, never touches
+# the target host. DMARC is the record that actually stops From-header spoofing;
+# a domain with no DMARC record, or a published policy of p=none (monitor-only),
+# can be spoofed. It reuses the discovery layer's DNS-over-HTTPS resolver, so it
+# adds no dependency and no engagement with the target — the query goes to a
+# public resolver. occam: DMARC-only, on apex domain entities. A subdomain with
+# no DMARC of its own inherits the org policy's sp= directive — checking that
+# (and SPF -all alignment) is the upgrade path; DMARC absent / p=none is the
+# honest, high-agreement floor the whole industry reports on.
+_DMARC_RE = re.compile(r"v\s*=\s*dmarc1", re.I)
+_DMARC_POLICY = re.compile(r"\bp\s*=\s*(none|quarantine|reject)", re.I)
+
+
+def email_spoofable(dmarc_txts) -> bool:
+    """Pure: do these _dmarc TXT records leave the domain open to email spoofing?
+    True when no DMARC record is published, or its policy is p=none (not enforced)."""
+    dmarc = next((t for t in dmarc_txts if _DMARC_RE.search(t)), None)
+    if dmarc is None:
+        return True                       # no DMARC at all → spoofable
+    m = _DMARC_POLICY.search(dmarc)
+    return bool(m and m.group(1).lower() == "none")
+
+
+def _txt_records(name: str) -> list:
+    """DoH TXT lookup via the discovery layer's resolver (dns.google). Returns the
+    record strings ([] on failure). Reuses core.http_json — no new dependency, and
+    the query never touches the target, only a public resolver."""
+    from .core import http_json, q       # lazy: matches coverage()'s deferred import
+    data = http_json(f"https://dns.google/resolve?name={q(name)}&type=TXT")
+    return [str(a.get("data", "")).strip('"') for a in (data or {}).get("Answer", []) if a.get("data")]
+
+
+@declares("email_spoof", ("email_spoofable",))
+def enrich_email_spoof(g, workers: int = 8) -> int:
+    """Establish `email_spoofable` on every apex-domain entity whose DMARC is
+    absent or unenforced. DNS-only (public resolver) — no target engagement — so
+    the CLI folds it into the base --probe tier. Writes only to `Entity.evidence`."""
+    domains = [e for e in g.nodes.values() if e.type == "domain"]
+    if not domains:
+        return 0
+    marked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        results = ex.map(lambda e: email_spoofable(_txt_records(f"_dmarc.{e.value}")), domains)
+        for ent, spoofable in zip(domains, results):
+            if spoofable:
+                ent.evidence["email_spoofable"] = True
+                marked += 1
+    return marked
+
+
+# --- open-redirect probe --------------------------------------------------
+# Active param injection, same self-gating discipline as the traversal probe:
+# inject a UNIQUE external canary URL into conventional redirect parameters on
+# `/`, and count it only if a 3xx Location points back at that exact canary host —
+# a value the app cannot emit unless it followed our parameter (I-1). No open
+# redirect to a host we didn't inject. occam: query-param redirects on `/` only;
+# body/meta-refresh and path-segment redirects are the upgrade path.
+_REDIRECT_PARAMS = ("redirect", "url", "next", "return", "returnurl", "dest",
+                    "destination", "continue", "r", "u")
+_REDIRECT_CANARY = "https://argus-openredirect-canary.example/"
+_REDIRECT_HOST = "argus-openredirect-canary.example"
+_REDIRECTS = (301, 302, 303, 307, 308)
+
+
+def _location_host(location: str) -> str:
+    """Pure: the host a Location header points at ('' if none/unparseable).
+    Handles absolute and protocol-relative (//host/…) redirect targets."""
+    try:
+        return (urllib.parse.urlsplit(location.strip()).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def redirect_evidence(responses: dict, canary_host: str = _REDIRECT_HOST) -> dict:
+    """Pure: {param: (status, location)} -> evidence. Open redirect only when a 3xx
+    Location resolves to the exact external host we injected. Never asserts False —
+    parameters coming back empty means we tried them, not that redirects are safe."""
+    for status, location in responses.values():
+        if status in _REDIRECTS and _location_host(location) == canary_host:
+            return {"open_redirect": True}
+    return {}
+
+
+def redirect_probe(host: str, timeout: float = 8.0) -> dict:
+    """Probe one host for an open redirect. Returns evidence; {} establishes nothing.
+    Reachability GET first, so an unreachable host costs one request (SSRF guard first)."""
+    if not _resolvable_and_global(host):
+        return {}
+    payload = urllib.parse.quote(_REDIRECT_CANARY, safe="")
+    for scheme in ("https", "http"):
+        if not _fetch(f"{scheme}://{host}/", timeout)[0]:
+            continue
+        responses = {}
+        for p in _REDIRECT_PARAMS:
+            status, headers, _ = _fetch(f"{scheme}://{host}/?{p}={payload}", timeout)
+            responses[p] = (status, headers.get("location", ""))
+        return redirect_evidence(responses)
+    return {}
+
+
+@declares("redirect_probe", ("open_redirect",))
+def enrich_redirect(g, timeout: float = 8.0, workers: int = 8) -> int:
+    """Attach open-redirect evidence to every probeable node. Returns hosts marked.
+    1 + len(_REDIRECT_PARAMS) requests per host, so it rides the active --probe-paths
+    tier with admin/exposure/traversal/graphql. Writes only to `Entity.evidence`."""
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    marked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, ev in zip(targets, ex.map(lambda e: redirect_probe(e.value, timeout), targets)):
+            if ev:
+                ent.evidence.update(ev)
+                marked += 1
+    return marked
+
+
+# --- reflected-XSS + SSTI injection probe ---------------------------------
+# One active probe, two predicates — both from the SAME reflection of a unique
+# canary, so it costs one request set. Inject a canary carrying an HTML-XSS
+# marker and a template-injection marker into conventional parameters on `/`:
+#   · reflected_xss — the raw <svg/onload=…> came back with its angle brackets
+#     INTACT (unescaped HTML reflection). If the app HTML-encodes, the marker
+#     comes back as &lt;svg…&gt; and is correctly NOT counted.
+#   · ssti          — our {{7*7}} rendered to 49 flush against a unique marker
+#     (argussti49), a value only a template engine that evaluated our injection
+#     can produce. A literal reflection stays argussti{{7*7}} and is NOT counted.
+# Both markers are unique tokens, so neither can be forged by ordinary page text
+# (self-gating, I-1). occam: HTML-context XSS + {{ }} template syntax only;
+# attribute/JS-context XSS and ${}/<%= %> engines are the upgrade path.
+_INJECT_PARAMS = ("q", "s", "search", "query", "id", "name", "keyword", "message")
+_XSS_PAYLOAD = "argusx55<svg/onload=confirm(1)>"     # raw <…> survives ⇒ unescaped reflection
+_SSTI_MARK = "argussti"
+_SSTI_PAYLOAD = _SSTI_MARK + "{{7*7}}"               # renders to argussti49 iff evaluated
+_SSTI_EVAL = _SSTI_MARK + "49"
+_INJECT_PAYLOAD = _XSS_PAYLOAD + _SSTI_PAYLOAD
+
+
+def injection_evidence(bodies) -> dict:
+    """Pure: the response bodies from injecting our canary -> {reflected_xss?, ssti?}.
+    Never asserts False — an absent marker means the app didn't reflect it here,
+    not that it's safe everywhere (I-1)."""
+    ev: dict = {}
+    for body in bodies:
+        if not body:
+            continue
+        if _XSS_PAYLOAD in body:
+            ev["reflected_xss"] = True
+        if _SSTI_EVAL in body:
+            ev["ssti"] = True
+    return ev
+
+
+def injection_probe(host: str, timeout: float = 8.0) -> dict:
+    """Probe one host for reflected XSS / SSTI. Returns evidence; {} establishes
+    nothing. Reachability GET first, so an unreachable host costs one request."""
+    if not _resolvable_and_global(host):
+        return {}
+    payload = urllib.parse.quote(_INJECT_PAYLOAD, safe="")
+    for scheme in ("https", "http"):
+        if not _fetch(f"{scheme}://{host}/", timeout)[0]:
+            continue
+        bodies = [_fetch(f"{scheme}://{host}/?{p}={payload}", timeout)[2] for p in _INJECT_PARAMS]
+        return injection_evidence(bodies)
+    return {}
+
+
+@declares("injection_probe", ("reflected_xss", "ssti"))
+def enrich_injection(g, timeout: float = 8.0, workers: int = 8) -> int:
+    """Attach reflected-XSS / SSTI evidence to every probeable node. Returns hosts
+    marked. 1 + len(_INJECT_PARAMS) requests per host, so it rides the active
+    --probe-paths tier with the other payload probes. Writes only to `Entity.evidence`."""
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    marked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, ev in zip(targets, ex.map(lambda e: injection_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
                 marked += 1

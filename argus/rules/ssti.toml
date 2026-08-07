@@ -1,0 +1,25 @@
+# A publicly reachable host EVALUATED an expression we injected: our {{7*7}} came
+# back rendered as 49, flush against a unique marker. Server-side template
+# injection is frequently a path to remote code execution, since template engines
+# expose object/attribute access an attacker can escalate. Only a rendered result
+# (not a literal echo) of our unique marker sets the predicate, so the rule stands
+# on publicly_discoverable + its own evidence. Critical: this is often RCE.
+id = "ssti"
+name = "Server-side template injection (SSTI)"
+description = "A publicly reachable host evaluated an injected template expression server-side (our arithmetic rendered to its result), a flaw that commonly escalates to remote code execution."
+base_confidence = 80
+tags = ["exposure", "ssti", "injection", "rce", "bug-bounty"]
+version = 1
+
+[requires]
+ssti = true
+publicly_discoverable = true
+
+[outputs]
+severity = "critical"
+recommendation = [
+    "Never build templates from user input — pass request data only as bound values, never as template source",
+    "Render untrusted data in a sandboxed/logic-less template context with object access disabled",
+    "Confirm the reachable object surface and rotate any secrets exposed through the template context",
+]
+hypothesis = ["An attacker can evaluate expressions server-side and likely escalate to remote code execution on the host"]

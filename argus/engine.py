@@ -199,6 +199,14 @@ _PREDICATES = {
     "insecure_cookie": _ev("insecure_cookie"),
     "exposed_sensitive_file": _ev("exposed_sensitive_file"),
     "path_traversal": _ev("path_traversal"),
+    "clickjacking": _ev("clickjacking"),
+    "cors_misconfig": _ev("cors_misconfig"),
+    "graphql_introspection": _ev("graphql_introspection"),
+    "subdomain_takeover": _ev("subdomain_takeover"),
+    "open_redirect": _ev("open_redirect"),
+    "reflected_xss": _ev("reflected_xss"),
+    "ssti": _ev("ssti"),
+    "email_spoofable": _ev("email_spoofable"),
 }
 # occam: no dns_resolves / http_reachable / tls_valid / certificate_seen yet —
 #        nothing asserts them and no rule reads them. Add each with its probe.

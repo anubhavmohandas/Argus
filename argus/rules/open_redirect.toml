@@ -1,0 +1,25 @@
+# A publicly reachable host redirected to an external host we chose, injected via
+# a query parameter — an open redirect. On its own it aids phishing and OAuth
+# token theft; chained, it is a frequent SSRF/filter-bypass primitive. Only a 3xx
+# Location resolving to our unique canary host sets the predicate, so the rule
+# stands on publicly_discoverable + its own evidence. Medium: real, but the payoff
+# is usually a step in a chain rather than a direct compromise.
+id = "open_redirect"
+name = "Open redirect"
+description = "A publicly reachable host redirects to an attacker-supplied external URL via a request parameter, enabling phishing, OAuth token theft, and redirect-based filter bypasses."
+base_confidence = 60
+tags = ["exposure", "open-redirect", "phishing", "bug-bounty"]
+version = 1
+
+[requires]
+open_redirect = true
+publicly_discoverable = true
+
+[outputs]
+severity = "medium"
+recommendation = [
+    "Redirect only to a server-side allowlist of paths/hosts — never to a raw request parameter",
+    "Prefer relative redirect targets, and reject absolute or protocol-relative URLs",
+    "Where an external redirect is unavoidable, route it through an interstitial confirmation page",
+]
+hypothesis = ["An attacker can craft a link on this trusted host that silently forwards victims to a site they control"]
