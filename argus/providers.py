@@ -34,6 +34,8 @@ import os
 import re
 import socket
 import ssl
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -170,6 +172,94 @@ def _resolvable_and_global(host: str) -> bool:
     return True
 
 
+# --- engagement gate: SSRF guard AND the operator's scope --------------------
+# Two orthogonal reasons never to touch a host: it resolves inward (SSRF — always
+# enforced), or the program put it out of scope (operator policy — enforced only
+# when a scope file is loaded). Every ACTIVE probe asks `_permitted` instead of
+# the raw SSRF guard, so a scope is honoured everywhere at once, by construction.
+_SCOPE = None   # a scope.Scope, or None for "no scope loaded => SSRF is the only gate"
+
+
+def set_scope(scope) -> None:
+    """Install (or clear, with None) the engagement scope every probe honours."""
+    global _SCOPE
+    _SCOPE = scope
+
+
+def _permitted(host: str) -> bool:
+    """May a provider connect to `host`? In scope (if one is set) AND globally
+    routable. Passive discovery/analysis providers don't ask this — scope gates
+    engagement with the target, not public-record lookups (see scope.py)."""
+    if _SCOPE is not None and not _SCOPE.allows(host):
+        return False
+    return _resolvable_and_global(host)
+
+
+# --- politeness: a global rate limiter + request budget ----------------------
+# Bug-bounty rules of engagement cap request rate; a full --probe-paths sweep can
+# fire dozens of requests per host across a threadpool. This throttles every
+# outbound HTTP request through _fetch to a chosen rate and an optional hard
+# budget, and slows the whole run when a target answers 429/503. Default is
+# unlimited — zero overhead and no behaviour change until the operator opts in.
+class _Throttle:
+    def __init__(self):
+        self.min_interval = 0.0     # seconds between requests (0 = unlimited)
+        self.remaining = None       # global request budget (None = unbounded)
+        self._next_at = 0.0
+        self._lock = threading.Lock()
+
+    def configure(self, rate: float | None = None, max_requests: int | None = None) -> None:
+        self.min_interval = 1.0 / rate if rate and rate > 0 else 0.0
+        self.remaining = max_requests
+        self._next_at = 0.0
+
+    def acquire(self) -> bool:
+        """Reserve one request. False => budget exhausted, caller must NOT send
+        (which reads as 'never reached it' = established nothing, invariant I-1).
+        occam: sleeps under the lock, so all workers serialize to the set rate —
+        that global serialization IS the politeness; per-thread buckets aren't."""
+        with self._lock:
+            if self.remaining is not None:
+                if self.remaining <= 0:
+                    return False
+                self.remaining -= 1
+            if self.min_interval:
+                now = time.monotonic()
+                wait = self._next_at - now
+                if wait > 0:
+                    time.sleep(wait)
+                self._next_at = max(now, self._next_at) + self.min_interval
+            return True
+
+    def backoff(self, seconds: float) -> None:
+        """A target asked us to slow down (429/503 Retry-After) — push the next
+        allowed request out for every worker, bounded so one hostile header can't
+        stall the run indefinitely."""
+        seconds = max(0.0, min(seconds, 60.0))
+        with self._lock:
+            self._next_at = max(self._next_at, time.monotonic() + seconds)
+
+
+_throttle = _Throttle()
+
+
+def set_rate(rate: float | None = None, max_requests: int | None = None) -> None:
+    """Set the global request rate (req/sec) and/or hard request budget. Both
+    None (the default) means unlimited — probing behaves exactly as before."""
+    _throttle.configure(rate, max_requests)
+
+
+def _retry_after(headers) -> float:
+    """Retry-After seconds a 429/503 asked for; a small default when it's a date
+    or absent. occam: integer-seconds form only — HTTP-date backoff is rare and a
+    fixed 5s is polite enough without a date parser."""
+    val = (headers or {}).get("retry-after", "").strip()
+    try:
+        return float(int(val))
+    except (TypeError, ValueError):
+        return 5.0
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuse redirects: following one re-targets us at a host that never
     passed the guard above. A 3xx is also evidence in its own right (a redirect
@@ -188,6 +278,8 @@ def _fetch(url: str, timeout: float, data: bytes | None = None,
     lowercased headers, body). Unreachable => (0, {}, "") — a failure to connect
     establishes nothing. `extra_headers` add to the defaults (Origin for CORS,
     Content-Type for a GraphQL POST); they never override the User-Agent."""
+    if not _throttle.acquire():
+        return 0, {}, ""        # request budget exhausted: we didn't reach it (I-1)
     hdrs = {"User-Agent": _UA, "Accept": "*/*", **(extra_headers or {})}
     req = urllib.request.Request(url, data=data, headers=hdrs)
     try:
@@ -195,12 +287,15 @@ def _fetch(url: str, timeout: float, data: bytes | None = None,
             body = r.read(_BODY_CAP).decode("utf-8", "replace")
             return r.status, {k.lower(): v for k, v in r.headers.items()}, body
     except urllib.error.HTTPError as e:      # 3xx/4xx/5xx are answers, not errors
+        hdrs_out = {k.lower(): v for k, v in (e.headers or {}).items()}
+        if e.code in (429, 503):             # the target asked us to slow down — honour it
+            _throttle.backoff(_retry_after(hdrs_out))
         body = ""
         try:
             body = e.read(_BODY_CAP).decode("utf-8", "replace")
         except Exception:
             pass
-        return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, body
+        return e.code, hdrs_out, body
     except Exception:
         return 0, {}, ""
 
@@ -293,7 +388,7 @@ def probe(host: str, timeout: float = 8.0) -> tuple[dict, dict]:
     """Probe one host over HTTPS, then HTTP. Returns (evidence, observed):
     evidence is engine-vocabulary predicates; observed is non-predicate facts
     (e.g. a product version) that OTHER providers read. Unreachable => ({}, {})."""
-    if not _resolvable_and_global(host):
+    if not _permitted(host):
         return {}, {}
     for scheme in ("https", "http"):
         status, headers, body = _fetch(f"{scheme}://{host}/", timeout)
@@ -464,7 +559,7 @@ def _tls_fetch(host: str, timeout: float = 8.0) -> bytes | None:
 def tls_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host's TLS cert. Returns an observation (fingerprint), never a
     predicate — 'reused' is the analyzer's graph-wide call, not this probe's."""
-    if not _resolvable_and_global(host):
+    if not _permitted(host):
         return {}
     der = _tls_fetch(host, timeout)
     return {"cert_fingerprint": cert_fingerprint(der)} if der else {}
@@ -579,7 +674,7 @@ def admin_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host's administrative paths. Returns evidence; {} establishes
     nothing. Control request first — it both picks the scheme and defines what
     'nothing here' looks like, so an unreachable host costs exactly one request."""
-    if not _resolvable_and_global(host):
+    if not _permitted(host):
         return {}
     for scheme in ("https", "http"):
         status, headers, body = _fetch(f"{scheme}://{host}{_CONTROL_PATH}", timeout)
@@ -654,37 +749,83 @@ def sensitive_evidence(control: tuple, responses: dict) -> dict:
     return {}
 
 
-def exposure_probe(host: str, timeout: float = 8.0) -> dict:
-    """Probe one host's sensitive paths. Returns evidence; {} establishes nothing.
-    Control request first — it picks the scheme and defines 'nothing here', so an
-    unreachable host costs exactly one request (same shape as admin_probe)."""
-    if not _resolvable_and_global(host):
-        return {}
+def _mask(secret: str) -> str:
+    """Redact a matched secret to a confirmable-but-unusable preview. Keep the
+    first 4 + last 2 chars (enough for a hunter to correlate), mask the middle. A
+    short match is masked whole — we never want the raw credential in a case file,
+    a report, or stdout. This is the security line: Argus proves the leak, it
+    doesn't re-leak it."""
+    secret = secret.strip()
+    if len(secret) <= 8:
+        return "*" * len(secret)
+    return f"{secret[:4]}{'…' * 3}{secret[-2:]}"
+
+
+def secrets_in(body: str) -> list[dict]:
+    """Pure: the live-format secrets in a recovered file body, REDACTED.
+
+    Reuses the discovery layer's 48-pattern catalog (modules.scan_text) rather
+    than a second copy — one knowledge source. The pattern (an AKIA… key, a
+    -----BEGIN … KEY----- block, a provider token) is self-gating: ordinary page
+    text can't forge it, so a match is the file actually leaking a credential, not
+    a guess. Returns {type, severity, preview} only — never the raw secret."""
+    from . import modules
+    out, seen = [], set()
+    for f in modules.scan_text(body):
+        raw = f.data.get("match", "")
+        key = (f.title, raw)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"type": f.title, "severity": f.severity, "preview": _mask(raw)})
+    return out
+
+
+def exposure_probe(host: str, timeout: float = 8.0) -> tuple[dict, dict]:
+    """Probe one host's sensitive paths. Returns (evidence, observed); ({}, {})
+    establishes nothing. Control request first — it picks the scheme and defines
+    'nothing here', so an unreachable host costs exactly one request. When a
+    recovered file verifies as the real thing, its body is scanned for live-format
+    secrets: a hit escalates the evidence to `exposed_secret` and the redacted
+    matches ride in observed['secrets'] for the dossier/report."""
+    if not _permitted(host):
+        return {}, {}
     for scheme in ("https", "http"):
         status, headers, body = _fetch(f"{scheme}://{host}{_CONTROL_PATH}", timeout)
         if status:
-            return sensitive_evidence(
-                _shape(status, headers, body),
-                {p: _fetch(f"{scheme}://{host}{p}", timeout) for p in _SENSITIVE_PATHS})
-    return {}
+            control = _shape(status, headers, body)
+            responses = {p: _fetch(f"{scheme}://{host}{p}", timeout) for p in _SENSITIVE_PATHS}
+            ev = sensitive_evidence(control, responses)
+            obs, secrets = {}, []
+            for path, (st, hd, bd) in responses.items():
+                if st == 200 and _shape(st, hd, bd) != control and _looks_like(path, bd):
+                    secrets += secrets_in(bd)      # only scan a body confirmed to be the real file
+            if secrets:
+                ev["exposed_secret"] = True
+                obs["secrets"] = secrets
+            return ev, obs
+    return {}, {}
 
 
-@declares("exposure_probe", ("exposed_sensitive_file",))
+@declares("exposure_probe", ("exposed_sensitive_file", "exposed_secret"))
 def enrich_exposure(g, timeout: float = 8.0, workers: int = 8) -> int:
     """Attach exposed-file evidence to every probeable node. Returns hosts marked.
 
     Requests up to 4 paths per host (control + 3 files) against someone else's
     infrastructure, so it rides the same opt-in active tier as admin_probe rather
-    than the default probe. Writes only to `Entity.evidence`."""
+    than the default probe. Writes to `Entity.evidence` (predicates) and, when a
+    recovered file leaks a credential, redacted matches to `Entity.observed`."""
     targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
     if not targets:
         return 0
     marked = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        for ent, ev in zip(targets, ex.map(lambda e: exposure_probe(e.value, timeout), targets)):
+        for ent, (ev, obs) in zip(targets, ex.map(lambda e: exposure_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
                 marked += 1
+            if obs:
+                ent.observed.update(obs)
     return marked
 
 
@@ -829,7 +970,7 @@ def scan_host(host: str, ports=None, timeout: float = 4.0, workers: int = 32) ->
     {} if `host` is not a safe, globally-routable target — the same SSRF guard
     every probe uses: a discovered name pointing inward is never connected to."""
     ports = list(_DEFAULT_PORTS) if ports is None else list(ports)   # [] means none, not default
-    if not ports or not _resolvable_and_global(host):
+    if not ports or not _permitted(host):
         return {}
     open_ports, filtered, services, cves = [], [], [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(ports))) as ex:
@@ -1080,7 +1221,7 @@ def traversal_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host for path traversal. Returns evidence; {} establishes nothing.
     Control request first — it picks the scheme and defines 'nothing here', so an
     unreachable host costs exactly one request (same shape as exposure_probe)."""
-    if not _resolvable_and_global(host):
+    if not _permitted(host):
         return {}
     for scheme in ("https", "http"):
         status, headers, body = _fetch(f"{scheme}://{host}{_CONTROL_PATH}", timeout)
@@ -1119,11 +1260,15 @@ def enrich_traversal(g, timeout: float = 8.0, workers: int = 8) -> int:
 # forge back the exact origin string we sent, so no separate control request is
 # needed. Low engagement (one benign GET), so it rides the base --probe tier.
 #
-# occam: flags only reflected-specific-origin + credentials, the classic high-
-# signal case. ACAO:* is browser-rejected with credentials (not exploitable), and
-# `Origin: null` reflection is a narrower variant — add each when a target needs
-# it. Non-credentialed reflection exposes only public data, so it isn't claimed.
+# occam: flags reflected-specific-origin + credentials (the classic high-signal
+# case) and the `Origin: null` + credentials variant. ACAO:* is browser-rejected
+# with credentials (not exploitable) so it isn't claimed; non-credentialed
+# reflection exposes only public data, so it isn't claimed either.
 _CORS_PROBE_ORIGIN = "https://argus-cors-probe.example"
+
+
+def _cors_credentialed(headers: dict) -> bool:
+    return headers.get("access-control-allow-credentials", "").strip().lower() == "true"
 
 
 def cors_evidence(headers: dict, probe_origin: str = _CORS_PROBE_ORIGIN) -> dict:
@@ -1135,23 +1280,41 @@ def cors_evidence(headers: dict, probe_origin: str = _CORS_PROBE_ORIGIN) -> dict
     acao = headers.get("access-control-allow-origin", "").strip()
     if not acao:
         return {}
-    acac = headers.get("access-control-allow-credentials", "").strip().lower() == "true"
-    if acao == probe_origin and acac:
+    if acao == probe_origin and _cors_credentialed(headers):
+        return {"cors_misconfig": True}
+    return {}
+
+
+def cors_null_evidence(headers: dict) -> dict:
+    """Pure: the `Origin: null` variant. A server that echoes ACAO: null with
+    credentials trusts a class of contexts an attacker can put a victim in
+    (sandboxed iframe, some redirects, local files) — the same credentialed
+    cross-origin read as the reflected case. Only counts when we sent Origin:null
+    and it came back reflected with credentials; no ACAO => no claim (I-1)."""
+    if headers.get("access-control-allow-origin", "").strip().lower() == "null" \
+            and _cors_credentialed(headers):
         return {"cors_misconfig": True}
     return {}
 
 
 def cors_probe(host: str, timeout: float = 8.0) -> dict:
-    """Probe one host for a credentialed reflected-origin CORS grant. Returns
-    evidence; {} establishes nothing. One GET with our probe Origin — an
-    unreachable or non-global host costs nothing (SSRF guard first)."""
-    if not _resolvable_and_global(host):
+    """Probe one host for a credentialed CORS grant, two variants: reflected
+    arbitrary origin, then (only if that didn't fire) `Origin: null`. Returns
+    evidence; {} establishes nothing. Costs one GET, plus one more for the null
+    check — an unreachable or out-of-scope host costs nothing (gate first)."""
+    if not _permitted(host):
         return {}
     for scheme in ("https", "http"):
         status, headers, _ = _fetch(f"{scheme}://{host}/", timeout,
                                     extra_headers={"Origin": _CORS_PROBE_ORIGIN})
-        if status:
-            return cors_evidence(headers)
+        if not status:
+            continue
+        ev = cors_evidence(headers)
+        if ev:
+            return ev
+        status, headers, _ = _fetch(f"{scheme}://{host}/", timeout,
+                                    extra_headers={"Origin": "null"})
+        return cors_null_evidence(headers) if status else {}
     return {}
 
 
@@ -1203,7 +1366,7 @@ def graphql_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host's conventional GraphQL paths for enabled introspection.
     Returns evidence; {} establishes nothing. A cheap reachability GET first, so
     an unreachable host costs one request before any POSTs (SSRF guard first)."""
-    if not _resolvable_and_global(host):
+    if not _permitted(host):
         return {}
     for scheme in ("https", "http"):
         if not _fetch(f"{scheme}://{host}/", timeout)[0]:
@@ -1322,7 +1485,7 @@ def redirect_evidence(responses: dict, canary_host: str = _REDIRECT_HOST) -> dic
 def redirect_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host for an open redirect. Returns evidence; {} establishes nothing.
     Reachability GET first, so an unreachable host costs one request (SSRF guard first)."""
-    if not _resolvable_and_global(host):
+    if not _permitted(host):
         return {}
     payload = urllib.parse.quote(_REDIRECT_CANARY, safe="")
     for scheme in ("https", "http"):
@@ -1392,7 +1555,7 @@ def injection_evidence(bodies) -> dict:
 def injection_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host for reflected XSS / SSTI. Returns evidence; {} establishes
     nothing. Reachability GET first, so an unreachable host costs one request."""
-    if not _resolvable_and_global(host):
+    if not _permitted(host):
         return {}
     payload = urllib.parse.quote(_INJECT_PAYLOAD, safe="")
     for scheme in ("https", "http"):
@@ -1418,3 +1581,65 @@ def enrich_injection(g, timeout: float = 8.0, workers: int = 8) -> int:
                 ent.evidence.update(ev)
                 marked += 1
     return marked
+
+
+# --- security.txt disclosure discovery ------------------------------------
+# NOT a vulnerability provider, on purpose: a security.txt (RFC 9116) is the
+# opposite of a finding — it's the target telling you where and how to report one.
+# So this asserts NO predicate and fires NO rule (presence isn't a risk, and by
+# I-1 absence isn't a finding either). It's a pure OBSERVATION, like the TLS
+# fingerprint: it records the disclosure contact into `observed`, and the dossier
+# and the exported report use it to answer "where do I file this?". Self-gating on
+# the RFC's mandatory `Contact:` field — a soft-404/HTML page has no such line, so
+# a hit is a real policy file. Costs one GET to a well-known path, so it folds
+# into the base --probe tier.
+_SECURITY_TXT_PATHS = ("/.well-known/security.txt", "/security.txt")
+_SECTXT_FIELD = re.compile(r"(?im)^(contact|policy|encryption|expires|acknowledgments)\s*:\s*(.+?)\s*$")
+
+
+def parse_security_txt(body: str) -> dict:
+    """Pure: an RFC 9116 security.txt body -> {field: [values]}. Returns {} unless
+    it carries at least one Contact field — the one field the RFC makes mandatory,
+    and what makes 'this is a security.txt' self-gating rather than a guess."""
+    fields: dict = {}
+    for m in _SECTXT_FIELD.finditer(body):
+        fields.setdefault(m.group(1).lower(), []).append(m.group(2).strip())
+    return fields if fields.get("contact") else {}
+
+
+def security_txt_probe(host: str, timeout: float = 8.0) -> dict:
+    """Fetch a host's security.txt from either well-known location. Returns
+    {'security_txt': {url, contact, policy}} or {} — an observation, never a
+    predicate. Reachability GET first, so an unreachable/out-of-scope host costs
+    at most one request (gate first)."""
+    if not _permitted(host):
+        return {}
+    for scheme in ("https", "http"):
+        if not _fetch(f"{scheme}://{host}/", timeout)[0]:
+            continue                          # host didn't answer on this scheme
+        for path in _SECURITY_TXT_PATHS:
+            status, _, body = _fetch(f"{scheme}://{host}{path}", timeout)
+            if status == 200:
+                fields = parse_security_txt(body)
+                if fields:
+                    return {"security_txt": {"url": f"{scheme}://{host}{path}",
+                                             "contact": fields.get("contact", []),
+                                             "policy": fields.get("policy", [])}}
+        return {}                             # reached the host; no disclosure policy
+    return {}
+
+
+def enrich_security_txt(g, timeout: float = 8.0, workers: int = 8) -> int:
+    """Record each probeable host's security.txt disclosure contact into
+    `observed`. Observation-only — writes no predicate, declares nothing, fires no
+    rule. Returns the number of hosts that published a policy."""
+    targets = [e for e in g.nodes.values() if e.type in _PROBEABLE]
+    if not targets:
+        return 0
+    found = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for ent, obs in zip(targets, ex.map(lambda e: security_txt_probe(e.value, timeout), targets)):
+            if obs:
+                ent.observed.update(obs)
+                found += 1
+    return found

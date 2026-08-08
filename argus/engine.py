@@ -198,6 +198,7 @@ _PREDICATES = {
     "security_headers_missing": _ev("security_headers_missing"),
     "insecure_cookie": _ev("insecure_cookie"),
     "exposed_sensitive_file": _ev("exposed_sensitive_file"),
+    "exposed_secret": _ev("exposed_secret"),
     "path_traversal": _ev("path_traversal"),
     "clickjacking": _ev("clickjacking"),
     "cors_misconfig": _ev("cors_misconfig"),

@@ -68,10 +68,10 @@ Each item ships the ARGUS way: a pure evidence function + a self-gating
 signature + a TOML rule + a test, honest about I-1. Ordered by hunter payoff.
 
 ### Near — more reportable classes, same discipline
-- [ ] **Subdomain takeover** — dangling CNAME → known fingerprint (S3/GitHub
-      Pages/Heroku/etc.). Classic high-value bounty; signature is definitive.
-- [ ] **Open redirect** — reflected redirect to an attacker origin, self-gated on
-      the `Location` actually pointing off-host.
+- [x] **Subdomain takeover** — dangling CNAME → known fingerprint (S3/GitHub
+      Pages/Heroku/etc.). Shipped: `takeover_service` fingerprints → `subdomain_takeover`.
+- [x] **Open redirect** — reflected redirect to an attacker origin, self-gated on
+      the `Location` actually pointing off-host. Shipped: `redirect_probe`.
 - [ ] **Secrets in exposed files** — extend `exposure_probe`: parse recovered
       `.env` / `.git` config for live-looking keys (already have the secret
       scanner in `test_argus`).

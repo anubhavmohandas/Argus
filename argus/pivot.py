@@ -230,6 +230,26 @@ def dossier(g: Graph, result) -> str:
             more = f"  (+{len(ents) - 12} more)" if len(ents) > 12 else ""
             lines.append(f"   {t:<10} {len(ents):>3}  {vals}{more}")
 
+    # Evidence summary: what kinds of evidence we actually hold. Passive rows
+    # (DNS/RDAP/subdomains) come from discovery findings; active rows come from
+    # what providers observed. When the active rows are all 0 the "no predicate
+    # fired" outcome explains itself — passive DNS alone can't trip a service rule.
+    ev: dict[str, int] = {}
+    for f in g.findings:
+        label = f"DNS {f.data['type']}" if f.module == "dns" and f.data.get("type") else f.module
+        ev[label] = ev.get(label, 0) + 1
+    active = {"Ports": 0, "Services": 0, "CVEs": 0, "Probed hosts": 0}
+    for e in g.nodes.values():
+        active["Ports"] += len(e.observed.get("open_ports", []))
+        active["Services"] += len(e.observed.get("services", []))
+        active["CVEs"] += len(e.observed.get("cves", []))
+        active["Probed hosts"] += 1 if e.evidence else 0
+    lines.append("\n EVIDENCE SUMMARY  (what was collected)")
+    for label in sorted(ev):
+        lines.append(f"   {label:<16} {ev[label]:>3}")
+    for label, n in active.items():   # always shown — a 0 here is the point
+        lines.append(f"   {label:<16} {n:>3}")
+
     # Always print PRIORITY + CONCLUSIONS, even when empty: silently ending after
     # FINDINGS reads as "Argus stopped halfway". Empty = engine ran, nothing fired.
     top_p = result.interesting[:10]
@@ -255,13 +275,39 @@ def dossier(g: Graph, result) -> str:
             for r in c.recommendations:
                 lines.append(f"          ↳ recommend:  {r}")
     else:
-        # distinguish "nothing matched" from "everything that matched was noise"
+        # Three distinct empty states — collapsing them misleads the analyst,
+        # because each implies a different next action:
+        #   noise      → evidence matched, but only plumbing/CDN
+        #   predicated → actionable evidence exists, no rule fired
+        #   passive    → evidence exists but none of it is a predicate
+        #   nothing    → no evidence at all
         noisy = len(result.risks)
-        why = (f"all {noisy} matched conclusion(s) were plumbing/CDN noise"
-               if noisy else "no predicate matched the collected evidence")
-        lines.append(f"   — no deterministic conclusion reached: {why}.")
-        if not any(e.evidence for e in g.nodes.values()):
-            lines.append("     tip: no evidence was collected — try Active mode (2-4) to probe hosts for evidence.")
+        has_predicates = any(e.evidence for e in g.nodes.values())
+        if noisy:
+            why = f"all {noisy} matched conclusion(s) were plumbing/CDN noise"
+        elif has_predicates:
+            why = "no collected evidence matched any investigation predicate"
+        elif g.findings:
+            why = "collected evidence was informational only — no actionable predicate set"
+        else:
+            why = "no evidence was collected"
+        lines.append(f"   — no rule matched the current evidence: {why}.")
+        lines.append("     observed infrastructure appears consistent with normal public exposure.")
+        lines.append("     no high-confidence investigative lead generated.")
+        if not has_predicates:
+            lines.append("     tip: run Active mode (2–4) to probe hosts for predicate evidence.")
+
+    # Leaked secrets: the exposed-file probe recovered a real file whose body
+    # carried a live-format credential. Redacted to a preview — Argus proves the
+    # leak without re-leaking it. Highest-urgency thing on the page, so it sits
+    # right under the conclusions.
+    leaked = sorted((e.value, e.observed["secrets"]) for e in g.nodes.values()
+                    if e.observed.get("secrets"))
+    if leaked:
+        lines.append("\n LEAKED SECRETS  (recovered from an exposed file — redacted)")
+        for host, secrets in leaked:
+            for s in secrets:
+                lines.append(f"   [{s.get('severity', 'info'):<8}] {host:<30} {s['type']}  {s['preview']}")
 
     # Port map: what the TCP scan saw, per host. open ports carry their service +
     # version; filtered (firewall/CDN dropped us) and closed (refused) are the
@@ -318,5 +364,95 @@ def dossier(g: Graph, result) -> str:
         lines.append("\n TOP SIGNALS")
         for f in top:
             lines.append(f"   [{f.severity:<8}] {f.module:<11} {f.title}")
+
+    # Disclosure: where the target says to report. Not a finding — the opposite of
+    # one — so it lives at the bottom, the "now file it" line after the findings.
+    for host, sec in sorted((e.value, e.observed["security_txt"]) for e in g.nodes.values()
+                            if e.observed.get("security_txt")):
+        contacts = ", ".join(sec.get("contact", [])) or "(no Contact field)"
+        lines.append(f"\n DISCLOSURE  {host} publishes security.txt → report to: {contacts}")
+        break   # one is enough to tell the operator where to file
     lines.append("═" * 60)
     return "\n".join(lines)
+
+
+# --- report export --------------------------------------------------------
+# The dossier is for the terminal; this is the deliverable. One Markdown file per
+# investigation, a section per rule conclusion: what it is, on which host, how sure
+# Argus is and why (the same traceable ledger), how it was determined, and what to
+# do. The "how determined" line is the provider's method, not a fabricated HTTP
+# transcript — Argus doesn't yet persist the exact proving request, and inventing
+# one would be a lie in a document meant to be pasted into a submission.
+# occam: capturing the raw request/response per conclusion is the upgrade path
+#        (providers would stash it in observed); the method + ledger is honest now.
+_REPRO = {
+    "path_traversal": "Requested a directory-traversal payload for /etc/passwd; the response body returned a real passwd file (a soft-404 cannot forge one).",
+    "open_redirect": "Injected an external canary URL into common redirect parameters; a 3xx Location resolved to the exact canary host.",
+    "reflected_xss": "Reflected an unescaped <svg/onload> canary through a query parameter — the angle brackets survived, so the HTML was not encoded.",
+    "ssti": "Injected {{7*7}} next to a unique marker; the response rendered 49, proving server-side template evaluation, not a literal echo.",
+    "exposed_sensitive_file": "Fetched a sensitive path (.git/.env/.DS_Store); the body matched the real file's content signature.",
+    "exposed_secret": "The recovered file's body contained a credential in a live provider format (stored redacted).",
+    "cors_misconfig": "Sent an arbitrary/null Origin; the server reflected it into Access-Control-Allow-Origin with Access-Control-Allow-Credentials: true.",
+    "graphql_introspection": "POSTed a minimal introspection query; the server returned a live __schema result.",
+    "subdomain_takeover": "The host served a vendor 'unclaimed name' page for a dangling DNS record — claimable by an attacker.",
+    "known_vulnerable_service": "An open service's banner reported a version that matches a catalogued/NVD CVE.",
+    "has_admin_interface": "Reached an administrative path that answered as a real admin surface (auth challenge / admin-titled page), differing from this host's not-found shape.",
+    "email_spoofable": "The domain publishes no enforced DMARC policy (absent or p=none), so From-header spoofing is not blocked.",
+    "insecure_cookie": "A Set-Cookie shipped without the Secure/HttpOnly flags.",
+    "security_headers_missing": "The served response omitted core hardening headers (HSTS/CSP/X-Content-Type-Options/X-Frame-Options).",
+    "clickjacking": "The response permitted framing — no X-Frame-Options DENY/SAMEORIGIN and no CSP frame-ancestors.",
+    "certificate_reused": "The same TLS certificate fingerprint is served by more than one host in the graph.",
+}
+
+
+def _repro_for(c) -> str:
+    """The method that established conclusion `c`, read from its own ledger — the
+    first satisfied predicate we have a repro note for. Honest by construction: it
+    describes what Argus actually did, keyed off the evidence that fired."""
+    for chk in c.ledger.get("evidence", []):
+        pred = chk.get("predicate")
+        if pred in _REPRO and (chk.get("met") or chk.get("applied")):
+            return _REPRO[pred]
+    return "See the evidence ledger below for the predicates that fired."
+
+
+def report_markdown(seed: str, g, result) -> str:
+    """A bug-bounty-ready Markdown report for one investigation. Consumes only the
+    graph + InvestigationResult (never engine internals), same as the dossier."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    risks = [c for c in result.risks if "noise" not in c.tags]
+    out = [f"# ARGUS report — `{seed}`", "",
+           f"*Generated {now}. Deterministic: same evidence + rules → same report "
+           f"(fingerprint `{result.fingerprint[:16] or 'n/a'}`).*", ""]
+    if result.error:
+        out += [f"> ⚠ **Reasoning degraded** — conclusions may be incomplete: {result.error}", ""]
+
+    contacts = next((sec.get("contact", []) for e in g.nodes.values()
+                     if (sec := e.observed.get("security_txt"))), [])
+    out += ["## Summary", "",
+            f"- Entity graph: **{len(g.nodes)}** nodes, **{len(g.edges)}** edges from seed `{seed}`",
+            f"- Reportable conclusions: **{len(risks)}**",
+            f"- Where to report: {', '.join(contacts) if contacts else '_no security.txt found — check the program page_'}", ""]
+
+    if not risks:
+        out += ["## Findings", "", "_No deterministic conclusion was reached. "
+                "Run an active tier (`--probe` / `--probe-paths` / `--scan`) to collect evidence._", ""]
+        return "\n".join(out)
+
+    out += ["## Findings", ""]
+    for i, c in enumerate(risks, 1):
+        out += [f"### {i}. {c.name} — `{c.target}`  ({c.severity.upper()}, {c.confidence}% confidence)", "",
+                f"**Target:** `{c.target}` ({c.target_type})  ·  **Rule:** `{c.rule}` v{c.rule_version}", "",
+                "**How Argus determined this**", "", _repro_for(c), "",
+                "**Evidence ledger**", "", "```"]
+        out += ledger_lines(c)
+        out += ["```", ""]
+        if c.hypotheses:
+            out += ["**Impact hypothesis**", ""] + [f"- {h}" for h in c.hypotheses] + [""]
+        if c.recommendations:
+            out += ["**Remediation**", ""] + [f"- {r}" for r in c.recommendations] + [""]
+    out += ["---", "",
+            "*Generated by ARGUS — a deterministic offensive-intelligence engine. "
+            "Every finding above carries the evidence that proves it; verify before filing.*"]
+    return "\n".join(out)

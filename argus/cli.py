@@ -7,10 +7,11 @@ import json
 import os
 import sys
 import threading
+from pathlib import Path
 
-from . import core, providers, store
+from . import core, providers, scope as scope_mod, store
 from .core import MODULES, run_module, run_all, sort_by_severity
-from .pivot import pivot, dossier, Budget, classify
+from .pivot import pivot, dossier, report_markdown, Budget, classify
 from .engine import investigate
 
 _SEV_COLOR = {
@@ -155,7 +156,7 @@ def _pivot_flow():
         choice = "1"
     flags = list(_MODES[choice][2])
     argv = ["pivot", seed]
-    if _yes("Customise options (depth/max/deep/ports/memory/json)?"):
+    if _yes("Customise options (depth/max/deep/ports/scope/rate/report/memory/json)?"):
         argv += ["--depth", _ask("Pivot depth", "2"),
                  "--max", _ask("Max entities", "40"),
                  "--deep", _ask("Re-pivot into N subdomains", "0")]
@@ -163,6 +164,16 @@ def _pivot_flow():
             ports = _ask("Ports (blank = common service ports)")
             if ports:
                 argv += ["--ports", ports]
+        scope_file = _ask("Scope file (blank = none)")
+        if scope_file:
+            argv += ["--scope", scope_file]
+        if flags:   # rate only bites the active tiers that actually send requests
+            rate = _ask("Max HTTP requests/sec (blank = unlimited)")
+            if rate:
+                argv += ["--rate", rate]
+        report = _ask("Write Markdown report to (blank = none)")
+        if report:
+            argv += ["--report", report]
         if not _yes("Save to investigation memory?", "y"):
             argv.append("--no-memory")
         if _yes("JSON output?"):
@@ -324,6 +335,14 @@ def _run(argv=None):
                     help="port spec for --scan, e.g. '1-1024' or '22,80,443' (default: common service ports)")
     pv.add_argument("--cve", action="store_true",
                     help="look up observed service versions against NVD live and attach the real CVEs + reference write-ups (needs --probe or --scan to have observed a version; set NVD_API_KEY to lift rate limits)")
+    pv.add_argument("--scope", default=None, metavar="FILE",
+                    help="engagement-scope file (in/out-of-scope allowlist); no active probe touches a host outside it")
+    pv.add_argument("--rate", type=float, default=None, metavar="N",
+                    help="politeness: cap outbound HTTP probe requests to N per second (default: unlimited)")
+    pv.add_argument("--max-requests", type=int, default=None, dest="max_requests", metavar="N",
+                    help="politeness: hard cap on total outbound HTTP probe requests for the run")
+    pv.add_argument("--report", default=None, metavar="PATH",
+                    help="also write a bug-bounty-ready Markdown report to PATH")
     pv.add_argument("--no-memory", action="store_true", help="don't save this run or compare against past ones")
     pv.add_argument("--json", action="store_true")
 
@@ -353,6 +372,18 @@ def _run(argv=None):
 
     if args.cmd == "pivot":
         print(f"[argus] seed {args.seed!r} classified as: {classify(args.seed)}", file=sys.stderr)
+        # Engagement policy, set before any provider runs. Always reset both, so a
+        # menu-driven second run never inherits the first run's scope/rate.
+        if args.scope:
+            try:
+                providers.set_scope(scope_mod.load(args.scope))
+            except ValueError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            print(f"[argus] scope loaded from {args.scope!r} — active probes limited to in-scope hosts", file=sys.stderr)
+        else:
+            providers.set_scope(None)
+        providers.set_rate(args.rate, args.max_requests)
         past = [] if args.no_memory else store.history(args.seed)
         g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
                                     expand_subdomains=args.deep), on_step=_progress)
@@ -363,7 +394,8 @@ def _run(argv=None):
             k = providers.enrich_kev(g)             # analysis: version -> known_exploited
             r = providers.analyze_certificates(g)   # analysis: shared cert -> certificate_reused
             m = providers.enrich_email_spoof(g)     # analysis: DMARC over DoH -> email_spoofable (no target engagement)
-            line = f"probed {n} HTTP, {t} TLS, {c} CORS; {k} known-exploit, {r} cert-reuse, {m} email-spoofable"
+            s = providers.enrich_security_txt(g)    # disclosure: where to report (observation only, one GET/host)
+            line = f"probed {n} HTTP, {t} TLS, {c} CORS; {k} known-exploit, {r} cert-reuse, {m} email-spoofable, {s} security.txt"
             if args.probe_paths:   # its own flag: multiplies the requests against the target
                 line += (f", {providers.enrich_admin(g)} admin-surface"
                          f", {providers.enrich_exposure(g)} exposed-file"
@@ -385,12 +417,18 @@ def _run(argv=None):
             print(f"[argus] NVD live lookup; {v} host(s) with a live CVE + references — evidence attached", file=sys.stderr)
         result = investigate(g)   # discovery -> reasoning: the one result object
         if past:  # investigation memory — "I've seen this before"
-            prev = past[-1]
-            print(f"[argus] seen before: {len(past)} prior investigation(s), "
-                  f"last {prev.get('timestamp', '?')[:10]} — {store.compare_line(prev, g)}",
-                  file=sys.stderr)
+            print("[argus] seen before —", file=sys.stderr)
+            for line in store.memory_block(past, g).splitlines():
+                print(f"        {line}", file=sys.stderr)
         if not args.no_memory:
             store.save(args.seed, g)   # memory stores evidence; conclusions are re-derivable
+        if args.report:
+            try:
+                Path(args.report).write_text(report_markdown(args.seed, g, result))
+                print(f"[argus] report written to {args.report}", file=sys.stderr)
+            except OSError as e:
+                print(f"error: cannot write report {args.report!r}: {e}", file=sys.stderr)
+                return 2
         if args.json:
             print(json.dumps({"graph": g.to_dict(), "investigation": result.to_dict()}, indent=2))
         else:

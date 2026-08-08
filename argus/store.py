@@ -78,3 +78,22 @@ def compare_line(prev: dict, g) -> str:
     bits = [f"+{n[t]} new {t}(s)" for t in ("subdomain", "domain", "ip") if n[t]]
     bits += [f"-{o[t]} {t}(s) gone" for t in ("subdomain", "domain", "ip") if o[t]]
     return ", ".join(bits) or "no entity changes since last run"
+
+
+def new_findings(prev: dict, g) -> int:
+    """Findings present now but not in the previous case file (module+target+title)."""
+    seen = {(f.get("module"), f.get("target"), f.get("title")) for f in prev.get("findings", [])}
+    return sum(1 for f in g.findings if (f.module, f.target, f.title) not in seen)
+
+
+def memory_block(past: list[dict], g) -> str:
+    """Investigator-style recap of what changed since the last run on this seed."""
+    prev = past[-1]
+    delta = compare_line(prev, g)
+    rows = [
+        ("Previous investigations", str(len(past))),
+        ("Last investigation", prev.get("timestamp", "?")[:10]),
+        ("Entity delta", "none" if delta.startswith("no entity") else delta),
+        ("New findings", str(new_findings(prev, g))),
+    ]
+    return "\n".join(f"{k:<24}: {v}" for k, v in rows)
