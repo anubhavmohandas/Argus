@@ -72,14 +72,14 @@ signature + a TOML rule + a test, honest about I-1. Ordered by hunter payoff.
       Pages/Heroku/etc.). Shipped: `takeover_service` fingerprints → `subdomain_takeover`.
 - [x] **Open redirect** — reflected redirect to an attacker origin, self-gated on
       the `Location` actually pointing off-host. Shipped: `redirect_probe`.
-- [ ] **Secrets in exposed files** — extend `exposure_probe`: parse recovered
+- [x] **Secrets in exposed files** — extend `exposure_probe`: parse recovered
       `.env` / `.git` config for live-looking keys (already have the secret
       scanner in `test_argus`).
-- [ ] **Security.txt / disclosure policy** — surface where/how to report, per
+- [x] **Security.txt / disclosure policy** — surface where/how to report, per
       target. Turns a finding into a filed report faster.
 
 ### Mid — depth on what's already there
-- [ ] **CORS variants** — `Origin: null` reflection, pre-flight abuse (today only
+- [x] **CORS variants** — `Origin: null` reflection, pre-flight abuse (today only
       the credentialed reflected-specific-origin case is claimed).
 - [ ] **GraphQL depth** — field suggestion / batching / mutation enumeration once
       introspection is confirmed.
@@ -89,12 +89,12 @@ signature + a TOML rule + a test, honest about I-1. Ordered by hunter payoff.
       more `known_exploited` fires with evidence.
 
 ### Far — the deliverable, not just the data
-- [ ] **Report export** — one command, one Markdown/HTML bounty-ready report per
+- [x] **Report export** — one command, one Markdown/HTML bounty-ready report per
       finding: title, severity, steps-to-reproduce from the captured request,
       impact, remediation. The dossier becomes a submission.
-- [ ] **Scope file** — an in/out-of-scope allowlist honored by every provider, so
+- [x] **Scope file** — an in/out-of-scope allowlist honored by every provider, so
       a program's rules are enforced by the tool, not the operator's memory.
-- [ ] **Rate-limit / politeness knob** — global request budget + backoff, so a
+- [x] **Rate-limit / politeness knob** — global request budget + backoff, so a
       full run stays inside a program's rules of engagement.
 
 ## Non-goals (Occam's fence)
@@ -109,4 +109,4 @@ signature + a TOML rule + a test, honest about I-1. Ordered by hunter payoff.
 
 `argus coverage` shows every predicate owned once, and **all `test_*.py` pass** —
 the invariants above are executable, not aspirational. Every new class lands with
-its own test or it doesn't land. Last verified green: 2026-08-07.
+its own test or it doesn't land. Last verified green: 2026-08-09.
