@@ -9,7 +9,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import core, policy, providers, scope as scope_mod, store
+from . import core, feedback, policy, providers, scope as scope_mod, store
 from .core import MODULES, run_module, run_all, sort_by_severity
 from .pivot import pivot, dossier, report_markdown, Budget, classify
 from .engine import investigate
@@ -358,6 +358,13 @@ def _run(argv=None):
     al.add_argument("target")
     al.add_argument("--json", action="store_true")
 
+    fb = sub.add_parser("feedback", help="Record a researcher verdict on a past finding (append-only; nudges future ranking)")
+    fb.add_argument("rule", help="rule id the finding came from, e.g. exposed_secret")
+    fb.add_argument("target", help="the host/entity the finding was about")
+    fb.add_argument("verdict", help=f"one of {', '.join(feedback.VERDICTS)} (or tp/fp/dup)")
+    fb.add_argument("--program", default="", help="engagement key the verdict belongs to (use the pivot seed for now)")
+    fb.add_argument("--note", default="", help="free-text note for the report trail")
+
     sub.add_parser("modules", help="List available modules")
     sub.add_parser("coverage", help="Which engine predicates have an evidence provider (the roadmap)")
 
@@ -437,6 +444,9 @@ def _run(argv=None):
                 names = ", ".join(sorted({c.rule for c in suppressed}))
                 print(f"[argus] policy suppressed {len(suppressed)} non-reportable finding(s): {names}",
                       file=sys.stderr)
+        # historical feedback: nudge rank by past researcher verdicts (never confidence).
+        # occam: program identity is the seed for now — a --program/policy.name key is the follow-up.
+        result = feedback.annotate(result, program=args.seed)
         if past:  # investigation memory — "I've seen this before"
             print("[argus] seen before —", file=sys.stderr)
             for line in store.memory_block(past, g).splitlines():
@@ -466,6 +476,17 @@ def _run(argv=None):
 
     if args.cmd == "all":
         _print_findings(run_all(args.target), args.json)
+        return 0
+
+    if args.cmd == "feedback":
+        try:
+            p_out = feedback.record(args.rule, args.target, args.verdict,
+                                    program=args.program, note=args.note)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        prog = f" [{args.program}]" if args.program else ""
+        print(f"[argus] recorded {args.verdict} on {args.rule} @ {args.target}{prog} → {p_out}", file=sys.stderr)
         return 0
 
     # No subcommand: on a real terminal, open the interactive menu; piped or
