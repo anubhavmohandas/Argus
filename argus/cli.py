@@ -9,7 +9,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import core, providers, scope as scope_mod, store
+from . import core, policy, providers, scope as scope_mod, store
 from .core import MODULES, run_module, run_all, sort_by_severity
 from .pivot import pivot, dossier, report_markdown, Budget, classify
 from .engine import investigate
@@ -335,6 +335,9 @@ def _run(argv=None):
                     help="port spec for --scan, e.g. '1-1024' or '22,80,443' (default: common service ports)")
     pv.add_argument("--cve", action="store_true",
                     help="look up observed service versions against NVD live and attach the real CVEs + reference write-ups (needs --probe or --scan to have observed a version; set NVD_API_KEY to lift rate limits)")
+    pv.add_argument("--policy", default=None, metavar="FILE",
+                    help="compile a pasted bug-bounty program page into the engagement policy: scope + rate + "
+                         "non-reportable exclusions + objectives (supersedes --scope/--rate)")
     pv.add_argument("--scope", default=None, metavar="FILE",
                     help="engagement-scope file (in/out-of-scope allowlist); no active probe touches a host outside it")
     pv.add_argument("--rate", type=float, default=None, metavar="N",
@@ -374,7 +377,18 @@ def _run(argv=None):
         print(f"[argus] seed {args.seed!r} classified as: {classify(args.seed)}", file=sys.stderr)
         # Engagement policy, set before any provider runs. Always reset both, so a
         # menu-driven second run never inherits the first run's scope/rate.
-        if args.scope:
+        pol = None
+        if args.policy:
+            try:
+                pol = policy.compile(Path(args.policy).read_text())
+            except OSError as e:
+                print(f"error: cannot read policy file {args.policy!r}: {e}", file=sys.stderr)
+                return 2
+            pol.apply()   # scope + rate, from the compiled program
+            print(f"[argus] engagement policy compiled from {args.policy!r}", file=sys.stderr)
+            for ln in pol.summary().splitlines():
+                print(f"        {ln}", file=sys.stderr)
+        elif args.scope:
             try:
                 providers.set_scope(scope_mod.load(args.scope))
             except ValueError as e:
@@ -383,7 +397,8 @@ def _run(argv=None):
             print(f"[argus] scope loaded from {args.scope!r} — active probes limited to in-scope hosts", file=sys.stderr)
         else:
             providers.set_scope(None)
-        providers.set_rate(args.rate, args.max_requests)
+        if not pol:
+            providers.set_rate(args.rate, args.max_requests)
         past = [] if args.no_memory else store.history(args.seed)
         g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
                                     expand_subdomains=args.deep), on_step=_progress)
@@ -416,6 +431,12 @@ def _run(argv=None):
             v = providers.enrich_nvd(g)
             print(f"[argus] NVD live lookup; {v} host(s) with a live CVE + references — evidence attached", file=sys.stderr)
         result = investigate(g)   # discovery -> reasoning: the one result object
+        if pol:   # program policy: suppress findings it declared non-reportable / out of scope
+            result, suppressed = pol.filter(result)
+            if suppressed:
+                names = ", ".join(sorted({c.rule for c in suppressed}))
+                print(f"[argus] policy suppressed {len(suppressed)} non-reportable finding(s): {names}",
+                      file=sys.stderr)
         if past:  # investigation memory — "I've seen this before"
             print("[argus] seen before —", file=sys.stderr)
             for line in store.memory_block(past, g).splitlines():

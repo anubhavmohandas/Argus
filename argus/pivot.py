@@ -267,7 +267,8 @@ def dossier(g: Graph, result) -> str:
     lines.append("\n INVESTIGATOR CONCLUSIONS  (deterministic — every score is traceable)")
     if concl:
         for c in concl[:8]:
-            lines.append(f"   [{c.confidence:>3}%] {c.target:<34} {c.name}  · severity: {c.severity}")
+            star = "★ " if "objective" in c.tags else ""   # matches a program objective (policy overlay)
+            lines.append(f"   [{c.confidence:>3}%] {c.target:<34} {star}{c.name}  · severity: {c.severity}")
             for l in ledger_lines(c):
                 lines.append(f"          {l}")
             for h in c.hypotheses:
@@ -442,7 +443,8 @@ def report_markdown(seed: str, g, result) -> str:
 
     out += ["## Findings", ""]
     for i, c in enumerate(risks, 1):
-        out += [f"### {i}. {c.name} — `{c.target}`  ({c.severity.upper()}, {c.confidence}% confidence)", "",
+        obj = " · ⭐ matches a program objective" if "objective" in c.tags else ""
+        out += [f"### {i}. {c.name} — `{c.target}`  ({c.severity.upper()}, {c.confidence}% confidence){obj}", "",
                 f"**Target:** `{c.target}` ({c.target_type})  ·  **Rule:** `{c.rule}` v{c.rule_version}", "",
                 "**How Argus determined this**", "", _repro_for(c), "",
                 "**Evidence ledger**", "", "```"]
