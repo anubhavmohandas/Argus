@@ -305,6 +305,78 @@ def _print_findings(findings, as_json: bool):
                 print(f"      {k}: {v}")
 
 
+def run_one(seed, pol, budget, *, on_step=None, probe=False, probe_paths=False,
+            scan=False, ports=None, cve=False, program=None):
+    """Execute ONE seed end-to-end: discovery → optional active evidence → reasoning
+    → policy filtering. The single-target primitive both `pivot` and `program` call,
+    so there is exactly one execution path. Scope/rate/budget must already be set on
+    the provider layer (the caller does that once); this never touches them, which is
+    what lets `program` share one request budget across every host. Returns
+    (graph, result, suppressed)."""
+    print(f"[argus] seed {seed!r} classified as: {classify(seed)}", file=sys.stderr)
+    g = pivot(seed, budget, on_step=on_step)
+    if probe or probe_paths:   # providers add evidence only — the engine is untouched by this
+        n = providers.enrich(g)                 # HTTP probe -> evidence + version + clickjacking
+        t = providers.enrich_tls(g)             # TLS probe -> observed cert fingerprint
+        c = providers.enrich_cors(g)            # CORS probe -> cors_misconfig (one GET/host)
+        k = providers.enrich_kev(g)             # analysis: version -> known_exploited
+        r = providers.analyze_certificates(g)   # analysis: shared cert -> certificate_reused
+        m = providers.enrich_email_spoof(g)     # analysis: DMARC over DoH -> email_spoofable
+        s = providers.enrich_security_txt(g)    # disclosure: where to report (one GET/host)
+        line = f"probed {n} HTTP, {t} TLS, {c} CORS; {k} known-exploit, {r} cert-reuse, {m} email-spoofable, {s} security.txt"
+        if probe_paths:   # its own flag: multiplies the requests against the target
+            line += (f", {providers.enrich_admin(g)} admin-surface"
+                     f", {providers.enrich_exposure(g)} exposed-file"
+                     f", {providers.enrich_traversal(g)} path-traversal"
+                     f", {providers.enrich_graphql(g)} graphql-introspection"
+                     f", {providers.enrich_redirect(g)} open-redirect"
+                     f", {providers.enrich_injection(g)} xss/ssti")
+        print(f"[argus] {line} — evidence attached", file=sys.stderr)
+    if scan:   # loudest tier: a TCP connect scan is unmistakable in the target's logs
+        v = providers.enrich_scan(g, ports=ports)
+        print(f"[argus] port-scanned hosts; {v} with a catalog CVE — evidence attached", file=sys.stderr)
+    if cve:   # live NVD lookup over versions the probe/scan observed
+        v = providers.enrich_nvd(g)
+        print(f"[argus] NVD live lookup; {v} host(s) with a live CVE + references — evidence attached", file=sys.stderr)
+    result = investigate(g)   # discovery -> reasoning: the one result object
+    suppressed = []
+    if pol:   # program policy: suppress findings it declared non-reportable / out of scope
+        result, suppressed = pol.filter(result)
+        if suppressed:
+            names = ", ".join(sorted({c.rule for c in suppressed}))
+            print(f"[argus] policy suppressed {len(suppressed)} non-reportable finding(s): {names}",
+                  file=sys.stderr)
+    # historical feedback: nudge rank by past researcher verdicts (never confidence).
+    result = feedback.annotate(result, program=program or seed)
+    return g, result, suppressed
+
+
+def _concrete_hosts(pol):
+    """The program's queue: concrete in-scope hosts to seed, tier-sorted. A wildcard
+    (`*.x`) does NOT authorize the apex `x`, and a CIDR/range is not a host — neither
+    is expanded. `action == "none"` never enters. Deduped, stable; tier ascending
+    (tier1 = highest priority first, un-tiered last). Returns (queue, skipped_count)."""
+    seen, out, skipped = set(), [], 0
+    for a in pol.assets:
+        if not a.network or a.action == "none":
+            continue
+        host = a.pattern.strip().lower().rstrip(".")
+        net = scope_mod._as_net(host)
+        if not host or host.startswith("*.") or (net is not None and net.num_addresses > 1):
+            skipped += 1                       # wildcard or range: not a single concrete host
+            continue
+        if not pol.scope.allows(host) or host in seen:
+            continue                           # defensive: only queue what the policy allows
+        seen.add(host)
+        out.append(a)
+    out.sort(key=lambda a: (a.tier is None, a.tier or 0))   # tier1 first, un-tiered last
+    return out, skipped
+
+
+def _queue_line(a):
+    return f"  {('tier' + str(a.tier)) if a.tier else 'tier-':<6} {a.action:<8} {a.pattern}"
+
+
 def main(argv=None):
     """Console entrypoint. Wraps the real dispatch so a Ctrl-C during a slow
     pivot prints one clean line instead of a socket-level traceback. interactive()
@@ -372,6 +444,23 @@ def _run(argv=None):
     po.add_argument("file", help="text file containing the pasted program page")
     po.add_argument("--all", action="store_true", help="print every entry instead of the first 12 per list")
 
+    pg = sub.add_parser("program", help="Compile a program page, then pivot every concrete in-scope host in tier order under one shared request budget")
+    pg.add_argument("file", help="text file containing the pasted program page")
+    pg.add_argument("--depth", type=int, default=2, help="max pivot depth per host (default 2)")
+    pg.add_argument("--max", type=int, default=40, dest="max_entities", help="max entities per host (default 40)")
+    pg.add_argument("--deep", type=int, default=0, help="re-pivot into N discovered subdomains per host (default 0)")
+    pg.add_argument("--probe", action="store_true", help="ACTIVE: execute the queue and probe discovered hosts (off = dry-run queue only)")
+    pg.add_argument("--probe-paths", action="store_true", help="ACTIVE, louder: also request admin + sensitive-file paths. Implies --probe")
+    pg.add_argument("--scan", action="store_true", help="ACTIVE, loudest: TCP-connect port scan + CVE match")
+    pg.add_argument("--ports", default=None, help="port spec for --scan, e.g. '1-1024' or '22,80,443'")
+    pg.add_argument("--cve", action="store_true", help="live NVD lookup over observed versions")
+    pg.add_argument("--rate", type=float, default=None, metavar="N", help="override the program's probe rate (req/sec)")
+    pg.add_argument("--max-requests", type=int, default=None, dest="max_requests", metavar="N",
+                    help="ONE shared hard cap on total outbound requests for the WHOLE run (not per host)")
+    pg.add_argument("--report", default=None, metavar="PATH", help="write a combined Markdown report (all hosts) to PATH")
+    pg.add_argument("--no-memory", action="store_true", help="don't save these runs to investigation memory")
+    pg.add_argument("--json", action="store_true")
+
     sub.add_parser("modules", help="List available modules")
     sub.add_parser("coverage", help="Which engine predicates have an evidence provider (the roadmap)")
 
@@ -391,13 +480,86 @@ def _run(argv=None):
         print(policy.compile(text).summary(limit=0 if args.all else 12))
         return 0
 
+    if args.cmd == "program":
+        try:
+            pol = policy.compile(Path(args.file).read_text())
+        except OSError as e:
+            print(f"error: cannot read program file {args.file!r}: {e}", file=sys.stderr)
+            return 2
+        queue, skipped = _concrete_hosts(pol)
+        print(f"[argus] program compiled from {args.file!r}: {len(queue)} concrete host(s) queued, "
+              f"{skipped} wildcard/range skipped", file=sys.stderr)
+        for a in queue:
+            print(_queue_line(a), file=sys.stderr)
+        if not queue:
+            print("[argus] nothing to run — no concrete in-scope host in this program", file=sys.stderr)
+            return 0
+
+        active = args.probe or args.probe_paths or args.scan
+        if not active:   # dry run: show the queue, touch nothing
+            print("[argus] dry run — add --probe / --probe-paths / --scan to execute the queue", file=sys.stderr)
+            return 0
+
+        # One shared budget for the whole run: apply the policy ONCE, override the
+        # cap/rate from the CLI if given, and never reconfigure between hosts.
+        if args.max_requests is not None:
+            pol.max_requests = args.max_requests
+        if args.rate is not None:
+            pol.rate_per_sec = args.rate
+        pol.apply()
+        for h in pol.unfilled_headers():
+            print(f"[argus] WARNING: required header still a placeholder — {h}", file=sys.stderr)
+        try:
+            ports = providers.parse_ports(args.ports) if (args.scan and args.ports) else None
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        budget = Budget(max_depth=args.depth, max_entities=args.max_entities,
+                        expand_subdomains=args.deep)
+
+        runs, failed = [], []
+        for a in queue:
+            if providers.budget_exhausted():
+                print(f"[argus] shared request budget exhausted — stopping before {a.pattern}", file=sys.stderr)
+                break
+            print(f"\n[argus] ── {a.pattern}  ({('tier' + str(a.tier)) if a.tier else 'tier-'} {a.action}) ──",
+                  file=sys.stderr)
+            try:
+                g, result, _ = run_one(a.pattern, pol, budget, on_step=_progress,
+                                       probe=args.probe, probe_paths=args.probe_paths,
+                                       scan=args.scan, ports=ports, cve=args.cve, program=a.pattern)
+            except Exception as e:   # one bad host must not kill the program run
+                print(f"[argus] {a.pattern} failed: {e} — continuing", file=sys.stderr)
+                failed.append((a.pattern, str(e)))
+                continue
+            if not args.no_memory:
+                store.save(a.pattern, g)
+            runs.append((a.pattern, g, result))
+
+        print(f"\n[argus] program complete: {len(runs)} host(s) probed, {len(failed)} failed", file=sys.stderr)
+        if args.report:
+            try:
+                Path(args.report).write_text(
+                    "\n\n---\n\n".join(report_markdown(h, g, r) for h, g, r in runs))
+                print(f"[argus] combined report written to {args.report}", file=sys.stderr)
+            except OSError as e:
+                print(f"error: cannot write report {args.report!r}: {e}", file=sys.stderr)
+                return 2
+        if args.json:
+            print(json.dumps([{"seed": h, "graph": g.to_dict(), "investigation": r.to_dict()}
+                              for h, g, r in runs], indent=2))
+        else:
+            for h, g, r in runs:
+                print(f"\n{'━' * 60}\n {h}\n{'━' * 60}")
+                print(dossier(g, r))
+        return 0
+
     if args.cmd == "coverage":
         for pred, prov in providers.coverage().items():
             print(f"  {pred:<28} {prov or '— NO PROVIDER'}")
         return 0
 
     if args.cmd == "pivot":
-        print(f"[argus] seed {args.seed!r} classified as: {classify(args.seed)}", file=sys.stderr)
         # Engagement policy, set before any provider runs. Always reset both, so a
         # menu-driven second run never inherits the first run's scope/rate.
         pol = None
@@ -422,47 +584,17 @@ def _run(argv=None):
             providers.set_scope(None)
         if not pol:
             providers.set_rate(args.rate, args.max_requests)
+        try:
+            ports = providers.parse_ports(args.ports) if (args.scan and args.ports) else None
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
         past = [] if args.no_memory else store.history(args.seed)
-        g = pivot(args.seed, Budget(max_depth=args.depth, max_entities=args.max_entities,
-                                    expand_subdomains=args.deep), on_step=_progress)
-        if args.probe or args.probe_paths:   # providers add evidence only — the engine is untouched by this
-            n = providers.enrich(g)                 # HTTP probe -> evidence + version + clickjacking
-            t = providers.enrich_tls(g)             # TLS probe -> observed cert fingerprint
-            c = providers.enrich_cors(g)            # CORS probe -> cors_misconfig (one GET/host)
-            k = providers.enrich_kev(g)             # analysis: version -> known_exploited
-            r = providers.analyze_certificates(g)   # analysis: shared cert -> certificate_reused
-            m = providers.enrich_email_spoof(g)     # analysis: DMARC over DoH -> email_spoofable (no target engagement)
-            s = providers.enrich_security_txt(g)    # disclosure: where to report (observation only, one GET/host)
-            line = f"probed {n} HTTP, {t} TLS, {c} CORS; {k} known-exploit, {r} cert-reuse, {m} email-spoofable, {s} security.txt"
-            if args.probe_paths:   # its own flag: multiplies the requests against the target
-                line += (f", {providers.enrich_admin(g)} admin-surface"
-                         f", {providers.enrich_exposure(g)} exposed-file"
-                         f", {providers.enrich_traversal(g)} path-traversal"
-                         f", {providers.enrich_graphql(g)} graphql-introspection"
-                         f", {providers.enrich_redirect(g)} open-redirect"
-                         f", {providers.enrich_injection(g)} xss/ssti")
-            print(f"[argus] {line} — evidence attached", file=sys.stderr)
-        if args.scan:   # loudest tier: a TCP connect scan is unmistakable in the target's logs
-            try:
-                ports = providers.parse_ports(args.ports) if args.ports else None
-            except ValueError as e:
-                print(f"error: {e}", file=sys.stderr)
-                return 2
-            v = providers.enrich_scan(g, ports=ports)
-            print(f"[argus] port-scanned hosts; {v} with a catalog CVE — evidence attached", file=sys.stderr)
-        if getattr(args, "cve", False):   # live NVD lookup over versions the probe/scan observed
-            v = providers.enrich_nvd(g)
-            print(f"[argus] NVD live lookup; {v} host(s) with a live CVE + references — evidence attached", file=sys.stderr)
-        result = investigate(g)   # discovery -> reasoning: the one result object
-        if pol:   # program policy: suppress findings it declared non-reportable / out of scope
-            result, suppressed = pol.filter(result)
-            if suppressed:
-                names = ", ".join(sorted({c.rule for c in suppressed}))
-                print(f"[argus] policy suppressed {len(suppressed)} non-reportable finding(s): {names}",
-                      file=sys.stderr)
-        # historical feedback: nudge rank by past researcher verdicts (never confidence).
-        # occam: program identity is the seed for now — a --program/policy.name key is the follow-up.
-        result = feedback.annotate(result, program=args.seed)
+        budget = Budget(max_depth=args.depth, max_entities=args.max_entities,
+                        expand_subdomains=args.deep)
+        g, result, _ = run_one(args.seed, pol, budget, on_step=_progress,
+                               probe=args.probe, probe_paths=args.probe_paths,
+                               scan=args.scan, ports=ports, cve=args.cve, program=args.seed)
         if past:  # investigation memory — "I've seen this before"
             print("[argus] seen before —", file=sys.stderr)
             for line in store.memory_block(past, g).splitlines():

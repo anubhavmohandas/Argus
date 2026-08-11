@@ -262,6 +262,12 @@ def set_rate(rate: float | None = None, max_requests: int | None = None) -> None
     _throttle.configure(rate, max_requests)
 
 
+def budget_exhausted() -> bool:
+    """True when a shared request budget was set and is spent — lets a multi-host
+    run stop before seeding a host it could never probe (invariant I-1)."""
+    return _throttle.remaining is not None and _throttle.remaining <= 0
+
+
 def _retry_after(headers) -> float:
     """Retry-After seconds a 429/503 asked for; a small default when it's a date
     or absent. occam: integer-seconds form only — HTTP-date backoff is rare and a
