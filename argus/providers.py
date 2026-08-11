@@ -952,13 +952,21 @@ def _probe_port(host: str, port: int, timeout: float) -> tuple:
       ("closed",   "")      — actively refused (RST): host up, nothing listening
       ("filtered", "")      — no response before the timeout: a firewall/CDN is
                               silently dropping the connection
+      ("skipped",  "")      — request budget exhausted: we never opened the socket,
+                              so this port is UNKNOWN, not closed/filtered (I-1)
 
     The closed/filtered split is the whole point of a scan against a modern host:
     most ports there are *filtered*, not closed, and the two are different facts —
     "refused" vs "no answer" — so they stay different (I-1). occam: connect scan
     can't see nmap's open|filtered nuance; a raw-SYN scan needs root and is a
     separate provider. Passive banner only — reads what a service says first,
-    sends nothing."""
+    sends nothing.
+
+    A TCP connect IS outbound engagement, so it obeys the same politeness contract
+    as HTTP: it acquires from the global `_throttle`, serializing every worker to
+    the program's request rate + budget instead of firing sockets unthrottled."""
+    if not _throttle.acquire():
+        return "skipped", ""            # budget spent: never reached it (I-1)
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
             s.settimeout(timeout)
@@ -988,10 +996,13 @@ def scan_host(host: str, ports=None, timeout: float = 4.0, workers: int = 32) ->
     if not ports or not _permitted(host):
         return {}
     open_ports, filtered, services, cves = [], [], [], []
+    skipped = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(ports))) as ex:
         for port, (state, banner) in zip(ports, ex.map(lambda p: _probe_port(host, p, timeout), ports)):
             if state == "filtered":
                 filtered.append(port)
+            elif state == "skipped":
+                skipped += 1                # budget ran out before this port (I-1)
             elif state == "open":
                 open_ports.append(port)
                 product, version = parse_banner(banner)
@@ -1000,7 +1011,7 @@ def scan_host(host: str, ports=None, timeout: float = 4.0, workers: int = 32) ->
                 for hit in cve_matches(product, version):
                     cves.append({"port": port, "product": product, "version": version, **hit})
             # "closed": host up, nothing listening — reflected in `scanned` only
-    obs: dict = {"scanned": len(ports)}
+    obs: dict = {"scanned": len(ports) - skipped}   # ports we actually reached, never the skipped ones
     if open_ports:
         obs["open_ports"] = sorted(open_ports)
     if filtered:

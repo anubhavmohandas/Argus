@@ -38,7 +38,22 @@ _TOK = re.compile(r"[^a-z0-9]+")
 
 
 def _tokens(value: str) -> set[str]:
-    return {t for t in _TOK.split(value.lower()) if t}
+    """Name signals from a hostname's labels, excluding the public suffix.
+
+    The trailing TLD label is never an environment/tech signal: `.dev`, `.app`,
+    `.zip` are gTLDs, not deployment hints. Dropping the last label stops
+    `app.aikido.dev` reading as a dev environment while keeping the real signal
+    in `dev.aikido.com`. Single-label values (bare hostnames, IP octets that
+    can't match the word vocabulary anyway) pass through whole.
+
+    occam: drops one label, not a full public-suffix list — `co.uk` leaves a
+           harmless `co` that matches nothing. Add a PSL only if a suffix label
+           ever collides with the vocabulary.
+    """
+    labels = value.lower().strip().rstrip(".").split(".")
+    if len(labels) >= 2:
+        labels = labels[:-1]  # drop the public-suffix / TLD label
+    return {t for label in labels for t in _TOK.split(label) if t}
 
 
 # --- investigator name vocabulary -----------------------------------------

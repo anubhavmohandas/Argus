@@ -125,6 +125,20 @@ def test_enrich_scan_writes_only_observed_and_evidence(monkeypatch=None):
     assert g.nodes["username:someone"].evidence == {}, "non-probeable host left untouched"
 
 
+def test_tcp_connect_obeys_the_request_budget():
+    # A TCP connect is outbound engagement, so it honours the same politeness
+    # budget as HTTP. Offline: budget 0 => _probe_port returns before it ever
+    # opens a socket, and 'skipped' stays distinct from closed/filtered (I-1).
+    try:
+        providers.set_rate(max_requests=0)                 # budget exhausted
+        state, banner = providers._probe_port("example.com", 80, timeout=0.01)
+        assert (state, banner) == ("skipped", ""), (state, banner)
+    finally:
+        providers.set_rate()                               # clear: unlimited again
+    # and unlimited (the default) leaves the gate open — no skip
+    assert providers._throttle.acquire() is True
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
