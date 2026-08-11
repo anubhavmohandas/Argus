@@ -28,8 +28,10 @@ Ceilings: free-prose network scope ("any other domain from …") is warned not
 enforced; non-host scope (hardware/firmware product names) is recorded as a named
 `Asset(network=False)` the operator reads but Argus cannot engage; a CIA-triad
 objective stated in prose is recorded as a label only (too broad to drive rank);
-per-asset tier/env come from tokens, not a structured field. Extend `_NR_MAP` as
-new rule ids land.
+per-asset env comes from tokens, and tier from either an inline token or the
+table's own tier cell, which a flat paste drops on the line below the row — that
+cell may also read "Out of scope", excluding its one row and NOT opening the
+global out-of-scope section. Extend `_NR_MAP` as new rule ids land.
 """
 from __future__ import annotations
 
@@ -102,7 +104,13 @@ _CHROME = {
     "report illegal content", "description", "detail", "detail leaderboard",
     "leaderboard", "not applicable", "all", "dashboard", "programs", "inbox",
     "url", "wildcard", "type", "tier",   # asset-table column/type cells, not assets
+    "ip range", "ip", "cidr", "ip address",
 }
+
+# The asset table's *type* column. Its presence is what proves the next line is a
+# table cell rather than the next entry of a plain list or a section header —
+# a bullet list of hosts never has one. See the tier-cell branch in `compile`.
+_TYPE_CELLS = {"url", "wildcard", "ip range", "ip", "cidr", "ip address", "domain"}
 
 # Once the policy body ends, platform pages append a researcher list, an activity
 # feed and a legal footer. Nothing at or below these markers is policy — stop.
@@ -127,7 +135,8 @@ _HEADERS: list[tuple[tuple[str, ...], str]] = [
     (("out of scope", "out-of-scope", "not in scope", "excluded", "exclusion",
       "not eligible", "non-qualifying", "non qualifying"), "out"),
     (("interesting target", "interesting", "priorit", "objective", "focus",
-      "looking for", "we are interested", "qualifying vuln", "in-scope vuln"), "obj"),
+      "looking for", "we are interested", "qualifying vuln", "in-scope vuln",
+      "worst-case scenario", "worst case scenario"), "obj"),
     (("do not", "don't", "forbidden", "prohibited", "not allowed",
       "restriction"), "forbid"),
     (("in scope", "in-scope", "scope", "assets", "asset", "targets", "target",
@@ -274,23 +283,43 @@ def compile(text: str) -> EngagementPolicy:
     req_headers = _scan_request_headers(text)
 
     section = None
+    batch: list[Asset] = []                 # assets from the previous source line — an
+    armed = False                           # asset table puts their tier cell underneath
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
         if _is_footer(line):                # researcher list / activity feed / legal footer
             break
+        cell = _TIER_CELL_RE.fullmatch(_debullet(line)) if armed else None
+        if cell:                            # the asset table's tier column qualifies the row
+            for a in batch:                 # above it — never a scope entry, never a section
+                if cell.group(1):           # header, never a vulnerability category
+                    a.tier = int(cell.group(1))
+                    continue
+                a.action = "none"           # an "Out of scope" cell excludes that row alone
+                if a.pattern in include:
+                    include.remove(a.pattern)
+                exclude.append(a.pattern)
+            batch, armed = [], False        # one row, one qualifying cell
+            continue
+        if batch and _norm(line) in _TYPE_CELLS:
+            armed = True                    # host / TYPE / tier — only a table reaches a tier
+            continue                        # cell, so only a table's "Out of scope" is one
         hdr, inline = _split_header(line)   # handles both "Header:" and inline "Header: a, b"
         if hdr is not None:
-            section = hdr
+            section, batch, armed = hdr, [], False
             items = [s.strip() for s in re.split(r"[;,]", inline) if s.strip()]
         else:
-            items = [_debullet(line)]
+            items = _split_items(_debullet(line))
+        before = len(assets)
         for body in items:
             if not body:
                 continue
             _route(section, body, include, exclude, assets, forbidden,
                    nr_ids, nr_labels, objectives, warnings, no_prod_scan)
+        if len(assets) > before:            # a new row: it, not the last one, owns the next
+            batch, armed = assets[before:], False   # type cell and the tier cell after it
 
     for w in _scan_objective_prose(text):   # CIA triad stated in prose (label only, no rank)
         if w not in objectives:
@@ -327,7 +356,7 @@ def _route(section, body, include, exclude, assets, forbidden,
             assets.append(_asset(host, body, no_prod_scan))
         elif _looks_like_scope_intent(body):     # meant as a network target, unparseable
             warnings.append(f"unparseable in-scope line (not enforced): {body!r}")
-        elif len(body.split()) >= 2 and not re.match(r"(?i)tier\s*\d+$", body):
+        elif len(body.split()) >= 2:
             # a named non-network asset (hardware / firmware / product name) — recorded
             # for the operator, never enters host scope (Argus cannot engage it).
             assets.append(Asset(pattern=body.rstrip(". "), network=False, action="none"))
@@ -343,17 +372,46 @@ def _route(section, body, include, exclude, assets, forbidden,
     elif section == "forbid":
         forbidden.append(body)
     elif section == "obj":
-        objectives.append(body.lower())
+        objectives.append(body.lower().rstrip(". "))
 
 
 # --- parsing internals ----------------------------------------------------
+def _norm(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip().lower())
+
+
+# A header is often written as a possessive sentence ("Our worst-case scenarios are:"),
+# so the keyword is one determiner in. Tried second, never instead: 'we are interested'
+# is itself a key and must keep matching whole.
+_LEAD_RE = re.compile(r"^(?:our|the|these|those|my)\s+")
+
+
 def _match_header(norm: str) -> str | None:
+    return _match_header_exact(norm) or _match_header_exact(_LEAD_RE.sub("", norm))
+
+
+def _match_header_exact(norm: str) -> str | None:
     if any(norm == k or norm.startswith(k) for k in _INFO_HEADERS):
         return "_info"                  # prose section: recognised so it stops collection
     for keys, sec in _HEADERS:          # ordered: 'out'/'obj' win over the generic 'in'
         if any(norm == k or norm.startswith(k + " ") or norm.startswith(k) for k in keys):
             return sec
     return None
+
+
+# The tier column of an asset table holds either a tier or the row's exclusion —
+# "Out of scope" *as a cell* marks one row, and must not start the global section.
+_TIER_CELL_RE = re.compile(r"tier\s*[:=]?\s*(\d+)\.?|out[ -]of[ -]scope", re.I)
+
+
+def _split_items(line: str) -> list[str]:
+    """One asset-table row can hold a whole block of hosts ('IP Range' rows paste as
+    '1.2.3.4, 5.6.7.8, …'). Split only when EVERY part is a host, so prose with
+    commas ('email spoofing, SPF, DMARC') stays the single item it is."""
+    parts = [p.strip() for p in line.split(",")]
+    if len(parts) > 1 and all(_as_host(p) for p in parts):
+        return parts
+    return [line]
 
 
 def _split_header(line: str) -> tuple[str | None, str]:
@@ -410,7 +468,7 @@ def _is_noise(line: str) -> bool:
     occam: shape heuristics; ceiling: a real >10-word exclusion or a bare one-word
     technique is dropped here — the former is unmappable prose anyway, the latter
     is re-admitted in the 'out' route when _classify_exclusion maps it."""
-    low = re.sub(r"\s+", " ", line.strip().lower())
+    low = _norm(line)
     if not low or low in _CHROME:
         return True
     if low.endswith(":"):                                # 'Hardware:', 'Minimum:' — a sublabel
@@ -692,6 +750,95 @@ def demo() -> None:
     r.apply()
     assert providers._ID_HEADERS == {"X-Example": "devil748"} and not r.unfilled_headers()
     providers.set_scope(None), providers.set_rate(), providers.set_headers()   # leave no global set
+
+    # asset table pasted as flat text: a bounty grid that must contribute no tiers, an
+    # 'IP Range' row holding a whole block of hosts, a tier cell stacked under each row,
+    # and a bounded worst-case list as the objectives (synthetic; RFC 5737 IPs).
+    table = """Bounties
+    Tier 1
+    €
+    500
+    Tier 3
+    €
+    50
+    Assets
+    tier
+    All
+    api.example.com
+    URL
+    Tier 1
+    198.51.100.4, 198.51.100.5, 203.0.113.9
+    IP Range
+    Tier 1
+    *.shop.example.org
+    Wildcard
+    Tier 3
+    In scope
+    Our worst-case scenarios are:
+    Command execution on production services.
+    Obtaining sensitive user data.
+    Out of scope
+    Missing security headers
+    """
+    t = compile(table)
+    assert t.warnings == [], t.warnings              # 'IP Range' is a type cell, not a scope line
+    # every IP of the block is its own asset, and the row's single tier cell covers them all
+    assert {a.pattern: a.tier for a in t.assets} == {
+        "api.example.com": 1, "198.51.100.4": 1, "198.51.100.5": 1,
+        "203.0.113.9": 1, "*.shop.example.org": 3}, [(a.pattern, a.tier) for a in t.assets]
+    assert t.scope.allows("198.51.100.4") and t.scope.allows("203.0.113.9")
+    assert not t.scope.allows("198.51.100.6")        # only the listed IPs — no range invented
+    # a tier label is asset metadata; it must never surface as an excluded vuln class
+    assert not any("tier" in l.lower() for l in t.non_reportable_labels), t.non_reportable_labels
+    assert "missing_security_headers" in t.non_reportable and t.non_reportable_labels == [
+        "Missing security headers"], t.non_reportable_labels
+    # bounded worst-case prose = the program's objectives (an existing model field), and
+    # the ones that name a class Argus concludes also drive rank
+    assert t.objectives == ["command execution on production services",
+                            "obtaining sensitive user data"], t.objectives
+    assert not any(not a.network for a in t.assets)  # not mis-recorded as named assets
+    assert "vulnerable_service" in t.objective_targets, t.objective_targets
+    rce = Conclusion(rule="vulnerable_service", name="RCE", target="api.example.com",
+                     confidence=30, ledger={}, kind="risk", tags=["cve"])
+    hdr2 = Conclusion(rule="open_redirect", name="Redirect", target="api.example.com",
+                      confidence=95, ledger={}, kind="risk", tags=["redirect"])
+    ranked, _ = t.filter(InvestigationResult([hdr2, rce], "fp"))
+    assert [c.rule for c in ranked.risks] == ["vulnerable_service", "open_redirect"]
+
+    # an asset table whose tier column reads "Out of scope" for ONE row. That cell is
+    # row metadata: it excludes its own row and nothing else. Read as a section header
+    # instead, it inverts the authorization boundary — the excluded row stays allowed
+    # and every row below it is wrongly blocked. The real header must still switch.
+    row_cell = """Assets
+    tier
+    All
+    *.example.com
+    Wildcard
+    Out of scope
+    technik.example.org
+    URL
+    Tier 3
+    technik.beta.example.org
+    URL
+    Tier 3
+    In scope
+    Our worst-case scenarios are:
+    Obtaining sensitive user data.
+    Out of scope
+    Missing security headers
+    """
+    x = compile(row_cell)
+    assert x.warnings == [], x.warnings
+    assert not x.scope.allows("a.example.com")                  # the cell excluded its row
+    assert x.scope.allows("technik.example.org"), "row below an 'Out of scope' cell blocked"
+    assert x.scope.allows("technik.beta.example.org"), "row below an 'Out of scope' cell blocked"
+    assert {a.pattern: (a.tier, a.action) for a in x.assets} == {
+        "*.example.com": (None, "none"), "technik.example.org": (3, "active"),
+        "technik.beta.example.org": (3, "active")}, [(a.pattern, a.tier, a.action) for a in x.assets]
+    # the later bare "Out of scope" is a real header: its body is still an exclusion,
+    # and the objective section between them was not swallowed
+    assert "missing_security_headers" in x.non_reportable, x.non_reportable
+    assert x.objectives == ["obtaining sensitive user data"], x.objectives
     print("policy demo passed")
 
 

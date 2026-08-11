@@ -297,6 +297,27 @@ def test_pivot_offline_fanout():
     assert not g.findings  # nothing ran, so no findings — proves no network path taken
 
 
+def test_apex_not_readded_as_subdomain():
+    # crt.sh lists the apex among a domain's own certificate SANs. Without the
+    # guard it becomes a second node (domain:x.com AND subdomain:x.com), and the
+    # engine fires every rule twice for the same host — the duplicate
+    # "[30%] x.com Cookie set without security flags" conclusion bug.
+    import importlib
+    P = importlib.import_module("argus.pivot")  # the module (argus.pivot the name is the function)
+    real = P.run_module
+    P.run_module = lambda mod, val: (
+        [Finding("subdomains", val, "subs", core.LOW,
+                 data={"subdomains": [val, f"dev.{val}"]})] if mod == "subdomains" else [])
+    try:
+        g = pivot("x.com", Budget(max_depth=1, max_entities=10))
+    finally:
+        P.run_module = real
+    vals = [(e.type, e.value) for e in g.nodes.values()]
+    assert ("subdomain", "x.com") not in vals, vals   # apex must NOT be a subdomain node
+    assert ("domain", "x.com") in vals
+    assert ("subdomain", "dev.x.com") in vals          # a real subdomain is still kept
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -195,6 +195,9 @@ def pivot(seed: str, budget: Budget | None = None, on_step=None) -> Graph:
                     cvalue = _normalize_child(ctype, cvalue)
                     if cvalue is None:
                         continue  # junk (null-MX "0 .", malformed host, bad IP) — never a node
+                    if ctype == "subdomain" and f"domain:{cvalue}" in g.nodes:
+                        continue  # apex lists itself among its own SANs — already a
+                                  # domain node; re-adding it fires every rule twice
                     # occam: bound the subdomain explosion — CT can return
                     #        thousands. Default lists them; --deep re-pivots N.
                     if ctype == "subdomain":
