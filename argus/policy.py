@@ -441,11 +441,12 @@ def _as_host(line: str) -> str | None:
         s = urlsplit(s).netloc
     elif " " in s:
         return None
-    s = s.split("/")[0].split(":")[0].strip().lower()
+    s = s.strip().lower()
     if not s:
         return None
-    if scope_mod._as_net(s) is not None:
-        return s
+    if scope_mod._as_net(s) is not None:      # a bare IP or CIDR: keep the mask intact
+        return s                              # (a /24 is a range, not host 203.0.113.0)
+    s = s.split("/")[0].split(":")[0].strip()  # a hostname: drop any URL path / port
     if "." in s and scope_mod._valid_entry(s):
         return s
     return None
