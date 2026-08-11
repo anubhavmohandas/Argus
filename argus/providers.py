@@ -186,6 +186,19 @@ def set_scope(scope) -> None:
     _SCOPE = scope
 
 
+# Programs mandate an identification header ("X-HackerOne: <handle>",
+# "X-Intigriti: <username>") so the target can tell authorised research from an
+# attack. Set once from the engagement policy; carried by every probe.
+_ID_HEADERS: dict[str, str] = {}
+
+
+def set_headers(headers: dict | None = None) -> None:
+    """Install (or clear, with None) headers every probe must carry. A
+    "User-Agent" key here overrides the default agent."""
+    global _ID_HEADERS
+    _ID_HEADERS = {k: v for k, v in (headers or {}).items() if k and v}
+
+
 def _permitted(host: str) -> bool:
     """May a provider connect to `host`? In scope (if one is set) AND globally
     routable. Passive discovery/analysis providers don't ask this — scope gates
@@ -280,7 +293,9 @@ def _fetch(url: str, timeout: float, data: bytes | None = None,
     Content-Type for a GraphQL POST); they never override the User-Agent."""
     if not _throttle.acquire():
         return 0, {}, ""        # request budget exhausted: we didn't reach it (I-1)
-    hdrs = {"User-Agent": _UA, "Accept": "*/*", **(extra_headers or {})}
+    # Program-mandated identity headers win over per-call extras: the engagement
+    # contract outranks any single probe's convenience.
+    hdrs = {"User-Agent": _UA, "Accept": "*/*", **(extra_headers or {}), **_ID_HEADERS}
     req = urllib.request.Request(url, data=data, headers=hdrs)
     try:
         with _OPENER.open(req, timeout=timeout) as r:  # noqa: S310 (probes external targets by design)

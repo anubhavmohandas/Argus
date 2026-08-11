@@ -91,7 +91,7 @@ _TIER_RE = re.compile(r"\btier\s*[:=]?\s*(\d)", re.I)
 _NO_PROD_SCAN_RE = re.compile(r"produc\w*.{0,40}(must not|do not|don't|shouldn't|cannot).{0,20}scan"
                               r"|(do not|don't|no).{0,20}scan.{0,40}produc", re.I)
 _TEST_TOKENS = ("test", "acc", "acceptance", "staging", "stage", "uat", "qa", "dev", "sandbox")
-_PROD_TOKENS = ("prod", "production", "www.", "live")
+_PROD_TOKENS = ("prod", "production", "www", "live")
 
 # Platform-page furniture: short UI/nav lines that would otherwise pass as items.
 # Kept small and platform-generic on purpose — the structural gates (_is_noise
@@ -101,6 +101,7 @@ _CHROME = {
     "create submission", "view my submissions", "follow program", "program actions",
     "report illegal content", "description", "detail", "detail leaderboard",
     "leaderboard", "not applicable", "all", "dashboard", "programs", "inbox",
+    "url", "wildcard", "type", "tier",   # asset-table column/type cells, not assets
 }
 
 # Once the policy body ends, platform pages append a researcher list, an activity
@@ -149,6 +150,7 @@ class EngagementPolicy:
     rate_per_sec: float | None = None
     max_requests: int | None = None
     user_agent: str = ""
+    request_headers: dict[str, str] = field(default_factory=dict)  # program-required headers to send
     forbidden: list[str] = field(default_factory=list)
     non_reportable: set[str] = field(default_factory=set)        # rule ids / tags to suppress
     non_reportable_labels: list[str] = field(default_factory=list)  # verbatim, for the report
@@ -159,10 +161,22 @@ class EngagementPolicy:
 
     # --- integration with the running engine ------------------------------
     def apply(self) -> None:
-        """Push the scope + rate into the provider layer, before any provider runs."""
+        """Push the scope + rate + required identity headers into the provider
+        layer, before any provider runs. A header value still holding the page's
+        placeholder ('<your-username>') is NOT sent — announcing yourself as
+        literal '<your-username>' identifies nobody; `unfilled_headers()` says so."""
         from . import providers   # lazy: avoid import cycle at module load
         providers.set_scope(self.scope)
         providers.set_rate(self.rate_per_sec, self.max_requests)
+        hdrs = {k: v for k, v in self.request_headers.items() if not _is_placeholder(v)}
+        if self.user_agent:
+            hdrs["User-Agent"] = self.user_agent
+        providers.set_headers(hdrs)
+
+    def unfilled_headers(self) -> list[str]:
+        """Required headers whose value is still the page's placeholder — the
+        operator must supply a real one or the engagement is unattributable."""
+        return [f"{k}: {v}" for k, v in self.request_headers.items() if _is_placeholder(v)]
 
     def is_reportable(self, c) -> bool:
         """A finding the program explicitly excluded is not reportable — even though
@@ -205,21 +219,40 @@ class EngagementPolicy:
         risks.sort(key=lambda c: "objective" not in c.tags)   # False(0) = matched sorts first
         return InvestigationResult(risks + rest, result.fingerprint, result.error), suppressed
 
-    def summary(self) -> str:
-        """The engagement contract, human-readable — echoed before an investigation."""
+    def summary(self, limit: int = 12) -> str:
+        """The engagement contract, human-readable — echoed before an investigation.
+        Long lists are capped at `limit` entries with an explicit "+N more" so the
+        output never silently hides part of the contract (limit=0 = show all)."""
+        def block(title: str, items: list[str]) -> list[str]:
+            if not items:
+                return [f"  {title:<16} —"]
+            shown = items if limit <= 0 else items[:limit]
+            out = [f"  {title:<16} {len(items)}"]
+            out += [f"    · {s}" for s in shown]
+            if len(items) > len(shown):
+                out.append(f"    · … +{len(items) - len(shown)} more")
+            return out
+
         L = ["ENGAGEMENT POLICY"]
-        L.append(f"  assets           {len(self.assets)} in scope")
-        for a in self.assets[:12]:
-            meta = " ".join(x for x in (a.env, f"tier{a.tier}" if a.tier else "", a.action) if x)
-            L.append(f"    {a.pattern:<34} {meta}")
+        L += block("assets", [
+            f"{a.pattern:<34} " + " ".join(x for x in (
+                a.env, f"tier{a.tier}" if a.tier else "", a.action,
+                "" if a.network else "(non-network)") if x)
+            for a in self.assets
+        ])
         L.append(f"  rate             {self.rate_per_sec or '—'} req/sec"
                  f"{'  max ' + str(self.max_requests) if self.max_requests else ''}")
         L.append(f"  user-agent       {self.user_agent or '—'}")
-        L.append(f"  forbidden        {', '.join(self.forbidden) or '—'}")
-        L.append(f"  non-reportable   {', '.join(self.non_reportable_labels) or '—'}")
-        L.append(f"  objectives       {', '.join(self.objectives) or '—'}")
-        for w in self.warnings:
-            L.append(f"  ! {w}")
+        L += block("headers", [
+            f"{k}: {v}" + ("   ← FILL IN before probing" if _is_placeholder(v) else "")
+            for k, v in self.request_headers.items()
+        ])
+        L += block("forbidden", self.forbidden)
+        L += block("non-reportable", self.non_reportable_labels)
+        # Which exclusions Argus can actually act on — the rest are report-only text.
+        L.append(f"  → suppresses     {', '.join(sorted(self.non_reportable)) or '—'}")
+        L += block("objectives", self.objectives)
+        L += block("warnings", self.warnings)
         return "\n".join(L)
 
 
@@ -238,6 +271,7 @@ def compile(text: str) -> EngagementPolicy:
 
     no_prod_scan = bool(_NO_PROD_SCAN_RE.search(text))
     rate, ua = _scan_rate(text), _scan_ua(text)
+    req_headers = _scan_request_headers(text)
 
     section = None
     for raw in text.splitlines():
@@ -272,7 +306,7 @@ def compile(text: str) -> EngagementPolicy:
 
     return EngagementPolicy(
         scope=scope_mod.Scope(include, exclude),
-        rate_per_sec=rate, user_agent=ua,
+        rate_per_sec=rate, user_agent=ua, request_headers=req_headers,
         forbidden=forbidden, non_reportable=nr_ids, non_reportable_labels=nr_labels,
         objectives=objectives, objective_targets=_objective_targets(objectives),
         assets=assets, warnings=warnings,
@@ -385,6 +419,8 @@ def _is_noise(line: str) -> bool:
         return True                                      # cross-reference prose
     if "\t" in line:                                     # a table row pasted as text
         return True
+    if "feedback" in low and " " in low and "." not in low and len(low.split()) <= 4:
+        return True                                      # 'Program feedback link' etc. — a UI link
     return len(low.split()) > 10                         # a sentence/paragraph, not an item
 
 
@@ -393,21 +429,36 @@ def _is_footer(line: str) -> bool:
     return norm in _FOOTER_MARKERS or norm.startswith(("© copyright", "want to participate"))
 
 
+_INTEREST_RE = re.compile(
+    r"\b(?:particularly |especially |only |mainly |really |also )*interested in\s+(.+?)"
+    r"(?:\s+(?:if|when|unless|where|provided|and|that|because)\b|[.,;:)]|$)", re.I)
+
+
 def _scan_objective_prose(text: str) -> list[str]:
-    """The CIA triad stated in prose ('compromise of confidentiality, integrity, or
-    availability') is a real objective many programs never put under a header.
-    Record present members when ≥2 co-occur — a lone word is not a triad claim."""
+    """Objectives many programs state in prose, never under a header:
+      * the CIA triad ('compromise of confidentiality, integrity, or availability')
+        — recorded when ≥2 co-occur (a lone word is not a triad claim);
+      * an explicit '(we're only) interested in <X>' focus — the bounded phrase X.
+    Label-only unless X maps in _OBJ_MAP; then it also drives objective ranking."""
     low = text.lower()
-    cia = [w for w in ("confidentiality", "integrity", "availability") if w in low]
-    return cia if len(cia) >= 2 else []
+    out = [w for w in ("confidentiality", "integrity", "availability") if w in low]
+    out = out if len(out) >= 2 else []
+    for m in _INTEREST_RE.finditer(text):
+        phrase = re.sub(r"\s+", " ", m.group(1)).strip(" .,-").lower()
+        if 2 <= len(phrase.split()) <= 8 and phrase not in out:
+            out.append(phrase)
+    return out
 
 
 def _asset(host: str, body: str, no_prod_scan: bool) -> Asset:
-    low = (host + " " + body).lower()
+    # match env tokens as whole labels/words, never as substrings, and never
+    # against the host's TLD — `.dev`/`.app` are TLDs, not environments
+    words = set(re.findall(r"[a-z]+", host.lower().rsplit(".", 1)[0]))
+    words |= set(re.findall(r"[a-z]+", body.lower()))
     env = ""
-    if any(t in low for t in _TEST_TOKENS):
+    if words & set(_TEST_TOKENS):
         env = "test"
-    elif any(t in low for t in _PROD_TOKENS):
+    elif words & set(_PROD_TOKENS):
         env = "prod"
     tier = int(_TIER_RE.search(body).group(1)) if _TIER_RE.search(body) else None
     action = "passive" if (env == "prod" and no_prod_scan) else "active"
@@ -448,6 +499,35 @@ def _scan_ua(text: str) -> str:
             if v.lower() not in _UA_PLACEHOLDERS:   # skip platform "Not applicable" rows
                 return v
     return ""
+
+
+_REQ_HDR_LABEL_RE = re.compile(r"(?:required[\s-]*)?request[\s-]*header", re.I)
+_HEADER_LINE_RE = re.compile(r"([A-Za-z][A-Za-z0-9-]*)\s*:\s*(\S.*)")
+
+
+def _is_placeholder(value: str) -> bool:
+    """'<your-username>', '{handle}', 'YOUR_USERNAME' — a slot, not a value."""
+    v = value.strip()
+    return bool(re.search(r"[<{\[]|\byour[_ -]?\w+\b", v, re.I))
+
+
+def _scan_request_headers(text: str) -> dict[str, str]:
+    """Program-required request headers (e.g. Intigriti's 'Request header' config
+    row → 'X-Intigriti: <your-username>'). Anchored on the config label so ordinary
+    'Name: value' prose isn't harvested; the value sits on the label line or the
+    next few. occam: value may be a '<placeholder>' the operator must fill before
+    sending — captured verbatim and surfaced, not auto-sent."""
+    lines = [l.strip() for l in text.splitlines()]
+    out: dict[str, str] = {}
+    for i, line in enumerate(lines):
+        if not _REQ_HDR_LABEL_RE.fullmatch(line):
+            continue
+        for nxt in lines[i:i + 4]:              # label line itself, then a short lookahead
+            m = _HEADER_LINE_RE.fullmatch(nxt)
+            if m and m.group(2).lower() not in _UA_PLACEHOLDERS:
+                out[m.group(1)] = m.group(2).strip()
+                break
+    return out
 
 
 def demo() -> None:
@@ -567,6 +647,51 @@ def demo() -> None:
     assert not any("physical access" in l.lower() for l in q.non_reportable_labels)  # prose dropped
     assert {"confidentiality", "integrity", "availability"} <= set(q.objectives), q.objectives
     assert q.objective_targets == set()                         # CIA is label-only, drives no rank
+
+    # platform config block: a required request header, a rate, an asset table with
+    # type cells, an 'interested in' objective in prose, and a feedback-link false
+    # asset (synthetic, not any real program).
+    cfg = """Rules of engagement
+    Give feedback
+    User agent
+    Not applicable
+    Automated tooling
+    max. 3 requests /sec
+    Request header
+    X-Example: <your-username>
+    Assets
+    app.example.com
+    URL
+    Tier 2
+    *.example.com
+    Wildcard
+    In scope
+    Give feedback
+    Program feedback link
+    We're only interested in privilege escalation within the same tenant if you can view another team's data.
+    Out of scope
+    Missing security headers
+    """
+    r = compile(cfg)
+    assert r.request_headers == {"X-Example": "<your-username>"}, r.request_headers  # header captured
+    assert r.rate_per_sec == 3.0, r.rate_per_sec
+    assert r.user_agent == "", r.user_agent                     # "Not applicable" is not the UA
+    assert r.scope.allows("app.example.com") and r.scope.allows("x.example.com")
+    assert not any(not a.network for a in r.assets), [a.pattern for a in r.assets]   # no 'feedback link' junk
+    assert not any("URL" in w for w in r.warnings), r.warnings   # 'URL' type cell isn't warned scope
+    assert "privilege escalation within the same tenant" in r.objectives, r.objectives
+    assert {"admin_interface_exposed", "access-control", "authz"} <= r.objective_targets
+    assert "missing_security_headers" in r.non_reportable
+
+    # a placeholder header is surfaced to the operator, never sent as-is
+    from . import providers
+    assert r.unfilled_headers() == ["X-Example: <your-username>"], r.unfilled_headers()
+    r.apply()
+    assert providers._ID_HEADERS == {}, providers._ID_HEADERS
+    r.request_headers["X-Example"] = "devil748"          # operator filled it in
+    r.apply()
+    assert providers._ID_HEADERS == {"X-Example": "devil748"} and not r.unfilled_headers()
+    providers.set_scope(None), providers.set_rate(), providers.set_headers()   # leave no global set
     print("policy demo passed")
 
 

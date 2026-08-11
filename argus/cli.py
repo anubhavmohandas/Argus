@@ -365,6 +365,13 @@ def _run(argv=None):
     fb.add_argument("--program", default="", help="engagement key the verdict belongs to (use the pivot seed for now)")
     fb.add_argument("--note", default="", help="free-text note for the report trail")
 
+    po = sub.add_parser("policy", help="Compile a pasted bug-bounty program page and print the engagement contract")
+    # `inspect` is the only verb today; optional so `argus policy FILE` also works.
+    po.add_argument("verb", nargs="?", choices=["inspect"], default="inspect",
+                    help="inspect: print the compiled contract (default)")
+    po.add_argument("file", help="text file containing the pasted program page")
+    po.add_argument("--all", action="store_true", help="print every entry instead of the first 12 per list")
+
     sub.add_parser("modules", help="List available modules")
     sub.add_parser("coverage", help="Which engine predicates have an evidence provider (the roadmap)")
 
@@ -373,6 +380,15 @@ def _run(argv=None):
     if args.cmd == "modules":
         for name, m in sorted(MODULES.items()):
             print(f"  {name:<12} [{m.kind:<9}] {m.help}")
+        return 0
+
+    if args.cmd == "policy":
+        try:
+            text = Path(args.file).read_text()
+        except OSError as e:
+            print(f"error: cannot read policy file {args.file!r}: {e}", file=sys.stderr)
+            return 2
+        print(policy.compile(text).summary(limit=0 if args.all else 12))
         return 0
 
     if args.cmd == "coverage":
