@@ -18,10 +18,18 @@ it never *guesses a host it isn't sure of* (an unparseable scope line is warned,
 not invented) and it never drops a finding on a class it did not explicitly see
 excluded.
 
-occam: section-router + keyword heuristics, tuned to the real DHL / KU Leuven /
-Intigriti wording. Ceiling: free-prose scope ("any other domain from …") can't be
-enforced and is surfaced as a warning; per-asset tier/env come from tokens in the
-text, not a structured field. Extend `_NR_MAP` as new rule ids land.
+occam: section-router + keyword/shape heuristics, tuned to real platform-page
+paste (DHL / KU Leuven / Intigriti). Raw pages are mostly furniture — nav chrome,
+agreement prose, asset tables, a researcher/footer block — so routing runs behind
+three structural gates: a footer sentinel (`_is_footer`), informational-section
+headers that collect nothing (`_INFO_HEADERS`), and a per-line noise filter
+(`_is_noise`: chrome, sublabels, cross-references, table rows, prose sentences).
+Ceilings: free-prose network scope ("any other domain from …") is warned not
+enforced; non-host scope (hardware/firmware product names) is recorded as a named
+`Asset(network=False)` the operator reads but Argus cannot engage; a CIA-triad
+objective stated in prose is recorded as a label only (too broad to drive rank);
+per-asset tier/env come from tokens, not a structured field. Extend `_NR_MAP` as
+new rule ids land.
 """
 from __future__ import annotations
 
@@ -74,21 +82,53 @@ _OBJ_MAP: list[tuple[tuple[str, ...], set[str]]] = [
 ]
 
 _RATE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:requests?|reqs?|calls?)?\s*(?:/|per)\s*sec", re.I)
-_UA_RE = re.compile(r"user[\s-]*agent\s*[:=]?\s*(.+)", re.I)
+# same-line only ([ \t-] never crosses a newline) and a delimiter is required, so a
+# bare "User agent" label whose value sits on the next line ("Not applicable", a
+# platform placeholder) is not mistaken for the agent to send.
+_UA_RE = re.compile(r"user[ \t-]*agent[ \t]*[:=][ \t]*(\S.*)", re.I)
+_UA_PLACEHOLDERS = {"not applicable", "n/a", "none", "-", "any", "no restriction"}
 _TIER_RE = re.compile(r"\btier\s*[:=]?\s*(\d)", re.I)
 _NO_PROD_SCAN_RE = re.compile(r"produc\w*.{0,40}(must not|do not|don't|shouldn't|cannot).{0,20}scan"
                               r"|(do not|don't|no).{0,20}scan.{0,40}produc", re.I)
 _TEST_TOKENS = ("test", "acc", "acceptance", "staging", "stage", "uat", "qa", "dev", "sandbox")
 _PROD_TOKENS = ("prod", "production", "www.", "live")
 
+# Platform-page furniture: short UI/nav lines that would otherwise pass as items.
+# Kept small and platform-generic on purpose — the structural gates (_is_noise
+# shape rules, the footer sentinel, informational headers) do the heavy lifting.
+_CHROME = {
+    "give feedback", "view changes", "expand all", "filter text", "no bounty",
+    "create submission", "view my submissions", "follow program", "program actions",
+    "report illegal content", "description", "detail", "detail leaderboard",
+    "leaderboard", "not applicable", "all", "dashboard", "programs", "inbox",
+}
+
+# Once the policy body ends, platform pages append a researcher list, an activity
+# feed and a legal footer. Nothing at or below these markers is policy — stop.
+_FOOTER_MARKERS = (
+    "researchers", "last contributors", "program actions", "activity",
+    "last 90 day response times",
+)
+
+# Section headers that introduce program *prose* (eligibility, safe harbour, FAQ,
+# severity, legal), not policy items. Hitting one ends the collecting section
+# until the next real header, so its body is never recorded as scope/exclusions.
+_INFO_HEADERS = (
+    "severity assessment", "severity", "faq", "safe harbor", "safe harbour",
+    "report eligibility", "product eligibility", "eligibility criteria",
+    "security researcher", "researcher/reporter", "researcher and reporter",
+    "sensitive and personal", "shared agreements", "intellectual property",
+    "rules of engagement", "disclosure policy",
+)
+
 # header keyword -> section the following body lines belong to
 _HEADERS: list[tuple[tuple[str, ...], str]] = [
     (("out of scope", "out-of-scope", "not in scope", "excluded", "exclusion",
-      "not eligible", "non-qualifying", "non qualifying", "not applicable"), "out"),
+      "not eligible", "non-qualifying", "non qualifying"), "out"),
     (("interesting target", "interesting", "priorit", "objective", "focus",
       "looking for", "we are interested", "qualifying vuln", "in-scope vuln"), "obj"),
     (("do not", "don't", "forbidden", "prohibited", "not allowed",
-      "rules of engagement", "restriction"), "forbid"),
+      "restriction"), "forbid"),
     (("in scope", "in-scope", "scope", "assets", "asset", "targets", "target",
       "domains", "domain"), "in"),
 ]
@@ -96,10 +136,11 @@ _HEADERS: list[tuple[tuple[str, ...], str]] = [
 
 @dataclass
 class Asset:
-    pattern: str            # host / wildcard / CIDR, as it will enter the scope
+    pattern: str            # host / wildcard / CIDR, or a named non-network asset
     env: str = ""           # "test" | "prod" | "" (unknown — never guessed past tokens)
     tier: int | None = None
     action: str = "active"  # "active" | "passive" | "none"
+    network: bool = True     # False = hardware/firmware/product name; never enters host scope
 
 
 @dataclass
@@ -203,6 +244,8 @@ def compile(text: str) -> EngagementPolicy:
         line = raw.strip()
         if not line:
             continue
+        if _is_footer(line):                # researcher list / activity feed / legal footer
+            break
         hdr, inline = _split_header(line)   # handles both "Header:" and inline "Header: a, b"
         if hdr is not None:
             section = hdr
@@ -215,8 +258,17 @@ def compile(text: str) -> EngagementPolicy:
             _route(section, body, include, exclude, assets, forbidden,
                    nr_ids, nr_labels, objectives, warnings, no_prod_scan)
 
-    if section is not None and not include and not exclude:
+    for w in _scan_objective_prose(text):   # CIA triad stated in prose (label only, no rank)
+        if w not in objectives:
+            objectives.append(w)
+
+    named = [a for a in assets if not a.network]
+    if section is not None and not include and not exclude and not named:
         warnings.append("no scope parsed — check the pasted assets section")
+    elif named and not include:
+        shown = ", ".join(a.pattern for a in named[:3]) + ("…" if len(named) > 3 else "")
+        warnings.append(f"scope is non-network ({len(named)} named asset(s): {shown}) — "
+                        f"recorded for the operator; no host for Argus to engage")
 
     return EngagementPolicy(
         scope=scope_mod.Scope(include, exclude),
@@ -229,23 +281,31 @@ def compile(text: str) -> EngagementPolicy:
 
 def _route(section, body, include, exclude, assets, forbidden,
            nr_ids, nr_labels, objectives, warnings, no_prod_scan) -> None:
-    """Send one parsed item to its section's collector. Mutates the caller's lists."""
+    """Send one parsed item to its section's collector. Mutates the caller's lists.
+    Informational sections collect nothing; furniture/prose is dropped, never
+    recorded as a policy item (that pollution was the whole bug on raw pages)."""
+    if section not in ("in", "out", "forbid", "obj") or _is_noise(body):
+        return
     if section == "in":
         host = _as_host(body)
         if host:
             include.append(host)
             assets.append(_asset(host, body, no_prod_scan))
-        elif _looks_like_scope_intent(body):
+        elif _looks_like_scope_intent(body):     # meant as a network target, unparseable
             warnings.append(f"unparseable in-scope line (not enforced): {body!r}")
+        elif len(body.split()) >= 2 and not re.match(r"(?i)tier\s*\d+$", body):
+            # a named non-network asset (hardware / firmware / product name) — recorded
+            # for the operator, never enters host scope (Argus cannot engage it).
+            assets.append(Asset(pattern=body.rstrip(". "), network=False, action="none"))
     elif section == "out":
         host = _as_host(body)
         if host:
             exclude.append(host)
-        else:                           # a vulnerability class, not a host
-            ids, label = _classify_exclusion(body)
-            nr_ids |= ids
-            if label not in nr_labels:
-                nr_labels.append(label)
+            return
+        ids, label = _classify_exclusion(body)   # a vulnerability class / excluded category
+        nr_ids |= ids
+        if (ids or len(body.split()) >= 2) and label not in nr_labels:
+            nr_labels.append(label)              # single unmapped words are furniture, dropped
     elif section == "forbid":
         forbidden.append(body)
     elif section == "obj":
@@ -254,6 +314,8 @@ def _route(section, body, include, exclude, assets, forbidden,
 
 # --- parsing internals ----------------------------------------------------
 def _match_header(norm: str) -> str | None:
+    if any(norm == k or norm.startswith(k) for k in _INFO_HEADERS):
+        return "_info"                  # prose section: recognised so it stops collection
     for keys, sec in _HEADERS:          # ordered: 'out'/'obj' win over the generic 'in'
         if any(norm == k or norm.startswith(k + " ") or norm.startswith(k) for k in keys):
             return sec
@@ -298,7 +360,46 @@ def _as_host(line: str) -> str | None:
 
 
 def _looks_like_scope_intent(body: str) -> bool:
-    return bool(re.search(r"\.|/|domain|app|api|endpoint|host|url|ip\b", body, re.I))
+    """True when a non-host in-scope line still *means* a network target (a domain
+    phrase, a path, an embedded dot) — so it is warned, not silently dropped nor
+    mistaken for a hardware asset. A trailing sentence period is not an embedded
+    dot: 'SDM firmware ... elements.' is a named asset, 'api.foo bar' is intent."""
+    b = body.strip().rstrip(".")
+    return bool(re.search(r"\w\.\w|/|\b(?:subdomain|domain|app|api|endpoint|host|url|ip)s?\b",
+                          b, re.I))
+
+
+def _is_noise(line: str) -> bool:
+    """A pasted platform page is mostly furniture, prose and cross-references, not
+    policy items. True for lines that must never be recorded as a scope/exclusion/
+    forbidden/objective entry. Structural and platform-generic, not per-program.
+    occam: shape heuristics; ceiling: a real >10-word exclusion or a bare one-word
+    technique is dropped here — the former is unmappable prose anyway, the latter
+    is re-admitted in the 'out' route when _classify_exclusion maps it."""
+    low = re.sub(r"\s+", " ", line.strip().lower())
+    if not low or low in _CHROME:
+        return True
+    if low.endswith(":"):                                # 'Hardware:', 'Minimum:' — a sublabel
+        return True
+    if low.endswith("section.") or re.search(r"\bsee\b.*\bsection\b", low):
+        return True                                      # cross-reference prose
+    if "\t" in line:                                     # a table row pasted as text
+        return True
+    return len(low.split()) > 10                         # a sentence/paragraph, not an item
+
+
+def _is_footer(line: str) -> bool:
+    norm = re.sub(r"\s+", " ", line.lower()).rstrip("?:. ")
+    return norm in _FOOTER_MARKERS or norm.startswith(("© copyright", "want to participate"))
+
+
+def _scan_objective_prose(text: str) -> list[str]:
+    """The CIA triad stated in prose ('compromise of confidentiality, integrity, or
+    availability') is a real objective many programs never put under a header.
+    Record present members when ≥2 co-occur — a lone word is not a triad claim."""
+    low = text.lower()
+    cia = [w for w in ("confidentiality", "integrity", "availability") if w in low]
+    return cia if len(cia) >= 2 else []
 
 
 def _asset(host: str, body: str, no_prod_scan: bool) -> Asset:
@@ -340,8 +441,13 @@ def _scan_rate(text: str) -> float | None:
 
 
 def _scan_ua(text: str) -> str:
-    m = _UA_RE.search(text)
-    return m.group(1).strip() if m else ""
+    for line in text.splitlines():
+        m = _UA_RE.match(line.strip())
+        if m:
+            v = m.group(1).strip().rstrip(".")
+            if v.lower() not in _UA_PLACEHOLDERS:   # skip platform "Not applicable" rows
+                return v
+    return ""
 
 
 def demo() -> None:
@@ -406,6 +512,61 @@ def demo() -> None:
     envs = {a.pattern: (a.env, a.action) for a in j.assets}
     assert envs["test.example.io"] == ("test", "active"), envs
     assert envs["www.example.io"] == ("prod", "passive"), envs   # prod + "must not be scanned"
+
+    # raw platform-page paste: nav chrome, agreement prose, an asset table, a CIA
+    # objective stated in prose, a hardware-style scope with no host, and a footer.
+    # The parser must keep the real items and drop the furniture (synthetic page).
+    raw = """Dashboard
+    Programs
+    logo
+    Give feedback
+    Rules of engagement
+    User agent
+    Not applicable
+    By participating in this program, you agree to follow the terms and adhere to the scope of the Program.
+    Assets
+    tier
+    All
+    Widget Firmware and Utilities
+    Other
+    No bounty
+    In scope
+    Give feedback
+    See "Report Eligibility Criteria" section.
+    Hardware:
+    ExampleChip A100 family boards
+    Firmware:
+    Device firmware embedded in the above hardware elements.
+    Out of scope
+    Product Category\tBounty\tBonus
+    Third-Party Products\tNo\tNo
+    Missing security headers
+    Issues that require deep physical access to the device are out of scope for bounty rewards.
+    End of Life Products
+    Severity assessment
+    A path to the compromise of confidentiality, integrity, or availability is required.
+    FAQ
+    When is a bounty awarded?
+    Researchers
+    logo
+    someuser
+    © Copyright 2026
+    """
+    q = compile(raw)
+    assert q.forbidden == [], q.forbidden                       # RoE prose is not "forbidden"
+    assert q.user_agent == "", q.user_agent                     # "Not applicable" placeholder rejected
+    assert not any("participating" in l.lower() for l in q.non_reportable_labels)  # agreement prose gone
+    assert "Give feedback" not in q.non_reportable_labels and "logo" not in q.non_reportable_labels
+    assert "someuser" not in q.non_reportable_labels            # footer block not parsed
+    named = [a.pattern for a in q.assets if not a.network]      # hardware/firmware scope captured
+    assert "ExampleChip A100 family boards" in named, named
+    assert any("Device firmware embedded" in p for p in named), named
+    assert q.scope._inc_dom == [] and q.scope._inc_net == []    # no host scope; nothing crashes
+    assert "missing_security_headers" in q.non_reportable       # short mapped exclusion survives
+    assert "End of Life Products" in q.non_reportable_labels    # real category survives
+    assert not any("physical access" in l.lower() for l in q.non_reportable_labels)  # prose dropped
+    assert {"confidentiality", "integrity", "availability"} <= set(q.objectives), q.objectives
+    assert q.objective_targets == set()                         # CIA is label-only, drives no rank
     print("policy demo passed")
 
 
