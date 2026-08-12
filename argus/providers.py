@@ -156,6 +156,15 @@ def _resolvable_and_global(host: str) -> bool:
     at 127.0.0.1, at RFC1918 space, or at 169.254.169.254 (cloud metadata).
     Probing those turns a recon tool into an SSRF primitive against the machine
     running it, so a non-global answer means we do not connect at all.
+
+    Ceiling — this is not airtight against DNS rebinding: the resolve here and
+    the resolve urllib does when it opens the socket are two separate lookups, so
+    a name that answers global now and internal a moment later slips the gate.
+    occam: closing it means pinning THIS resolved address and dialing the pinned
+    IP (with SNI/Host preserved for TLS) via a custom opener — a real change with
+    real TLS-probe regression risk, deferred until a threat model asks for it.
+    Today's guard stops the static-record case (the common one); rebinding is a
+    known, named gap, not an oversight.
     """
     try:
         infos = socket.getaddrinfo(host, None)
@@ -470,20 +479,24 @@ def enrich(g, timeout: float = 8.0, workers: int = 8) -> int:
 
 
 def coverage() -> dict:
-    """predicate -> provider name (or None). Reads the engine's live vocabulary
+    """predicate -> provider name(s) (or None). Reads the engine's live vocabulary
     and the provider manifest, so it can't go stale. The name_suggests_* /
     publicly_discoverable predicates come from discovery itself, not a probe;
-    every predicate left with None is a gap — the next provider to build."""
+    every predicate left with None is a gap — the next provider to build.
+
+    A predicate may have MORE than one source (both port_scan and nvd establish
+    known_vulnerable_service); all owners are listed, comma-joined, so the map
+    never hides a contributor — that honesty is the whole point of the manifest."""
     from . import engine
-    owner: dict = {}
+    owners: dict[str, list[str]] = {}
     for name, preds in PROVIDES.items():
         for pred in preds:
-            owner.setdefault(pred, name)   # a predicate may have >1 source (scan + nvd both
-                                           # establish known_vulnerable_service); list the first.
+            owners.setdefault(pred, []).append(name)
     for pred in engine._PREDICATES:
         if pred.startswith("name_suggests_") or pred == "publicly_discoverable":
-            owner.setdefault(pred, "discovery")
-    return {pred: owner.get(pred) for pred in engine._PREDICATES}
+            owners.setdefault(pred, ["discovery"])
+    return {pred: ", ".join(owners[pred]) if owners.get(pred) else None
+            for pred in engine._PREDICATES}
 
 
 # --- KEV / public-exploit intelligence (version-gated) --------------------

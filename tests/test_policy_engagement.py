@@ -101,6 +101,28 @@ def test_engagement_reshapes_the_queue():
     assert top.rule == "admin_interface_exposed" and top.confidence == 45
 
 
+def test_engagement_state_fully_resets_between_runs():
+    """The reset discipline the CLI's pivot path relies on: a run WITHOUT a policy
+    must inherit NOTHING from a prior --policy run. Headers were the gap — installed
+    by apply(), never cleared — so program A's identity header ('X-Program: handle-A')
+    could ride onto program B's targets. Guard all three engagement globals together;
+    headers are the one this regression is about. No network."""
+    from argus import providers
+
+    p = policy.compile("Assets:\n*.acme-a.example\nRate: 2 requests/sec\n")
+    p.request_headers = {"X-Program": "handle-A"}
+    p.apply()                                    # what a --policy run installs
+    assert providers._ID_HEADERS == {"X-Program": "handle-A"}
+    assert providers._SCOPE is not None and providers._throttle.min_interval > 0
+
+    # exactly what cli._run's non-policy pivot path now does before the next run
+    providers.set_scope(None); providers.set_rate(); providers.set_headers()
+    assert providers._ID_HEADERS == {}, "stale ID header would leak onto the next target"
+    assert providers._SCOPE is None
+    assert providers._throttle.min_interval == 0.0
+
+
 if __name__ == "__main__":
     test_engagement_reshapes_the_queue()
+    test_engagement_state_fully_resets_between_runs()
     print("policy engagement behaviour: 3 programs -> 3 distinct ranked queues — passed")

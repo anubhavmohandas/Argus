@@ -49,8 +49,9 @@ These are load-bearing. Nothing ships that violates them.
 - **Pivot engine + entity graph** — RDAP/DNS/CT/IP correlation from one seed
   (domain, ip, username, phone, email), deduped into a scored graph.
 - **The Provider Contract** — every evidence source `@declares` exactly the
-  predicates it owns; `argus coverage` proves every engine predicate has a
-  provider and each is owned once. Currently **full coverage.**
+  predicates it owns; `argus coverage` proves every engine predicate has at least
+  one provider (a few, like `known_vulnerable_service`, have two — the static
+  catalog and the live NVD lookup — and both are listed). Currently **full coverage.**
 - **Providers live:** `http_probe` (internet-facing, tech, auth, missing
   headers, insecure cookie, clickjacking), `cors_probe`, `graphql_probe`,
   `admin_probe`, `exposure_probe`, `traversal_probe`, `port_scan`, `kev`,

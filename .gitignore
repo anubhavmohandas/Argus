@@ -4,6 +4,13 @@ Tools/
 # Any stray source zips (e.g. Shadowbroker-main.zip still at root)
 *.zip
 
+# Pasted bug-bounty program pages are runtime inputs, never repo fixtures.
+# Convention: name them *_program.txt and they stay untracked. This is narrow on
+# purpose — a bare `*.txt` also silently swallowed real docs (NOTES/CHANGELOG).
+# NOTE: a program page NOT named *_program.txt is NOT auto-ignored — keep the
+# suffix, or a real scope page (possibly sensitive) could be committed by accident.
+*_program.txt
+
 
 # Case files — argus/store.py writes here when ARGUS_HOME points inside the repo
 .argus/
@@ -24,5 +31,3 @@ dist/
 __pycache__/
 *.pyc
 .venv/
-
-*.txt

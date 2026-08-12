@@ -584,6 +584,9 @@ def _run(argv=None):
             providers.set_scope(None)
         if not pol:
             providers.set_rate(args.rate, args.max_requests)
+            providers.set_headers()   # clear ID headers a prior --policy run installed —
+                                      # same reset discipline as scope/rate, or program A's
+                                      # identity header leaks onto program B's targets
         try:
             ports = providers.parse_ports(args.ports) if (args.scan and args.ports) else None
         except ValueError as e:
