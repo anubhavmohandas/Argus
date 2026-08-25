@@ -55,7 +55,7 @@ _NR_MAP: list[tuple[tuple[str, ...], set[str]]] = [
     (("version disclosure", "banner grab", "banner-grab", "software version", "version banner"),
      {"version-disclosure"}),
     (("weak ssl", "weak tls", "ssl config", "tls config", "cipher"), {"weak-tls"}),
-    (("email spoof", "spf record", "dmarc", "dkim"), {"email_spoofable"}),
+    (("email spoof", "spf record", "dmarc", "dkim"), {"email_spoofing"}),
     (("self-xss", "self xss"), {"self-xss"}),
     (("csrf",), {"csrf"}),
     (("username enum", "user enumeration", "email enum", "account enum"), {"user-enum"}),

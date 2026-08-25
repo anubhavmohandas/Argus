@@ -110,7 +110,7 @@ _MODES = {
     "1": ("Passive", "public sources only — never touches the target", []),
     "2": ("Active", "+ probe hosts + live NVD CVEs & write-ups", ["--probe", "--cve"]),
     "3": ("Active+", "+ request admin & sensitive paths (.git/.env)", ["--probe-paths", "--cve"]),
-    "4": ("Full scan", "+ TCP port scan, service versions & live CVEs (loudest)", ["--scan", "--cve"]),
+    "4": ("Full scan", "+ TCP port scan, service versions & live CVEs (loudest)", ["--probe-paths", "--scan", "--cve"]),
 }
 # green → red: the colour itself tells you how loud the level is (safe → loudest)
 _MODE_COLOR = {"1": "38;2;80;220;120", "2": "38;2;230;200;60",

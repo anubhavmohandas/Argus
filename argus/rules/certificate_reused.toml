@@ -1,0 +1,28 @@
+# The per-host TLS probe only ever records a certificate fingerprint; only the
+# graph-wide analyzer can see the SAME fingerprint served by two or more hosts —
+# that comparison is what earns `certificate_reused`, never a single probe's
+# claim. A shared cert usually means shared infrastructure: the same origin or
+# load-balancer behind names that look unrelated, or hosts that were expected to
+# be isolated but aren't. That is a correlation LEAD for a hunter's infra map,
+# not itself a vulnerability — a wildcard cert legitimately covers many
+# subdomains — so this stays informational: high confidence (the SHA-256 match
+# is exact, not a guess), low severity (why two hosts share a cert is the
+# hunter's next step, not a claim Argus makes for them).
+id = "certificate_reused"
+name = "TLS certificate reused across hosts"
+description = "Two or more discovered hosts serve the identical TLS certificate fingerprint, indicating shared infrastructure worth correlating."
+base_confidence = 80
+tags = ["exposure", "recon", "infra-correlation"]
+version = 1
+
+[requires]
+certificate_reused = true
+publicly_discoverable = true
+
+[outputs]
+severity = "info"
+recommendation = [
+    "Confirm whether the shared certificate is an intentional wildcard/SAN, or unexpected shared infrastructure",
+    "If unexpected, map what else that origin serves — it may expose a host not meant to be reachable this way",
+]
+hypothesis = ["These hosts share a TLS origin or load-balancer, which may reveal infrastructure not otherwise discoverable"]

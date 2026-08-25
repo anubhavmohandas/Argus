@@ -122,7 +122,19 @@ def test_engagement_state_fully_resets_between_runs():
     assert providers._throttle.min_interval == 0.0
 
 
+def test_dmarc_exclusion_suppresses_the_real_rule():
+    # _NR_MAP's phrasing -> id must match the actual rule id ("email_spoofing"),
+    # not the predicate it reads ("email_spoofable") — a mismatch here means a
+    # program's explicit DMARC exclusion silently does nothing.
+    p = policy.compile("Assets:\n*.acme.example\nOut of scope:\n- DMARC / SPF record issues\n")
+    assert "email_spoofing" in p.non_reportable, p.non_reportable
+    c = Conclusion(rule="email_spoofing", name="x", target="acme.example", confidence=55,
+                   ledger={}, kind="risk", tags=["exposure", "email", "dmarc", "spoofing", "bug-bounty"])
+    assert p.is_reportable(c) is False, "program excluded DMARC findings — must be suppressed"
+
+
 if __name__ == "__main__":
     test_engagement_reshapes_the_queue()
     test_engagement_state_fully_resets_between_runs()
+    test_dmarc_exclusion_suppresses_the_real_rule()
     print("policy engagement behaviour: 3 programs -> 3 distinct ranked queues — passed")

@@ -335,6 +335,26 @@ def test_wayback_feeds_subdomains_same_as_crtsh():
     assert ("subdomain", "old.x.com") in vals, vals
 
 
+def test_interactive_menu_tiers_are_cumulative():
+    # each mode's description reads "+ ..." on top of the one before it, so its
+    # actual engagement (what run_one's `if probe or probe_paths` etc. will do)
+    # must be a superset too — not just its raw flag strings, since --probe-paths
+    # implies --probe by name but is a DIFFERENT string. Mode 4 used to be exactly
+    # this bug: ["--scan", "--cve"] alone, no --probe/--probe-paths, so "Full scan"
+    # silently never ran http_probe/admin_probe/exposure_probe at all.
+    from argus.cli import _MODES
+
+    def capability(flags):
+        probe_paths = "--probe-paths" in flags
+        return {"probe": "--probe" in flags or probe_paths, "probe_paths": probe_paths,
+                "scan": "--scan" in flags, "cve": "--cve" in flags}
+
+    for prev, cur in zip("123", "234"):
+        cp, cc = capability(_MODES[prev][2]), capability(_MODES[cur][2])
+        assert all(cc[k] or not cp[k] for k in cp), \
+            f"mode {cur} ({_MODES[cur][0]!r}) must engage at least as much as mode {prev} ({_MODES[prev][0]!r})"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

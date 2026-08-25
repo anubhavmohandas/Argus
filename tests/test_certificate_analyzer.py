@@ -54,6 +54,24 @@ def test_single_host_is_never_reuse():
     assert "certificate_reused" not in only.evidence
 
 
+def test_certificate_reused_fires_the_rule_through_the_unchanged_engine():
+    # mirror the KEV/port-scan tests: prove the evidence actually reaches a
+    # conclusion via the shipped rule — no engine or rule edit required.
+    g = Graph()
+    a = Entity("subdomain", "a.example.com", 1)
+    b = Entity("subdomain", "b.example.com", 1)
+    a.observed["cert_fingerprint"] = b.observed["cert_fingerprint"] = "SHARED"
+    g.add(a)
+    g.add(b)
+    providers.analyze_certificates(g)
+    conf = {c.rule: c for c in engine.investigate(g).conclusions if c.target == "a.example.com"}
+    assert "certificate_reused" in conf, "certificate_reused evidence must fire a rule"
+    c = conf["certificate_reused"]
+    assert c.severity == "info" and c.confidence == 80
+    assert any(chk.get("predicate") == "certificate_reused" and chk.get("met")
+               for chk in c.ledger["evidence"])
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
