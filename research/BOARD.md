@@ -100,6 +100,10 @@ Read the one thing, take it, close the tab.
 | Photon | Endpoint + secret extraction from crawl | queued |
 | theHarvester | Email/domain source aggregation | queued |
 | CT log parsers (certstream et al.) | Streaming CT ingest vs. crt.sh polling | queued |
+| Shodan (InternetDB) | Passive port/service data without Argus touching the target — a zero-engagement alternative feed alongside `port_scan`; free tier is IP-only, no query budget | queued |
+| Hunter.io | Domain → employee email format/pattern; a new pivot entity type (email) discovery doesn't have yet | queued |
+| S3BucketList | Bucket ACL probe (list/read/write) once a bucket URL is known — distinct from the existing `aws-s3` takeover fingerprint, which only detects *unclaimed* buckets | queued |
+| Hunter Verifier | Live/deliverable check for an address Hunter.io discovers — depends on the Hunter.io provider existing first, not independent | queued |
 
 ## Category C — Curiosity
 
@@ -119,6 +123,8 @@ Studied and reimplemented natively — see README → Attribution.
 | GhostTrack | — | IP geo/ASN, phone, username enumeration | Build: reimplemented + hardened (input validation) | pending backfill |
 | Shadowbroker | — | Recon-toolkit patterns | Build: rdap/dns, native | pending backfill |
 | pentest-ai-agents | — | Findings-DB schema | Adapt: schema only; SQLite deferred — see [ADR-004](DECISIONS.md) | pending backfill |
+| Wayback Machine (CDX API) | — | Archived-URL hostnames as a second passive subdomain source, free/no key | Build: `wayback` module, mirrors `subdomains` (crt.sh) exactly, same `_extract` branch | pending backfill |
+| Retire.js | — | Vulnerable-JS-library detection via `<script src>` version matching | Build: `vulnerable_js`/`scripts_from` in `providers.py`, folded into `http_probe` (zero extra requests) — shares `known_vulnerable_service` with `port_scan`/`nvd` | pending backfill |
 
 Pages are missing because these were studied before the board existed.
 Backfill is cheap and worth it — the *rejected* ideas are the part that

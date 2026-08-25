@@ -20,7 +20,7 @@ from .engine import ledger_lines
 
 # What modules to run for each entity type. Order = cheap/authoritative first.
 _PLAN: dict[str, list[str]] = {
-    "domain":    ["rdap", "dns", "subdomains"],
+    "domain":    ["rdap", "dns", "subdomains", "wayback"],
     "subdomain": ["dns"],
     "ip":        ["ip"],
     "username":  ["username"],
@@ -116,7 +116,7 @@ def _extract(finding: Finding) -> list[tuple[str, str, str]]:
         for ns in d.get("nameservers", []) or []:
             if ns:
                 out.append(("domain", str(ns).rstrip("."), "nameserver"))
-    elif m == "subdomains":
+    elif m in ("subdomains", "wayback"):
         for sub in d.get("subdomains", []) or []:
             out.append(("subdomain", sub, "subdomain_of"))
     elif m == "ip":
@@ -399,7 +399,7 @@ _REPRO = {
     "cors_misconfig": "Sent an arbitrary/null Origin; the server reflected it into Access-Control-Allow-Origin with Access-Control-Allow-Credentials: true.",
     "graphql_introspection": "POSTed a minimal introspection query; the server returned a live __schema result.",
     "subdomain_takeover": "The host served a vendor 'unclaimed name' page for a dangling DNS record — claimable by an attacker.",
-    "known_vulnerable_service": "An open service's banner reported a version that matches a catalogued/NVD CVE.",
+    "known_vulnerable_service": "An open service's banner or a client-side JS library reported a version that matches a catalogued/NVD CVE.",
     "has_admin_interface": "Reached an administrative path that answered as a real admin surface (auth challenge / admin-titled page), differing from this host's not-found shape.",
     "email_spoofable": "The domain publishes no enforced DMARC policy (absent or p=none), so From-header spoofing is not blocked.",
     "insecure_cookie": "A Set-Cookie shipped without the Secure/HttpOnly flags.",

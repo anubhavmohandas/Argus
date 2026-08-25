@@ -81,6 +81,7 @@ Strengths harvested from the source tools, reimplemented natively:
 | Module | Source | Does |
 |---|---|---|
 | `rdap` / `dns` / `subdomains` | Shadowbroker recon + Claude-OSINT arsenal | registrar/dates/NS · DoH A/MX/NS/TXT · crt.sh CT subdomain discovery |
+| `wayback` | Wayback Machine CDX API | archived-URL hostnames — a second passive subdomain source |
 | `ip` / `phone` / `username` | GhostTrack (hardened) | geo/ASN/ISP · carrier/region (offline) · social-platform enumeration |
 | `secrets` | Claude-OSINT 48-pattern catalog | credential/key leak scanning of a file or dir |
 
@@ -98,7 +99,7 @@ tier**, so you only send what you opt into:
 
 | Predicate(s) | Provider | Establishes |
 |---|---|---|
-| `internet_facing`, `technology`, `authentication_required`, `security_headers_missing`, `insecure_cookie`, `clickjacking`, `subdomain_takeover` | `http_probe` | everything a single `/` response reveals — reachability, tech fingerprint, auth gate, hardening headers, cookie flags, framability, and a dangling-DNS takeover fingerprint |
+| `internet_facing`, `technology`, `authentication_required`, `security_headers_missing`, `insecure_cookie`, `clickjacking`, `subdomain_takeover`, `known_vulnerable_service` | `http_probe` | everything a single `/` response reveals — reachability, tech fingerprint, auth gate, hardening headers, cookie flags, framability, a dangling-DNS takeover fingerprint, and a vulnerable client-side JS library version matched against a CVE catalog |
 | `certificate_reused` | `cert_analysis` | the same TLS cert served across unrelated hosts (analysis over the graph) |
 | `known_exploited`, `public_exploit` | `kev` | an observed product version matched against a known-exploited catalog |
 | `cors_misconfig` | `cors_probe` | a credentialed reflected-origin CORS grant (one extra GET) |
@@ -202,4 +203,7 @@ from [Shadowbroker](https://github.com/bigbodycobain/Shadowbroker) ·
 findings-DB schema from
 [pentest-ai-agents](https://github.com/0xSteph/pentest-ai-agents) · engine
 concept from [CAI](https://github.com/aliasrobotics/cai) · web-exposure evidence
-patterns from `owasp_scanner`.
+patterns from `owasp_scanner` · archived-URL subdomain discovery from the
+[Wayback Machine CDX API](https://archive.org/help/wayback_api.php) ·
+vulnerable-JS-library detection concept from
+[Retire.js](https://github.com/RetireJS/retire.js).

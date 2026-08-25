@@ -408,6 +408,77 @@ def version_from(headers: dict) -> str | None:
     return None
 
 
+# --- vulnerable client-side JS library match -------------------------------
+# Same move as the port scan's CVE catalog (below), applied to a different
+# observation: not a TCP banner, a <script src> URL in the page body the HTTP
+# probe already fetched. Zero extra requests — the body is already in hand,
+# the same free ride as takeover_service/is_framable above. occam: a static
+# demo catalog, same shape and same version-gated ceiling as _CVE_CATALOG.
+_JS_VULN_CATALOG = [
+    {"product": "jquery", "vulnerable_through": "3.4.0", "cve": "CVE-2020-11022",
+     "summary": "jQuery <3.5.0 htmlPrefilter allows XSS via untrusted HTML passed to .html()/.append()",
+     "severity": "medium", "known_exploited": False, "public_exploit": True},
+    {"product": "jquery", "vulnerable_through": "1.12.4", "cve": "CVE-2015-9251",
+     "summary": "jQuery <3.0.0 ajax() executes cross-domain responses regardless of declared content-type",
+     "severity": "medium", "known_exploited": False, "public_exploit": True},
+    {"product": "bootstrap", "vulnerable_through": "3.4.0", "cve": "CVE-2018-14041",
+     "summary": "Bootstrap <3.4.1/<4.1.2 tooltip/popover data-* attributes allow XSS",
+     "severity": "medium", "known_exploited": False, "public_exploit": True},
+    {"product": "angular", "vulnerable_through": "1.5.8", "cve": "CVE-2016-9066",
+     "summary": "AngularJS <1.5.9 expression sandbox bypass leading to XSS",
+     "severity": "high", "known_exploited": False, "public_exploit": True},
+    {"product": "lodash", "vulnerable_through": "4.17.15", "cve": "CVE-2020-8203",
+     "summary": "lodash <4.17.16 prototype pollution via defaultsDeep/zipObjectDeep/etc.",
+     "severity": "high", "known_exploited": False, "public_exploit": True},
+]
+
+_SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.I)
+# filename/path substring -> canonical product name in the catalog above.
+_JS_LIB_ALIASES = (("jquery", "jquery"), ("bootstrap", "bootstrap"),
+                   ("angular", "angular"), ("lodash", "lodash"))
+_JS_VER_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
+
+
+def scripts_from(body: str) -> list[str]:
+    """Pure: every <script src="..."> URL in a page body."""
+    return _SCRIPT_SRC_RE.findall(body or "")
+
+
+def parse_script_lib(src: str) -> tuple:
+    """Pure: a script URL -> (product, version) or (None, None).
+
+    occam: filename/path substring match + the first dotted version anywhere in
+    the URL — covers common CDN/bundle naming (jquery-3.4.0.min.js,
+    /libs/jquery/3.4.0/jquery.min.js, ?v=3.4.0). A library that doesn't put its
+    version in the URL needs a content-hash/comment probe — heavier, not
+    attempted here."""
+    low = src.lower()
+    for needle, canon in _JS_LIB_ALIASES:
+        if needle in low:
+            m = _JS_VER_RE.search(src)
+            return canon, (m.group(0) if m else None)
+    return None, None
+
+
+def vulnerable_js(scripts: list[str]) -> list[dict]:
+    """Pure: script URLs -> catalog CVE matches, version-gated (same honesty as
+    cve_matches — no version means no claim, I-1). Shaped identically to
+    cve_matches' output (product/version/cve/summary/severity/...) so it merges
+    straight into the same observed['cves'] list the dossier already renders."""
+    out = []
+    for src in scripts:
+        product, version = parse_script_lib(src)
+        if not product or not version:
+            continue
+        running = _ver_tuple(version)
+        if not running:
+            continue
+        for entry in _JS_VULN_CATALOG:
+            if entry["product"] == product and running <= _ver_tuple(entry["vulnerable_through"]):
+                out.append({"version": version, **entry})
+    return sorted(out, key=lambda e: e["cve"])
+
+
 # No has_admin_interface here — asserting it from `technology == "jenkins"` would
 # be the provider drawing a conclusion. That mapping is the rule engine's job
 # (see rules/jenkins_confirmed.toml). The predicate is earned by reaching an
@@ -433,7 +504,12 @@ def probe(host: str, timeout: float = 8.0) -> tuple[dict, dict]:
             svc = takeover_service(body)      # which service, for the dossier/NYX
             if svc:
                 observed["takeover_service"] = svc
-            return evidence_from(status, headers, body, scheme), observed
+            ev = evidence_from(status, headers, body, scheme)
+            js_cves = vulnerable_js(scripts_from(body))
+            if js_cves:
+                observed["cves"] = js_cves
+                ev["known_vulnerable_service"] = True
+            return ev, observed
     return {}, {}
 
 
@@ -457,7 +533,7 @@ def declares(name: str, provides):
 
 @declares("http_probe", ("internet_facing", "technology", "authentication_required",
                          "security_headers_missing", "insecure_cookie", "clickjacking",
-                         "subdomain_takeover"))
+                         "subdomain_takeover", "known_vulnerable_service"))
 def enrich(g, timeout: float = 8.0, workers: int = 8) -> int:
     """Attach probe evidence to every probeable node. Returns hosts reached.
 
@@ -474,7 +550,14 @@ def enrich(g, timeout: float = 8.0, workers: int = 8) -> int:
                 ent.evidence.update(ev)
                 reached += 1
             if obs:
+                # known_vulnerable_service has more than one owner (this probe's JS-library
+                # match, port_scan's banner match, live NVD) — merge into observed['cves']
+                # instead of a blind dict.update, so whichever provider runs first never
+                # clobbers what another already found on the same host.
+                cves = obs.pop("cves", None)
                 ent.observed.update(obs)
+                if cves:
+                    ent.observed["cves"] = ent.observed.get("cves", []) + cves
     return reached
 
 
@@ -1058,8 +1141,12 @@ def enrich_scan(g, ports=None, timeout: float = 4.0, workers: int = 8) -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         for ent, obs in zip(targets, ex.map(lambda e: scan_host(e.value, ports, timeout), targets)):
             if obs:
+                # merge, don't overwrite — http_probe's JS-library CVEs may already
+                # be sitting in observed['cves'] for this host (see enrich() above).
+                cves = obs.pop("cves", None)
                 ent.observed.update(obs)
-                if obs.get("cves"):
+                if cves:
+                    ent.observed["cves"] = ent.observed.get("cves", []) + cves
                     ent.evidence["known_vulnerable_service"] = True
                     vulnerable += 1
     return vulnerable

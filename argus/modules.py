@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import re
+import urllib.parse
 
 from .core import (
     CRITICAL, HIGH, MEDIUM, LOW, INFO,
@@ -243,3 +244,24 @@ def subdomains(domain: str):
                 names.add(n)
     yield Finding("subdomains", domain, f"{len(names)} unique subdomain(s)", LOW if names else INFO,
                   data={"subdomains": sorted(names)}, source="crt.sh")
+
+
+# ── wayback ───────────────────────────────────────────────────────────────
+@module("wayback", kind="domain", help="Passive subdomain discovery via archived URLs (Wayback CDX)")
+def wayback(domain: str):
+    # limit=5000: crt.sh has no such cap because its result set is bounded by
+    # actual certs issued; Wayback's is bounded by every URL ever crawled, which
+    # for a heavily-archived apex can be orders of magnitude larger.
+    data = http_json(
+        f"https://web.archive.org/cdx/search/cdx?url=*.{q(domain)}"
+        "&output=json&fl=original&collapse=urlkey&limit=5000", timeout=25.0)
+    if not data or len(data) < 2:
+        yield Finding("wayback", domain, "wayback returned nothing", INFO, source="web.archive.org")
+        return
+    names = set()
+    for row in data[1:]:                       # row 0 is the header ["original"]
+        host = (urllib.parse.urlsplit(row[0]).hostname or "").lower().rstrip(".")
+        if host.endswith(domain):
+            names.add(host)
+    yield Finding("wayback", domain, f"{len(names)} unique host(s) seen in archived URLs",
+                  LOW if names else INFO, data={"subdomains": sorted(names)}, source="web.archive.org")

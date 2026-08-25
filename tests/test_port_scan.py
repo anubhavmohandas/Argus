@@ -125,6 +125,53 @@ def test_enrich_scan_writes_only_observed_and_evidence(monkeypatch=None):
     assert g.nodes["username:someone"].evidence == {}, "non-probeable host left untouched"
 
 
+def test_scripts_from_and_parse_script_lib():
+    body = '<head><script src="/libs/jquery-3.4.0.min.js"></script>' \
+           '<script src="https://cdn.x.com/bootstrap.bundle.min.js?v=3.4.0"></script>' \
+           '<script src="/app.js"></script></head>'
+    scripts = providers.scripts_from(body)
+    assert scripts == ["/libs/jquery-3.4.0.min.js",
+                        "https://cdn.x.com/bootstrap.bundle.min.js?v=3.4.0", "/app.js"]
+    assert providers.parse_script_lib("/libs/jquery-3.4.0.min.js") == ("jquery", "3.4.0")
+    assert providers.parse_script_lib("bootstrap.bundle.min.js?v=3.4.0") == ("bootstrap", "3.4.0")
+    assert providers.parse_script_lib("/app.js") == (None, None)          # unknown library
+    assert providers.parse_script_lib("/jquery.min.js") == ("jquery", None)  # no version in URL
+
+
+def test_vulnerable_js_is_version_gated_and_deterministic():
+    hits = providers.vulnerable_js(["/libs/jquery-3.4.0.min.js"])
+    assert [h["cve"] for h in hits] == ["CVE-2020-11022"]
+    assert hits[0]["product"] == "jquery" and hits[0]["version"] == "3.4.0"
+    # patched version, unknown library, or no version in the URL -> nothing (I-1)
+    assert providers.vulnerable_js(["/libs/jquery-3.6.0.min.js"]) == []
+    assert providers.vulnerable_js(["/app.js"]) == []
+    assert providers.vulnerable_js(["/jquery.min.js"]) == []
+    assert providers.vulnerable_js([]) == []
+
+
+def test_js_cves_merge_with_scan_cves_instead_of_clobbering():
+    # http_probe and port_scan both write observed['cves']; whichever runs
+    # second must APPEND, never overwrite what the other already found.
+    g = Graph()
+    g.add(Entity("subdomain", "app.example.com", 1))
+    real_probe, real_scan = providers.probe, providers.scan_host
+    providers.probe = lambda host, timeout=8.0: (
+        ({"internet_facing": True}, {"cves": [{"product": "jquery", "version": "3.4.0",
+                                                "cve": "CVE-2020-11022", "severity": "medium"}]})
+        if host == "app.example.com" else ({}, {}))
+    providers.scan_host = lambda host, ports=None, timeout=4.0: (
+        {"open_ports": [443], "cves": [{"port": 443, "product": "nginx", "version": "1.0.0",
+                                        "cve": "CVE-9999-0001", "severity": "high"}]}
+        if host == "app.example.com" else {})
+    try:
+        providers.enrich(g)
+        providers.enrich_scan(g)
+    finally:
+        providers.probe, providers.scan_host = real_probe, real_scan
+    cves = {c["cve"] for c in g.nodes["subdomain:app.example.com"].observed["cves"]}
+    assert cves == {"CVE-2020-11022", "CVE-9999-0001"}, cves   # both present, neither lost
+
+
 def test_tcp_connect_obeys_the_request_budget():
     # A TCP connect is outbound engagement, so it honours the same politeness
     # budget as HTTP. Offline: budget 0 => _probe_port returns before it ever

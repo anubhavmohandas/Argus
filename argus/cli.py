@@ -254,6 +254,7 @@ def interactive() -> int:
 _STEP_LABEL = {
     "rdap": "registrar / RDAP", "dns": "DNS records (A/AAAA/MX/NS/TXT)",
     "subdomains": "subdomains via crt.sh — slow, up to ~25s", "ip": "IP geo / ASN",
+    "wayback": "archived-URL hosts via Wayback CDX — slow, up to ~25s",
     "username": "social-profile enumeration", "phone": "phone intel",
 }
 

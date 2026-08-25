@@ -318,6 +318,23 @@ def test_apex_not_readded_as_subdomain():
     assert ("subdomain", "dev.x.com") in vals          # a real subdomain is still kept
 
 
+def test_wayback_feeds_subdomains_same_as_crtsh():
+    # wayback shares _extract's "subdomains" branch by module-name check, not a
+    # separate code path — this proves that wiring actually fires.
+    import importlib
+    P = importlib.import_module("argus.pivot")
+    real = P.run_module
+    P.run_module = lambda mod, val: (
+        [Finding("wayback", val, "wb", core.LOW,
+                 data={"subdomains": [f"old.{val}"]})] if mod == "wayback" else [])
+    try:
+        g = pivot("x.com", Budget(max_depth=1, max_entities=10))
+    finally:
+        P.run_module = real
+    vals = [(e.type, e.value) for e in g.nodes.values()]
+    assert ("subdomain", "old.x.com") in vals, vals
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
