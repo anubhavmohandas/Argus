@@ -36,6 +36,28 @@ cd web/frontend && npm install && npm run build   # emits web/frontend/dist
 cd ../.. && python3 web/server.py                 # serves UI + API on :8787
 ```
 
+### Docker (self-contained)
+
+Builds the frontend and bundles it with the engine in one image. Build from the
+**repo root** so the `argus/` package is in the build context:
+
+```bash
+docker build -f web/Dockerfile -t argus-web .
+docker run --rm -p 8787:8787 -e GITHUB_TOKEN=ghp_xxx argus-web
+# open http://127.0.0.1:8787
+```
+
+Or with compose:
+
+```bash
+GITHUB_TOKEN=ghp_xxx docker compose -f web/docker-compose.yml up --build
+```
+
+`git` is installed in the image (the `github_org` module needs it). The `phone`
+module's optional `phonenumbers` dependency is not installed — add it if needed.
+The container binds `0.0.0.0` inside, mapped to `127.0.0.1:8787` on the host by
+default; active engagement tiers still require authorization in the UI.
+
 Open http://127.0.0.1:8787.
 
 ## Engagement levels

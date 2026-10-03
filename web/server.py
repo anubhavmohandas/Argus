@@ -55,6 +55,13 @@ LEVELS: dict[str, list[str]] = {
     "full":        ["--probe-paths", "--scan", "--cve"],# + TCP port scan (loudest)
 }
 
+# Modules exposed to the UI (run via `argus run <name> <target>`), allowlisted
+# on purpose — the UI cannot run an arbitrary module name. Grouped so the UI can
+# render a "secret recon" panel and a "utility" panel separately.
+SECRET_MODULES = {"postman_dork", "github_dork", "github_org", "jsmap"}
+UTILITY_MODULES = {"ip", "phone", "username", "secrets", "dns", "rdap", "subdomains", "wayback"}
+ALLOWED_MODULES = SECRET_MODULES | UTILITY_MODULES
+
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js":   "application/javascript; charset=utf-8",
@@ -179,6 +186,63 @@ def _run_stream(seed: str, level: str, opts: dict):
     yield "done", {"returncode": proc.returncode, "ts": time.time()}
 
 
+def _run_module_stream(name: str, target: str):
+    """SSE generator for `argus run <module> <target> --json` (a findings array)."""
+    if name not in ALLOWED_MODULES:
+        yield "error", {"message": f"unknown or disallowed module: {name!r}"}
+        return
+    try:
+        seed = _sanitize_seed(target)
+    except ValueError as e:
+        yield "error", {"message": str(e)}
+        return
+    argv = [sys.executable, "-m", "argus", "run", name, seed, "--json"]
+    yield "start", {"module": name, "target": seed, "ts": time.time()}
+
+    env = dict(os.environ)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    try:
+        proc = subprocess.Popen(argv, cwd=str(REPO_ROOT), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=env, bufsize=1)
+    except OSError as e:
+        yield "error", {"message": f"failed to launch engine: {e}"}
+        return
+
+    q: "queue.Queue[tuple[str, str]]" = queue.Queue()
+
+    def _pump(stream, tag):
+        for line in iter(stream.readline, ""):
+            q.put((tag, line.rstrip("\n")))
+        stream.close()
+        q.put((tag, None))
+
+    threading.Thread(target=_pump, args=(proc.stdout, "out"), daemon=True).start()
+    threading.Thread(target=_pump, args=(proc.stderr, "err"), daemon=True).start()
+
+    stdout_buf: list[str] = []
+    done = 0
+    while done < 2:
+        tag, line = q.get()
+        if line is None:
+            done += 1
+            continue
+        if tag == "err":
+            if line.strip():
+                yield "status", {"line": line}
+        else:
+            stdout_buf.append(line)
+
+    proc.wait()
+    raw = "\n".join(stdout_buf).strip()
+    try:
+        findings = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        yield "error", {"message": "could not parse engine JSON output", "raw": raw[:2000]}
+        return
+    yield "result", {"findings": findings}
+    yield "done", {"returncode": proc.returncode, "ts": time.time()}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ArgusWeb/0.1"
 
@@ -204,7 +268,10 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path == "/api/health":
-            self._send_json({"ok": True, "levels": list(LEVELS)})
+            self._send_json({"ok": True, "levels": list(LEVELS),
+                             "modules": sorted(SECRET_MODULES),
+                             "utility_modules": sorted(UTILITY_MODULES),
+                             "github_token": bool(os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"))})
             return
 
         if path == "/api/stream":
@@ -232,6 +299,23 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse_event(event, data)
             except (BrokenPipeError, ConnectionResetError):
                 pass  # client navigated away
+            return
+
+        if path == "/api/module":
+            qs = parse_qs(parsed.query)
+            name = qs.get("name", [""])[0]
+            target = qs.get("target", [""])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                for event, data in _run_module_stream(name, target):
+                    self._sse_event(event, data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
 
         # otherwise: static frontend

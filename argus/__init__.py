@@ -5,6 +5,7 @@ pivot engine. Add modules in modules.py (or a new file imported here) and
 they auto-register into core.MODULES.
 """
 from . import core, modules  # noqa: F401  (import registers the modules)
+from . import github_recon, postman_recon, js_recon, github_org  # noqa: F401 (register recon modules)
 from .pivot import pivot, dossier, Budget, Graph, classify  # noqa: F401
 from .core import Finding, run_module, run_all, MODULES  # noqa: F401
 

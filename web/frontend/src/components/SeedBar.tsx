@@ -1,6 +1,25 @@
 import { useState } from "react";
 import type { EngagementLevel, RunState } from "../types";
 
+function NumOpt({
+  label, value, set, disabled, w,
+}: { label: string; value: string; set: (v: string) => void; disabled: boolean; w: number }) {
+  return (
+    <label className="flex items-center gap-1.5 text-mute">
+      {label}
+      <input
+        type="number"
+        value={value}
+        onChange={(e) => set(e.target.value)}
+        disabled={disabled}
+        style={{ width: w * 8 }}
+        className="bg-base border border-edge rounded px-2 py-1 text-ink
+                   focus:outline-none focus:border-accent/50"
+      />
+    </label>
+  );
+}
+
 const LEVELS: { id: EngagementLevel; label: string; hint: string; loud: boolean }[] = [
   { id: "passive", label: "Passive", hint: "public sources only · never touches target", loud: false },
   { id: "active", label: "Active", hint: "probe hosts + live CVEs", loud: true },
@@ -8,20 +27,43 @@ const LEVELS: { id: EngagementLevel; label: string; hint: string; loud: boolean 
   { id: "full", label: "Full scan", hint: "+ TCP port scan (loudest)", loud: true },
 ];
 
-interface Props {
-  state: RunState;
-  onRun: (seed: string, level: EngagementLevel) => void;
-  onStop: () => void;
+export interface PivotOptions {
+  depth?: number;
+  max?: number;
+  deep?: number;
+  ports?: string;
 }
 
-export default function SeedBar({ state, onRun, onStop }: Props) {
+interface Props {
+  state: RunState;
+  onRun: (seed: string, level: EngagementLevel, opts: PivotOptions) => void;
+  onStop: () => void;
+  onSeedChange?: (seed: string) => void;
+}
+
+export default function SeedBar({ state, onRun, onStop, onSeedChange }: Props) {
   const [seed, setSeed] = useState("");
   const [level, setLevel] = useState<EngagementLevel>("passive");
   const [ack, setAck] = useState(false);
+  const [showOpts, setShowOpts] = useState(false);
+  const [depth, setDepth] = useState("2");
+  const [max, setMax] = useState("40");
+  const [deep, setDeep] = useState("0");
+  const [ports, setPorts] = useState("");
 
   const running = state === "running";
   const loud = LEVELS.find((l) => l.id === level)?.loud ?? false;
   const canRun = seed.trim().length > 0 && (!loud || ack) && !running;
+
+  const opts = (): PivotOptions => {
+    const o: PivotOptions = {};
+    if (depth.trim()) o.depth = Number(depth);
+    if (max.trim()) o.max = Number(max);
+    if (deep.trim()) o.deep = Number(deep);
+    if (ports.trim()) o.ports = ports.trim();
+    return o;
+  };
+  const fire = () => canRun && onRun(seed.trim(), level, opts());
 
   return (
     <div className="border-b border-edge bg-panel/80 backdrop-blur px-5 py-4">
@@ -32,9 +74,12 @@ export default function SeedBar({ state, onRun, onStop }: Props) {
         </div>
         <input
           value={seed}
-          onChange={(e) => setSeed(e.target.value)}
+          onChange={(e) => {
+            setSeed(e.target.value);
+            onSeedChange?.(e.target.value.trim());
+          }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && canRun) onRun(seed.trim(), level);
+            if (e.key === "Enter") fire();
           }}
           placeholder="seed — domain, ip, email, username, or phone"
           disabled={running}
@@ -51,7 +96,7 @@ export default function SeedBar({ state, onRun, onStop }: Props) {
           </button>
         ) : (
           <button
-            onClick={() => canRun && onRun(seed.trim(), level)}
+            onClick={fire}
             disabled={!canRun}
             className="px-6 py-2.5 rounded-lg bg-accent text-base font-semibold text-sm
                        disabled:opacity-35 disabled:cursor-not-allowed hover:bg-accent/90"
@@ -85,7 +130,34 @@ export default function SeedBar({ state, onRun, onStop }: Props) {
         <span className="text-xs text-mute ml-1">
           {LEVELS.find((l) => l.id === level)?.hint}
         </span>
+        <button
+          onClick={() => setShowOpts((s) => !s)}
+          disabled={running}
+          className="ml-auto text-xs font-mono text-mute hover:text-ink"
+        >
+          {showOpts ? "− options" : "+ options"}
+        </button>
       </div>
+
+      {showOpts && (
+        <div className="flex flex-wrap items-center gap-3 mt-3 text-xs font-mono">
+          <NumOpt label="depth" value={depth} set={setDepth} disabled={running} w={12} />
+          <NumOpt label="max" value={max} set={setMax} disabled={running} w={14} />
+          <NumOpt label="deep" value={deep} set={setDeep} disabled={running} w={12} />
+          <label className="flex items-center gap-1.5 text-mute">
+            ports
+            <input
+              value={ports}
+              onChange={(e) => setPorts(e.target.value)}
+              disabled={running}
+              placeholder="1-1024 or 22,80,443"
+              className="w-40 bg-base border border-edge rounded px-2 py-1 text-ink
+                         placeholder:text-mute/50 focus:outline-none focus:border-accent/50"
+            />
+          </label>
+          <span className="text-mute/60">ports apply only at Full scan</span>
+        </div>
+      )}
 
       {loud && !running && (
         <label className="flex items-start gap-2 mt-3 text-xs text-high/90 cursor-pointer select-none">

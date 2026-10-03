@@ -82,11 +82,19 @@ export function normalize(raw: RawResult): Dossier {
   const nodes = (g.nodes ?? []).map(normNode);
   const edges = (g.edges ?? []).map((e) => ({ src: e.src, rel: e.rel, dst: e.dst }));
   const conclusions = raw.investigation?.conclusions ?? [];
-  // Prefer scored conclusions; fall back to raw module observations.
+  const rawFindings = g.findings ?? [];
+  // Scored conclusions are the dossier. But some modules (secrets, github_dork)
+  // yield high-severity findings directly, outside the predicate/rule path — those
+  // must still surface, so merge in any non-info raw finding alongside conclusions.
   const findings: Finding[] =
     conclusions.length > 0
-      ? conclusions.map(conclusionToFinding)
-      : (g.findings ?? []).map(rawFindingToFinding);
+      ? [
+          ...conclusions.map(conclusionToFinding),
+          ...rawFindings
+            .filter((f) => f.severity && f.severity !== "info")
+            .map(rawFindingToFinding),
+        ]
+      : rawFindings.map(rawFindingToFinding);
   return {
     nodes,
     edges,
@@ -153,7 +161,62 @@ export function runPivot(
   return () => es.close();
 }
 
-export async function health(): Promise<{ ok: boolean; levels: string[] }> {
+export async function health(): Promise<{
+  ok: boolean;
+  levels: string[];
+  modules?: string[];
+  utility_modules?: string[];
+  github_token?: boolean;
+}> {
   const r = await fetch("/api/health");
   return r.json();
+}
+
+export interface ModuleCallbacks {
+  onStatus?: (line: string) => void;
+  onResult?: (findings: Finding[]) => void;
+  onError?: (message: string) => void;
+  onDone?: () => void;
+}
+
+/** Run a single secret-recon module (`argus run <name> <target> --json`). */
+export function runModule(
+  name: string,
+  target: string,
+  cb: ModuleCallbacks
+): () => void {
+  const params = new URLSearchParams({ name, target });
+  const es = new EventSource(`/api/module?${params.toString()}`);
+
+  es.addEventListener("status", (e) => {
+    try {
+      cb.onStatus?.(JSON.parse((e as MessageEvent).data).line);
+    } catch {
+      /* ignore */
+    }
+  });
+  es.addEventListener("result", (e) => {
+    try {
+      const raw = JSON.parse((e as MessageEvent).data).findings as RawFinding[];
+      cb.onResult?.((raw ?? []).map(rawFindingToFinding));
+    } catch {
+      cb.onError?.("could not parse module result");
+    }
+  });
+  es.addEventListener("error", (e) => {
+    const data = (e as MessageEvent).data;
+    if (data) {
+      try {
+        cb.onError?.(JSON.parse(data).message);
+      } catch {
+        cb.onError?.("stream error");
+      }
+    }
+  });
+  es.addEventListener("done", () => {
+    cb.onDone?.();
+    es.close();
+  });
+
+  return () => es.close();
 }

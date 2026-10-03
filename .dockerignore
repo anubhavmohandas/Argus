@@ -1,0 +1,18 @@
+# Build context is the repo root (docker build -f web/Dockerfile .).
+# Keep the context small: the image only needs argus/ + web/.
+.git
+.venv
+.pytest_cache
+**/__pycache__
+**/*.pyc
+web/frontend/node_modules
+web/frontend/dist
+oculus
+Tools
+research
+docs
+tests
+*.zip
+*_program.txt
+.DS_Store
+**/.DS_Store

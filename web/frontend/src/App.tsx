@@ -2,11 +2,15 @@ import { useCallback, useRef, useState } from "react";
 import type { Dossier, EngagementLevel, GraphNode, RunState } from "./types";
 import { runPivot } from "./api";
 import SeedBar from "./components/SeedBar";
+import type { PivotOptions } from "./components/SeedBar";
 import RunProgress from "./components/RunProgress";
 import StatBar from "./components/StatBar";
 import EntityGraph from "./components/EntityGraph";
 import FindingsList from "./components/FindingsList";
 import NodePanel from "./components/NodePanel";
+import SecretRecon from "./components/SecretRecon";
+import ModuleRunner from "./components/ModuleRunner";
+import { downloadReport } from "./lib";
 
 export default function App() {
   const [state, setState] = useState<RunState>("idle");
@@ -15,20 +19,22 @@ export default function App() {
   const [dossier, setDossier] = useState<Dossier | null>(null);
   const [selected, setSelected] = useState<GraphNode | null>(null);
   const [meta, setMeta] = useState<{ seed: string; level: string } | null>(null);
+  const [seed, setSeed] = useState("");
   const abortRef = useRef<(() => void) | null>(null);
 
-  const onRun = useCallback((seed: string, level: EngagementLevel) => {
+  const onRun = useCallback((seed: string, level: EngagementLevel, opts: PivotOptions) => {
     setState("running");
     setLog([]);
     setError(null);
     setDossier(null);
     setSelected(null);
+    setSeed(seed);
     setMeta({ seed, level });
 
     abortRef.current = runPivot(
       seed,
       level,
-      {},
+      opts,
       {
         onStatus: (line) => setLog((l) => [...l, line]),
         onResult: (d) => setDossier(d),
@@ -49,7 +55,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col">
-      <SeedBar state={state} onRun={onRun} onStop={onStop} />
+      <SeedBar state={state} onRun={onRun} onStop={onStop} onSeedChange={setSeed} />
 
       <main className="flex-1 max-w-[1400px] w-full mx-auto px-5 py-5 flex flex-col gap-5">
         {meta && (
@@ -60,6 +66,10 @@ export default function App() {
         )}
 
         <RunProgress state={state} log={log} error={error} />
+
+        <SecretRecon seed={seed} />
+
+        <ModuleRunner />
 
         {!dossier && state === "idle" && (
           <EmptyState />
@@ -76,8 +86,16 @@ export default function App() {
                 )}
               </div>
               <div className="lg:sticky lg:top-5">
-                <div className="text-xs font-mono text-mute mb-2">
-                  findings · {dossier.findings.length}
+                <div className="flex items-center justify-between mb-2">
+                  <div className="text-xs font-mono text-mute">
+                    findings · {dossier.findings.length}
+                  </div>
+                  <button
+                    onClick={() => downloadReport(dossier, meta?.seed ?? "argus")}
+                    className="text-xs font-mono text-accent hover:underline"
+                  >
+                    export .md
+                  </button>
                 </div>
                 <div className="max-h-[calc(100vh-180px)]">
                   <FindingsList dossier={dossier} />

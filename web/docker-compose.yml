@@ -1,0 +1,17 @@
+# Convenience wrapper for the Argus web stack.
+#   docker compose -f web/docker-compose.yml up --build
+#   open http://127.0.0.1:8787
+#
+# GITHUB_TOKEN is read from the host env (or a .env file next to this one) and
+# passed to the container so the github_dork / github_org modules work.
+services:
+  argus-web:
+    build:
+      context: ..            # repo root, so the argus/ package is in scope
+      dockerfile: web/Dockerfile
+    image: argus-web
+    ports:
+      - "127.0.0.1:8787:8787"   # localhost only by default
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    restart: unless-stopped
