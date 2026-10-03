@@ -74,6 +74,26 @@ discovered hosts for evidence; `--probe-paths` also requests admin/sensitive
 paths; `--scan` adds a TCP port scan. Everything past passive is **active** — the
 menu makes you confirm you're authorized before it sends a single request.
 
+## Web UI
+
+A browser frontend over the same engine — seed bar with engagement-level
+selector, live run log, the entity graph, and the findings dossier. The server
+(`web/server.py`) is **stdlib-only** and spawns the `argus` CLI; it reimplements
+no recon logic.
+
+```bash
+docker compose -f web/docker-compose.yml up --build   # → http://127.0.0.1:8787
+```
+
+Dev (hot reload) and build details: [`web/README.md`](web/README.md). The
+container image also ships to GHCR on each `v*` tag — see
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+> The original Go implementation (backend + its own frontend) lives in
+> [`oculus/`](oculus/) — self-contained and excluded from the Argus web build.
+> Its unique urlscan intel was ported into the Python engine; it is kept as the
+> reference implementation.
+
 ## Modules (the fuel)
 
 Strengths harvested from the source tools, reimplemented natively:
@@ -84,6 +104,7 @@ Strengths harvested from the source tools, reimplemented natively:
 | `wayback` | Wayback Machine CDX API | archived-URL hostnames — a second passive subdomain source |
 | `ip` / `phone` / `username` | GhostTrack (hardened) | geo/ASN/ISP · carrier/region (offline) · social-platform enumeration |
 | `secrets` | Claude-OSINT 48-pattern catalog | credential/key leak scanning of a file or dir |
+| `github_dork` / `github_org` / `postman_dork` / `jsmap` | Kongsec methodology | **passive secret-recon** — leaked credentials that reference a target domain, found in public GitHub code + commit history, public Postman workspaces, and archived JS bundles; all run through the shared [`triage`](argus/triage.py) 48-pattern + entropy filter and redacted. `github_dork` / `github_org` need `GITHUB_TOKEN` (code-search requires auth); each stays passive w.r.t. the target — it queries the third-party index, never the target itself |
 
 Add a module: write a `@module(...)`-decorated function in
 [`argus/modules.py`](argus/modules.py) that yields `Finding`s. It
