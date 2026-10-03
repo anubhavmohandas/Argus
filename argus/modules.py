@@ -265,3 +265,53 @@ def wayback(domain: str):
             names.add(host)
     yield Finding("wayback", domain, f"{len(names)} unique host(s) seen in archived URLs",
                   LOW if names else INFO, data={"subdomains": sorted(names)}, source="web.archive.org")
+
+
+# ── urlscan ─────────────────────────────────────────────────────────────────
+# Best-of-both merge: this is the one genuinely-unique capability the old oculus
+# (Go) stack had that Argus lacked — passive URL/host intel + free screenshots
+# from urlscan.io's public DB. Ported here as a native module so it flows through
+# the pivot graph and the web UI like any other. The oculus screenshotter needed
+# a headless-Chrome dependency; urlscan hands back a screenshot URL for nothing,
+# so no browser dep enters Argus. Brand/logo *reasoning* (oculus' OpenAI calls)
+# is deliberately NOT ported — Argus collects, NYX reasons.
+def _parse_urlscan(data, domain: str) -> dict:
+    """Pull hosts/IPs/screenshots out of a urlscan.io search response.
+    Pure (no network) so it is unit-testable on a synthetic payload."""
+    results = (data or {}).get("results", []) or []
+    subs, ips, pages = set(), set(), []
+    for r in results[:100]:
+        page = r.get("page", {}) or {}
+        host = str(page.get("domain", "")).strip().strip(".").lower()
+        ip = str(page.get("ip", "")).strip()
+        if host and (host == domain or host.endswith("." + domain)):
+            subs.add(host)
+        if ip:
+            ips.add(ip)
+        uid = r.get("_id") or ""
+        shot = r.get("screenshot") or (f"https://urlscan.io/screenshots/{uid}.png" if uid else "")
+        pages.append({
+            "url": page.get("url"), "domain": host or None, "ip": ip or None,
+            "server": page.get("server"), "asn": page.get("asnname"),
+            "screenshot": shot or None,
+            "result": r.get("result") or (f"https://urlscan.io/result/{uid}/" if uid else None),
+        })
+    total = (data or {}).get("total")
+    return {"subdomains": sorted(subs), "ips": sorted(ips), "pages": pages,
+            "total": total if isinstance(total, int) else len(results)}
+
+
+@module("urlscan", kind="domain", help="Passive URL/host intel + screenshots via urlscan.io (no key)")
+def urlscan(domain: str):
+    # occam: keyless public search (rate-limited to a few req/min). If you hit
+    # 429s, add an API-Key header in core.http_get and a URLSCAN_API_KEY env read.
+    data = http_json(f"https://urlscan.io/api/v1/search/?q={q('domain:' + domain)}&size=100", timeout=20.0)
+    if data is None:
+        yield Finding("urlscan", domain, "urlscan.io returned nothing", INFO, source="urlscan.io")
+        return
+    p = _parse_urlscan(data, domain)
+    yield Finding(
+        "urlscan", domain,
+        f"{p['total']} urlscan submission(s) · {len(p['subdomains'])} host(s), {len(p['ips'])} IP(s)",
+        LOW if p["total"] else INFO, data=p, source="urlscan.io",
+    )

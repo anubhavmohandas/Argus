@@ -20,7 +20,7 @@ from .engine import ledger_lines
 
 # What modules to run for each entity type. Order = cheap/authoritative first.
 _PLAN: dict[str, list[str]] = {
-    "domain":    ["rdap", "dns", "subdomains", "wayback"],
+    "domain":    ["rdap", "dns", "subdomains", "wayback", "urlscan"],
     "subdomain": ["dns"],
     "ip":        ["ip"],
     "username":  ["username"],
@@ -116,7 +116,7 @@ def _extract(finding: Finding) -> list[tuple[str, str, str]]:
         for ns in d.get("nameservers", []) or []:
             if ns:
                 out.append(("domain", str(ns).rstrip("."), "nameserver"))
-    elif m in ("subdomains", "wayback"):
+    elif m in ("subdomains", "wayback", "urlscan"):
         for sub in d.get("subdomains", []) or []:
             out.append(("subdomain", sub, "subdomain_of"))
     elif m == "ip":
