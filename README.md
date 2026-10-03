@@ -228,3 +228,7 @@ patterns from `owasp_scanner` · archived-URL subdomain discovery from the
 [Wayback Machine CDX API](https://archive.org/help/wayback_api.php) ·
 vulnerable-JS-library detection concept from
 [Retire.js](https://github.com/RetireJS/retire.js).
+
+---
+
+<p align="center">created with ❤️ by Anubhav</p>
