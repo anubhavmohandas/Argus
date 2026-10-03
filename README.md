@@ -9,6 +9,47 @@ That pivot loop is the point. Individual lookups are a commodity; the
 engine that chains them and correlates the results is the thing that's
 hard to deny.
 
+## How Argus thinks
+
+```mermaid
+flowchart TD
+    SEED["🌱 One seed<br/>domain · ip · email · username · phone"] --> CLASS{classify}
+
+    CLASS --> PIVOT
+
+    subgraph DISCOVER["① DISCOVERY — the pivot loop (passive)"]
+        direction TB
+        PIVOT["pivot ↻ bounded BFS"] --> SRC["RDAP · DNS · crt.sh CT · Wayback<br/>GitHub · Postman · JS bundles · username/ip"]
+        SRC -->|new entities feed back in| PIVOT
+    end
+
+    DISCOVER --> GRAPH[("② ENTITY GRAPH<br/>domains · subdomains · IPs · users<br/>deduped, linked")]
+
+    GRAPH --> PROBE
+
+    subgraph EVIDENCE["③ EVIDENCE — opt-in tiers (active)"]
+        direction TB
+        PROBE["--probe → http/tls/cert/kev/cors/dmarc<br/>--probe-paths → admin/.git/traversal/xss/ssti<br/>--scan → port scan + service-CVE"]
+    end
+
+    EVIDENCE --> ENGINE
+
+    subgraph REASON["④ INVESTIGATOR RULE ENGINE — read-only"]
+        direction TB
+        ENGINE["declarative TOML rules<br/>predicates → conclusions + evidence ledger"]
+    end
+
+    REASON --> OUT["📄 SCORED DOSSIER / JSON<br/>severity · confidence · evidence · hypothesis"]
+
+    style SEED fill:#2d6cdf,color:#fff
+    style GRAPH fill:#1f8a4c,color:#fff
+    style OUT fill:#b4531f,color:#fff
+```
+
+**One seed in → a connected, scored intelligence brief out.** Discovery grows
+the graph; the rule engine reasons over it read-only. Everything past the
+passive tier is opt-in and makes you confirm authorization first.
+
 ```
 argus pivot example.com
 ```
