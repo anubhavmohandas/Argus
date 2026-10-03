@@ -23,6 +23,9 @@ build/
 dist/
 *.egg-info/
 
+# Smoke-test / worker logs (oculus/work-smoke-*.log etc.)
+*.log
+
 # macOS + Python noise
 .DS_Store
 *.jpeg
