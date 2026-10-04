@@ -35,6 +35,7 @@ global out-of-scope section. Extend `_NR_MAP` as new rule ids land.
 """
 from __future__ import annotations
 
+import enum
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -153,6 +154,80 @@ class Asset:
     network: bool = True     # False = hardware/firmware/product name; never enters host scope
 
 
+# --- the authorization gate: can_test(...) --------------------------------
+# The one decision every ACTIVE action routes through. Deterministic on purpose:
+# NYX (or any caller) may *propose* a technique against a host, but this function
+# alone decides whether it is executable. No model, no network, same inputs ->
+# same verdict — so enforcement can never be argued down by an LLM (the spec's
+# hard rule: AI proposes, ARGUS disposes).
+class Verdict(enum.Enum):
+    ALLOW = "ALLOW"
+    ALLOW_WITH_LIMITS = "ALLOW_WITH_LIMITS"
+    HUMAN_APPROVAL = "HUMAN_APPROVAL"
+    DENY = "DENY"
+
+
+@dataclass(frozen=True)
+class Decision:
+    verdict: Verdict
+    reason: str
+    technique: str = ""
+    host: str = ""
+    limits: dict | None = None    # for ALLOW_WITH_LIMITS: the clamp the executor must honour
+
+    @property
+    def allowed(self) -> bool:
+        """True iff a worker may execute now (no human needed). ALLOW_WITH_LIMITS
+        is allowed — the caller must apply `.limits`; HUMAN_APPROVAL/DENY are not."""
+        return self.verdict in (Verdict.ALLOW, Verdict.ALLOW_WITH_LIMITS)
+
+
+# Technique registry: id -> (is_active, risk). PASSIVE techniques are scope-exempt
+# public-record lookups (DNS/CT/RDAP — see scope.py) and are never gated. An
+# unknown id is treated as DENY (fail-closed): the system cannot bound-execute
+# what it cannot classify. Add a row here when a new execution capability lands.
+_TECHNIQUES: dict[str, tuple[bool, str]] = {
+    "passive_lookup":             (False, "none"),
+    "http_probe":                 (True,  "low"),
+    "tls_probe":                  (True,  "low"),
+    "cert_probe":                 (True,  "low"),
+    "header_probe":               (True,  "low"),
+    "cors_probe":                 (True,  "low"),
+    "path_probe":                 (True,  "medium"),   # admin/.git/traversal discovery
+    "injection_probe":            (True,  "medium"),   # reflected xss/ssti canary (non-destructive)
+    "port_scan":                  (True,  "medium"),
+    "differential_same_account":  (True,  "medium"),   # baseline vs mutation, one identity
+    "differential_cross_account": (True,  "high"),     # reach identity A's object as identity B
+    "state_change":               (True,  "high"),     # any write / mutation
+    "mass_enumeration":           (True,  "high"),     # id sweeps, credential spray
+    "persistence":                (True,  "high"),
+}
+
+# Program-forbidden prose (lowercased substring) -> technique ids it prohibits.
+# policy.forbidden was captured but never enforced; this is what gives it teeth.
+# Phrases are specific on purpose (no bare "dos" — it hides in "dossier").
+_FORBIDDEN_MAP: list[tuple[tuple[str, ...], set[str]]] = [
+    (("automated scan", "automated tool", "scanner", "autoscan", "vulnerability scan"),
+        {"port_scan", "path_probe", "injection_probe"}),
+    (("brute force", "brute-force", "bruteforce", "credential stuffing", "password spray"),
+        {"mass_enumeration"}),
+    (("enumerat",), {"mass_enumeration"}),
+    (("denial of service", "ddos", "dos attack", "load test", "stress test", "fuzz"),
+        {"port_scan", "mass_enumeration", "injection_probe"}),
+]
+
+
+def _forbids(forbidden: list[str], technique: str) -> str | None:
+    """The verbatim forbidden entry that bans `technique`, or None. So a DENY can
+    quote the program's own words back ('program forbids this: "No automated scanning"')."""
+    for entry in forbidden:
+        low = entry.lower()
+        for phrases, techs in _FORBIDDEN_MAP:
+            if technique in techs and any(p in low for p in phrases):
+                return entry
+    return None
+
+
 @dataclass
 class EngagementPolicy:
     scope: scope_mod.Scope
@@ -176,6 +251,7 @@ class EngagementPolicy:
         literal '<your-username>' identifies nobody; `unfilled_headers()` says so."""
         from . import providers   # lazy: avoid import cycle at module load
         providers.set_scope(self.scope)
+        providers.set_policy(self)   # arms the engagement gate: _permitted now enforces action_for + fail-closed
         providers.set_rate(self.rate_per_sec, self.max_requests)
         hdrs = {k: v for k, v in self.request_headers.items() if not _is_placeholder(v)}
         if self.user_agent:
@@ -204,6 +280,73 @@ class EngagementPolicy:
             if _host_in_pattern(host, a.pattern):
                 return a.action
         return "active"
+
+    def _scope_defined(self) -> bool:
+        """Has the operator declared any engagement at all? An empty scope allows
+        everything (scope.py's only-exclusions rule), which is fail-OPEN — so for
+        active execution, 'no scope' means 'no authorization', not 'test the world'."""
+        return bool(self.scope.include_patterns() or self.scope.exclude_patterns())
+
+    def host_permitted(self, host: str) -> bool:
+        """Host-level subset of `can_test`, shared with the provider backstop
+        (`providers._permitted`). May an active technique touch this host at all?
+        False for undefined scope (fail-closed), out-of-scope/do-not-touch, or a
+        passive-only asset. Technique-specific rules (forbidden, high-risk) are
+        can_test's job; this is the last-line gate that needs no technique."""
+        return self._scope_defined() and self.action_for(host) == "active"
+
+    def can_test(self, host: str, technique: str,
+                 intensity: float = 1.0, account=None) -> Decision:
+        """THE authorization gate. Deterministic verdict for one (host, technique).
+
+        `intensity` = requests/sec the task intends (clamped against the program
+        rate). For a cross-account technique, `account` is the identity whose object
+        is being targeted (the potential victim); it must expose `.researcher_owned`
+        — True only when that object belongs to the researcher's own test account, so
+        a cross-account test never reaches a real user's data without human approval.
+        Evaluated top-down, first match wins; every non-ALLOW quotes why so the audit
+        trail is self-explaining."""
+        spec = _TECHNIQUES.get(technique)
+        if spec is None:
+            return Decision(Verdict.DENY,
+                            f"unknown technique {technique!r} — register it before execution",
+                            technique, host)
+        active, risk = spec
+        if not active:
+            return Decision(Verdict.ALLOW, "passive public lookup — scope-exempt", technique, host)
+        if not self._scope_defined():
+            return Decision(Verdict.DENY, "no scope defined — active execution fail-closed",
+                            technique, host)
+        if self.action_for(host) == "none":
+            return Decision(Verdict.DENY, "host out of scope or marked do-not-touch", technique, host)
+        banned = _forbids(self.forbidden, technique)
+        if banned:
+            return Decision(Verdict.DENY, f"program forbids this technique: {banned!r}", technique, host)
+        if self.action_for(host) == "passive":
+            return Decision(Verdict.DENY, "asset is passive-only; active technique denied", technique, host)
+        if risk == "high":
+            if technique == "differential_cross_account" and getattr(account, "researcher_owned", False):
+                return self._with_limits(
+                    "cross-account test between researcher-owned identities (one owned object only)",
+                    technique, host, intensity, extra={"single_object": True})
+            return Decision(Verdict.HUMAN_APPROVAL,
+                            f"high-risk technique {technique!r} requires explicit human authorization",
+                            technique, host)
+        return self._with_limits("within scope and permitted", technique, host, intensity)
+
+    def _with_limits(self, reason, technique, host, intensity, extra=None) -> Decision:
+        """ALLOW, or ALLOW_WITH_LIMITS when the program caps rate/budget or the
+        technique carries an intrinsic bound (`extra`). The clamp is advisory data
+        the executor must apply — the throttle enforces rate/budget independently."""
+        limits = dict(extra or {})
+        if self.rate_per_sec is not None and intensity > self.rate_per_sec:
+            limits["rate_per_sec"] = self.rate_per_sec
+        if self.max_requests is not None:
+            limits["max_requests"] = self.max_requests
+        if limits:
+            return Decision(Verdict.ALLOW_WITH_LIMITS, reason + " (clamped to program limits)",
+                            technique, host, limits)
+        return Decision(Verdict.ALLOW, reason, technique, host)
 
     def filter(self, result: InvestigationResult) -> tuple[InvestigationResult, list]:
         """Apply the engagement contract to a fresh investigation:

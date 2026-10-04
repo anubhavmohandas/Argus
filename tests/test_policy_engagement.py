@@ -114,11 +114,13 @@ def test_engagement_state_fully_resets_between_runs():
     p.apply()                                    # what a --policy run installs
     assert providers._ID_HEADERS == {"X-Program": "handle-A"}
     assert providers._SCOPE is not None and providers._throttle.min_interval > 0
+    assert providers._POLICY is p               # apply() now ARMS the gate too
 
     # exactly what cli._run's non-policy pivot path now does before the next run
-    providers.set_scope(None); providers.set_rate(); providers.set_headers()
+    providers.set_policy(None); providers.set_scope(None); providers.set_rate(); providers.set_headers()
     assert providers._ID_HEADERS == {}, "stale ID header would leak onto the next target"
     assert providers._SCOPE is None
+    assert providers._POLICY is None, "stale policy would govern _permitted on the next target"
     assert providers._throttle.min_interval == 0.0
 
 

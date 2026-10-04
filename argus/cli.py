@@ -589,6 +589,8 @@ def _run(argv=None):
         else:
             providers.set_scope(None)
         if not pol:
+            providers.set_policy(None)   # disarm a prior --policy run's gate (stale policy would
+                                         # otherwise govern _permitted instead of this run's scope)
             providers.set_rate(args.rate, args.max_requests)
             providers.set_headers()   # clear ID headers a prior --policy run installed —
                                       # same reset discipline as scope/rate, or program A's

@@ -187,12 +187,35 @@ def _resolvable_and_global(host: str) -> bool:
 # when a scope file is loaded). Every ACTIVE probe asks `_permitted` instead of
 # the raw SSRF guard, so a scope is honoured everywhere at once, by construction.
 _SCOPE = None   # a scope.Scope, or None for "no scope loaded => SSRF is the only gate"
+_POLICY = None  # an EngagementPolicy once apply()d: ARMS the gate (action_for + fail-closed)
 
 
 def set_scope(scope) -> None:
     """Install (or clear, with None) the engagement scope every probe honours."""
     global _SCOPE
     _SCOPE = scope
+
+
+def set_policy(policy) -> None:
+    """Arm (or disarm, with None) the full engagement gate. When armed, `_permitted`
+    enforces the policy's host-level decision (scope + per-asset action + fail-closed
+    on undefined scope), not just the raw scope allowlist. The technique-aware
+    verdict (forbidden / high-risk / approval) is `policy.can_test`, which the
+    orchestrator calls before dispatch; this is the provider-layer backstop no probe
+    can bypass."""
+    global _POLICY
+    _POLICY = policy
+
+
+def reset_engagement() -> None:
+    """Clear every engagement global at once — scope, policy, rate/budget, headers —
+    so a run inherits NOTHING from a prior --policy run. One call because the leaks
+    here come from forgetting one global (a stale ID header, now a stale policy);
+    there is no safe partial reset."""
+    set_scope(None)
+    set_policy(None)
+    set_rate()
+    set_headers()
 
 
 # Programs mandate an identification header ("X-HackerOne: <handle>",
@@ -209,10 +232,18 @@ def set_headers(headers: dict | None = None) -> None:
 
 
 def _permitted(host: str) -> bool:
-    """May a provider connect to `host`? In scope (if one is set) AND globally
-    routable. Passive discovery/analysis providers don't ask this — scope gates
-    engagement with the target, not public-record lookups (see scope.py)."""
-    if _SCOPE is not None and not _SCOPE.allows(host):
+    """May a provider connect to `host`? Engagement gate AND globally routable.
+    Passive discovery/analysis providers don't ask this — scope gates engagement
+    with the target, not public-record lookups (see scope.py).
+
+    When a full policy is armed (`set_policy`), the host decision is the policy's
+    (`host_permitted`: scope + per-asset action + fail-closed on undefined scope).
+    With only a bare scope installed, the legacy allowlist applies. SSRF
+    (`_resolvable_and_global`) always wins — it can never be policy-disabled."""
+    if _POLICY is not None:
+        if not _POLICY.host_permitted(host):
+            return False
+    elif _SCOPE is not None and not _SCOPE.allows(host):
         return False
     return _resolvable_and_global(host)
 
