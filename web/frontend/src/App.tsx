@@ -10,6 +10,7 @@ import FindingsList from "./components/FindingsList";
 import NodePanel from "./components/NodePanel";
 import SecretRecon from "./components/SecretRecon";
 import ModuleRunner from "./components/ModuleRunner";
+import ProgramScope from "./components/ProgramScope";
 import { downloadReport } from "./lib";
 
 export default function App() {
@@ -66,6 +67,8 @@ export default function App() {
         )}
 
         <RunProgress state={state} log={log} error={error} />
+
+        <ProgramScope />
 
         <SecretRecon seed={seed} />
 

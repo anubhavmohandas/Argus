@@ -263,6 +263,36 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload.encode("utf-8"))
         self.wfile.flush()
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/policy":
+            self._send_json({"error": "not found"}, code=404)
+            return
+        # Compile a pasted program page into the engagement contract. Pure parse —
+        # deterministic, no network, touches no target — so it is safe to accept a body.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 1_000_000:          # 1 MB cap; a program page is a few KB
+            self._send_json({"error": "program text must be 1 byte - 1 MB"}, code=400)
+            return
+        text = self.rfile.read(length).decode("utf-8", "replace")
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "argus", "policy", "inspect", "-", "--json"],
+                cwd=str(REPO_ROOT), input=text, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self._send_json({"error": f"compile failed: {e}"}, code=500)
+            return
+        if proc.returncode != 0:
+            self._send_json({"error": proc.stderr.strip() or "compile failed"}, code=500)
+            return
+        try:
+            self._send_json(json.loads(proc.stdout))
+        except json.JSONDecodeError:
+            self._send_json({"error": "could not parse compiler output"}, code=500)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path

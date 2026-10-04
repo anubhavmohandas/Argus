@@ -161,6 +161,19 @@ export function runPivot(
   return () => es.close();
 }
 
+/** Compile a pasted bug-bounty program page into the engagement contract.
+ * Pure parse on the server (no target traffic) — scope / out-of-scope / exclusions. */
+export async function compilePolicy(text: string): Promise<import("./types").Policy> {
+  const r = await fetch("/api/policy", {
+    method: "POST",
+    headers: { "Content-Type": "text/plain" },
+    body: text,
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || "compile failed");
+  return data as import("./types").Policy;
+}
+
 export async function health(): Promise<{
   ok: boolean;
   levels: string[];

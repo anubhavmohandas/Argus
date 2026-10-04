@@ -138,3 +138,40 @@ if __name__ == "__main__":
     test_engagement_state_fully_resets_between_runs()
     test_dmarc_exclusion_suppresses_the_real_rule()
     print("policy engagement behaviour: 3 programs -> 3 distinct ranked queues — passed")
+
+
+def test_to_dict_serializes_the_contract():
+    """The JSON surface the web UI consumes mirrors the compiled policy: in/out scope
+    split correctly, exclusions mapped, and the scope file round-trips through load()."""
+    p = policy.compile(
+        "In scope:\n"
+        "app.acme.example\n"
+        "*.dev.acme.example\n"
+        "Out of scope:\n"
+        "corp.acme.example\n"
+        "- Missing security headers\n"
+        "Interesting targets:\n"
+        "- IDOR / broken access control\n"
+        "Automated tooling max. 3 requests /sec\n"
+    )
+    d = p.to_dict()
+    patterns = {a["pattern"] for a in d["in_scope"]}
+    assert "app.acme.example" in patterns and "*.dev.acme.example" in patterns
+    assert d["out_of_scope"] == ["corp.acme.example"]
+    assert "missing_security_headers" in d["suppresses"]
+    assert d["rate_per_sec"] == 3.0
+    assert any("access" in o or "idor" in o for o in d["objectives"])
+
+    # the emitted scope file must parse back to an equivalent scope
+    import io, tempfile, os
+    fd, path = tempfile.mkstemp(suffix=".scope")
+    try:
+        os.write(fd, d["scope_file"].encode())
+        os.close(fd)
+        from argus import scope as scope_mod
+        s = scope_mod.load(path)
+        assert s.allows("app.acme.example")
+        assert s.allows("x.dev.acme.example")
+        assert not s.allows("corp.acme.example")
+    finally:
+        os.unlink(path)

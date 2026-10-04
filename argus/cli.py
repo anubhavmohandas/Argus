@@ -442,8 +442,9 @@ def _run(argv=None):
     # `inspect` is the only verb today; optional so `argus policy FILE` also works.
     po.add_argument("verb", nargs="?", choices=["inspect"], default="inspect",
                     help="inspect: print the compiled contract (default)")
-    po.add_argument("file", help="text file containing the pasted program page")
+    po.add_argument("file", help="text file containing the pasted program page ('-' = read stdin)")
     po.add_argument("--all", action="store_true", help="print every entry instead of the first 12 per list")
+    po.add_argument("--json", action="store_true", help="emit the compiled contract as JSON (structured, for the web UI / piping)")
 
     pg = sub.add_parser("program", help="Compile a program page, then pivot every concrete in-scope host in tier order under one shared request budget")
     pg.add_argument("file", help="text file containing the pasted program page")
@@ -474,11 +475,15 @@ def _run(argv=None):
 
     if args.cmd == "policy":
         try:
-            text = Path(args.file).read_text()
+            text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text()
         except OSError as e:
             print(f"error: cannot read policy file {args.file!r}: {e}", file=sys.stderr)
             return 2
-        print(policy.compile(text).summary(limit=0 if args.all else 12))
+        pol = policy.compile(text)
+        if args.json:
+            print(json.dumps(pol.to_dict()))
+        else:
+            print(pol.summary(limit=0 if args.all else 12))
         return 0
 
     if args.cmd == "program":

@@ -228,6 +228,36 @@ class EngagementPolicy:
         risks.sort(key=lambda c: "objective" not in c.tags)   # False(0) = matched sorts first
         return InvestigationResult(risks + rest, result.fingerprint, result.error), suppressed
 
+    def to_dict(self) -> dict:
+        """The compiled contract as JSON-serializable data — the structured form of
+        `summary()`, for the web UI / any non-terminal consumer. Pure view over the
+        already-parsed policy; computes nothing new."""
+        asset = {a.pattern: a for a in self.assets}
+
+        def detail(pat: str) -> dict:
+            a = asset.get(pat)
+            return {"pattern": pat,
+                    "env": a.env if a else "",
+                    "tier": a.tier if a else None,
+                    "action": a.action if a else "active"}
+
+        return {
+            "in_scope": [detail(p) for p in self.scope.include_patterns()],
+            "out_of_scope": self.scope.exclude_patterns(),
+            "non_network_assets": [a.pattern for a in self.assets if not a.network],
+            "rate_per_sec": self.rate_per_sec,
+            "max_requests": self.max_requests,
+            "user_agent": self.user_agent,
+            "request_headers": self.request_headers,
+            "unfilled_headers": self.unfilled_headers(),
+            "forbidden": self.forbidden,
+            "non_reportable_labels": self.non_reportable_labels,
+            "suppresses": sorted(self.non_reportable),
+            "objectives": self.objectives,
+            "warnings": self.warnings,
+            "scope_file": self.scope.as_file_text(),
+        }
+
     def summary(self, limit: int = 12) -> str:
         """The engagement contract, human-readable — echoed before an investigation.
         Long lists are capped at `limit` entries with an explicit "+N more" so the

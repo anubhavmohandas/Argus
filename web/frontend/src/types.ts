@@ -89,3 +89,27 @@ export interface Dossier {
 }
 
 export type RunState = "idle" | "running" | "done" | "error";
+
+// ---- engagement policy (compiled from a pasted program page) ----
+export interface PolicyAsset {
+  pattern: string;
+  env: string;
+  tier: number | null;
+  action: string; // "active" | "passive" | "none"
+}
+export interface Policy {
+  in_scope: PolicyAsset[];
+  out_of_scope: string[];
+  non_network_assets: string[];
+  rate_per_sec: number | null;
+  max_requests: number | null;
+  user_agent: string;
+  request_headers: Record<string, string>;
+  unfilled_headers: string[];
+  forbidden: string[];
+  non_reportable_labels: string[];
+  suppresses: string[];
+  objectives: string[];
+  warnings: string[];
+  scope_file: string;
+}

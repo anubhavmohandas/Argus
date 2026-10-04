@@ -37,6 +37,20 @@ class Scope:
         self._inc_dom, self._inc_net = _split(include)
         self._exc_dom, self._exc_net = _split(exclude)
 
+    def include_patterns(self) -> list[str]:
+        """The in-scope entries, as they would appear in a scope file."""
+        return self._inc_dom + [_net_str(n) for n in self._inc_net]
+
+    def exclude_patterns(self) -> list[str]:
+        """The out-of-scope entries (without the leading `!`)."""
+        return self._exc_dom + [_net_str(n) for n in self._exc_net]
+
+    def as_file_text(self) -> str:
+        """Render this scope back to the scope-file format `load()` reads, so a
+        compiled program can be saved and fed straight back in via `--scope`."""
+        lines = self.include_patterns() + ["!" + e for e in self.exclude_patterns()]
+        return "\n".join(lines) + ("\n" if lines else "")
+
     def allows(self, host: str) -> bool:
         """Is `host` (a domain, subdomain, or IP string) in scope to be touched?"""
         host = (host or "").strip().lower().rstrip(".")
@@ -70,6 +84,11 @@ def load(path: str) -> Scope:
 
 
 # --- matching internals ---------------------------------------------------
+def _net_str(net) -> str:
+    """An ip_network back to a scope-file token: a bare IP for a single host, CIDR otherwise."""
+    return str(net.network_address) if net.num_addresses == 1 else str(net)
+
+
 def _as_net(entry: str):
     """entry -> an ip_network if it is one, else None. A bare IP becomes a /32|/128."""
     try:
