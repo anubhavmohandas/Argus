@@ -203,6 +203,25 @@ _TECHNIQUES: dict[str, tuple[bool, str]] = {
     "persistence":                (True,  "high"),
 }
 
+# The engagement-level capability classes (Slice 4). Derived from `_TECHNIQUES`, not a
+# second list to drift: PASSIVE touches no target (scope-exempt, collect directly),
+# ACTIVE is bounded target interaction (must pass can_test), ACTIVE_HIGH_RISK adds a
+# human-gated boundary (approval, never auto-executed on the legacy path).
+CAPABILITY_CLASSES = ("PASSIVE", "ACTIVE", "ACTIVE_HIGH_RISK")
+
+
+def classify(technique: str) -> str:
+    """PASSIVE / ACTIVE / ACTIVE_HIGH_RISK for a technique — the single taxonomy the
+    orchestrator, legacy gate, and UI share. Unknown techniques are ACTIVE_HIGH_RISK:
+    an unclassified capability is treated as the most-restricted, never the safest."""
+    spec = _TECHNIQUES.get(technique)
+    if spec is None:
+        return "ACTIVE_HIGH_RISK"
+    active, risk = spec
+    if not active:
+        return "PASSIVE"
+    return "ACTIVE_HIGH_RISK" if risk == "high" else "ACTIVE"
+
 # Program-forbidden prose (lowercased substring) -> technique ids it prohibits.
 # policy.forbidden was captured but never enforced; this is what gives it teeth.
 # Phrases are specific on purpose (no bare "dos" — it hides in "dossier").
