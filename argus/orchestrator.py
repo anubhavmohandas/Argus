@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
-from .campaign import Experiment, Observation
+from .campaign import Experiment, Observation, _now
 from .policy import Verdict
 
 # Task lifecycle. Closed vocab: a typo can't invent a state that skips the gate.
@@ -73,6 +73,46 @@ class Orchestrator:
         self.budget = budget_requests          # None = unbounded
         self.max_attempts = max_attempts
         self.workers: dict[str, callable] = dict(_DEFAULT_WORKERS)
+        self._started_at = ""                  # set on first proposal
+        self._last_completed = ""              # id of the last EVALUATED task
+
+    # --- progress: a snapshot derived from the task table (no new store) ---
+    def progress(self) -> dict:
+        """Current work-unit snapshot, computed from the in-memory task table. This is the
+        model the operator UI's live progress bar consumes: `percentage` is verified work
+        (completed/planned) and never time-based, `state` drives the heartbeat animation.
+        occam: derived on read from `self.tasks`, the one table the loop already maintains —
+        no parallel counters to drift out of sync."""
+        tasks = list(self.tasks.values())
+        n = lambda s: sum(1 for t in tasks if t.state == s)
+        planned = len(tasks)
+        completed, running, queued = n("EVALUATED"), n("RUNNING"), n("QUEUED")
+        blocked, denied, failed = n("APPROVAL_REQUIRED"), n("DENIED"), n("FAILED")
+        cur = next((t for t in tasks if t.state == "RUNNING"), None)
+        if running:
+            state = "RUNNING"
+        elif queued:
+            state = "WAITING"
+        elif blocked:
+            state = "BLOCKED"
+        elif planned and (completed + denied + failed) == planned:
+            state = "COMPLETE"
+        else:
+            state = "IDLE"
+        return {
+            "campaign_id": self.c.id, "source": "orchestrator", "state": state,
+            "planned": planned, "completed": completed, "running": running,
+            "queued": queued, "blocked": blocked, "denied": denied, "failed": failed,
+            "queue_depth": queued,
+            "percentage": round(100 * completed / planned) if planned else 0,
+            "current_task": cur.id if cur else "",
+            "current_technique": cur.technique if cur else "",
+            "last_completed": self._last_completed,
+            "started_at": self._started_at, "updated_at": _now(),
+        }
+
+    def _snapshot(self) -> None:
+        self.c.save_progress(self.progress())
 
     def register_worker(self, technique: str, fn) -> None:
         """Bind a technique to an ARGUS capability. NYX can add a worker; it cannot
@@ -84,9 +124,11 @@ class Orchestrator:
         """Accept a proposed task and immediately run it through the gate. The task
         is queued, denied, or parked for approval — it never auto-executes here."""
         self.tasks[task.id] = task
+        self._started_at = self._started_at or _now()
         self.c.audit("task_proposed", task=task.id, technique=task.technique,
                      host=task.host, hypothesis=task.hypothesis)
         self._authorize(task)
+        self._snapshot()
         return task
 
     def _authorize(self, task: Task) -> None:
@@ -111,6 +153,7 @@ class Orchestrator:
             raise ValueError(f"policy denies {task_id} regardless of approval: {d.reason}")
         t.state = "QUEUED"
         self.c.audit("human_approved", task=task_id, by=by)
+        self._snapshot()
         return t
 
     def pending_approvals(self) -> list[Task]:
@@ -138,14 +181,17 @@ class Orchestrator:
         if worker is None:
             t.state = "FAILED"
             self.c.audit("no_worker", task=t.id, technique=t.technique)
+            self._snapshot()
             return t
         t.state, t.attempts = "RUNNING", t.attempts + 1
+        self._snapshot()                        # UI sees "currently executing" this task
         try:
             result = worker(t, self.c)
         except Exception as e:                  # noqa: BLE001 — a worker fault must not kill the loop
             t.state = "QUEUED" if t.attempts < self.max_attempts else "FAILED"
             self.c.audit("task_retry" if t.state == "QUEUED" else "task_failed",
                          task=t.id, error=str(e), attempt=t.attempts)
+            self._snapshot()
             return t
         if self.budget is not None:
             self.budget -= 1
@@ -165,8 +211,10 @@ class Orchestrator:
             if obs_dict is not None:
                 self.c.save_observation(Observation(experiment_id=exp.id, **obs_dict))
         t.state = "EVALUATED"
+        self._last_completed = t.id
         self.c.audit("experiment_recorded", task=t.id, experiment=t.experiment_id,
                      classification=classification or "")
+        self._snapshot()
         return t
 
     def run(self, max_steps: int = 1000) -> int:

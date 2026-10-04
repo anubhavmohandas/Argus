@@ -156,6 +156,38 @@ class Campaign:
     def observations(self) -> list[dict]:
         return _load_all(self.dir / "observations")
 
+    # --- progress: one durable snapshot the operator UI can poll -----------
+    def save_progress(self, snapshot: dict) -> None:
+        """Persist the orchestrator's work-unit snapshot so a separate process (the web
+        API) can read live campaign progress. Owner-only, overwritten each tick — this is
+        a cache of in-memory loop state, not an audit record (the audit log is the trail)."""
+        _write_private(self.dir / "progress.json", snapshot)
+
+    def progress(self) -> dict:
+        """Current progress. Prefers the orchestrator's durable snapshot; when none exists
+        (campaign never run through the orchestrator, or only via the direct differential
+        path) falls back to counts DERIVED from persisted experiments — honest about which,
+        via the `source` field, so the UI never shows a fabricated percentage."""
+        p = self.dir / "progress.json"
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except (OSError, ValueError):
+                pass
+        exps = self.experiments()
+        total = len(exps)
+        done = sum(1 for e in exps if e.get("status") in ("EVALUATED", "COMPLETED"))
+        failed = sum(1 for e in exps if e.get("status") == "FAILED")
+        return {
+            "campaign_id": self.id, "source": "derived",
+            "state": "COMPLETE" if total and done + failed == total else "IDLE",
+            "planned": total, "completed": done, "running": 0, "queued": 0,
+            "blocked": 0, "denied": 0, "failed": failed, "queue_depth": 0,
+            "percentage": round(100 * done / total) if total else 0,
+            "current_task": "", "current_technique": "", "last_completed": "",
+            "started_at": self.created_at, "updated_at": _now(),
+        }
+
     def _persist(self) -> None:
         _write_private(self.dir / "campaign.json",
                        {"id": self.id, "program_text": self.program_text,

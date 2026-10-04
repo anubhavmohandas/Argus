@@ -243,6 +243,55 @@ def _run_module_stream(name: str, target: str):
     yield "done", {"returncode": proc.returncode, "ts": time.time()}
 
 
+# --- control-plane read layer --------------------------------------------
+# The campaign/finding modules persist everything under $ARGUS_HOME as owner-only
+# JSON; these helpers READ that durable state and shape it for the UI. They import
+# the domain modules directly (no subprocess) because this path touches no target,
+# runs no provider, and never calls can_test — it only reports what already happened.
+# Anything that triggers active work still goes through the CLI/orchestrator gate.
+def _domain():
+    """Import the argus control-plane modules, ensuring the repo root is importable
+    when this file is run directly as `python3 web/server.py` (cwd would be web/)."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from argus import campaign as campaign_mod, finding as finding_mod
+    return campaign_mod, finding_mod
+
+
+def _campaigns_summary() -> list[dict]:
+    campaign_mod, _ = _domain()
+    out = []
+    for cid in campaign_mod.listing():
+        try:
+            c = campaign_mod.load(cid)
+        except (OSError, ValueError, KeyError):
+            continue
+        out.append({"id": c.id, "created_at": c.created_at, "progress": c.progress()})
+    return out
+
+
+def _campaign_detail(cid: str) -> dict | None:
+    """Full read model for one campaign, or None if `cid` isn't a known campaign.
+    cid is validated against the authoritative listing — it is NEVER interpolated
+    into a path before that check, so a traversal id ('../x') cannot escape the
+    campaigns root."""
+    campaign_mod, finding_mod = _domain()
+    if cid not in set(campaign_mod.listing()):
+        return None
+    c = campaign_mod.load(cid)
+    return {
+        "id": c.id,
+        "created_at": c.created_at,
+        "program_text": c.program_text,
+        "policy": c.policy.to_dict(),
+        "progress": c.progress(),
+        "experiments": c.experiments(),
+        "observations": c.observations(),
+        "findings": finding_mod.findings(c),
+        "audit": c.audit_trail()[-200:],      # tail; full trail is on disk
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ArgusWeb/0.1"
 
@@ -346,6 +395,29 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse_event(event, data)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            return
+
+        if path == "/api/campaigns":
+            try:
+                self._send_json({"campaigns": _campaigns_summary()})
+            except Exception as e:                      # noqa: BLE001 — read path, report not crash
+                self._send_json({"error": f"could not list campaigns: {e}"}, code=500)
+            return
+
+        if path == "/api/campaign":
+            cid = parse_qs(parsed.query).get("id", [""])[0]
+            if not cid:
+                self._send_json({"error": "missing campaign id"}, code=400)
+                return
+            try:
+                detail = _campaign_detail(cid)
+            except Exception as e:                      # noqa: BLE001
+                self._send_json({"error": f"could not load campaign: {e}"}, code=500)
+                return
+            if detail is None:
+                self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+                return
+            self._send_json(detail)
             return
 
         # otherwise: static frontend
