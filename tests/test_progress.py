@@ -41,14 +41,15 @@ def test_orchestrator_progress_is_verified_work_not_time():
 
         p = orch.progress()
         assert p["planned"] == 3
-        assert p["queued"] == 1 and p["denied"] == 1 and p["blocked"] == 1
+        assert p["queued"] == 1 and p["denied"] == 1 and p["approval_required"] == 1
+        assert p["blocked"] == 0                                  # no dependency-blocked tasks
         assert p["percentage"] == 0 and p["completed"] == 0      # nothing verified yet
         assert p["state"] == "WAITING"
 
         orch.run()
         p = orch.progress()
         assert p["completed"] == 1 and p["percentage"] == 33     # 1 of 3 verified
-        assert p["state"] == "BLOCKED"                           # risky task still parked
+        assert p["state"] == "BLOCKED"                           # risky task still awaiting approval
         assert p["last_completed"] == allowed.id
 
         # durable: a *separate* load (as the web API does) sees the same snapshot

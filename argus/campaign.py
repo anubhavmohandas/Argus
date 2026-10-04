@@ -120,6 +120,8 @@ class Campaign:
         d = _root() / self.id
         (d / "experiments").mkdir(parents=True, exist_ok=True)
         (d / "observations").mkdir(parents=True, exist_ok=True)
+        (d / "tasks").mkdir(parents=True, exist_ok=True)
+        (d / "approvals").mkdir(parents=True, exist_ok=True)
         d.chmod(0o700)
         return d
 
@@ -155,6 +157,26 @@ class Campaign:
 
     def observations(self) -> list[dict]:
         return _load_all(self.dir / "observations")
+
+    # --- durable task + approval records ----------------------------------
+    # The orchestrator's task table and its pending approvals, persisted so a
+    # restart (CLI exit, server restart, crash) recovers the queue instead of
+    # losing it. The orchestrator owns the Task/Approval shape; this layer only
+    # reads/writes the dicts, under the same owner-only JSON discipline as
+    # experiments. Unlike an Observation (immutable), a Task record is REWRITTEN
+    # on every state transition — it is stateful by design; the audit log is what
+    # stays append-only.
+    def save_task(self, record: dict) -> None:
+        _write_private(self.dir / "tasks" / f"{record['id']}.json", record)
+
+    def tasks(self) -> list[dict]:
+        return _load_all(self.dir / "tasks")
+
+    def save_approval(self, record: dict) -> None:
+        _write_private(self.dir / "approvals" / f"{record['id']}.json", record)
+
+    def approvals(self) -> list[dict]:
+        return _load_all(self.dir / "approvals")
 
     # --- progress: one durable snapshot the operator UI can poll -----------
     def save_progress(self, snapshot: dict) -> None:
