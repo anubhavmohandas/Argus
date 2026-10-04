@@ -54,23 +54,78 @@ NYX/Orchestrator proposes task
 - **Slice 4 — identity model.** `identity.py`: Identity (researcher_owned flag,
   role, tenant), credentials as an env-var *reference* validated at the boundary so
   a secret is never written to disk, per-campaign registration + audit. Feeds
-  can_test's cross-account row. `tests/test_identity.py`.
+  can_test's cross-account row. Now also `auth_headers()` — the resolved secret as a
+  request header (bearer by default; `auth_header`/`auth_template` are the
+  cookie/API-key calibration knob). `tests/test_identity.py`.
+- **Slice 5 — differential runner.** `differential.py`: the baseline → one controlled
+  mutation → compare → observe primitive. `Variant` (actor identity + method/path/
+  body/resource + explicit `owner` of the targeted object); `run()` validates exactly
+  ONE changed axis (no uncontrolled fuzzing), then gates **each** outbound request
+  INDEPENDENTLY through `can_test` (not just the parent), executes via the throttled,
+  SSRF-guarded, method-aware `providers._fetch`, `normalize`s both responses (volatile
+  headers + uuid/timestamp/token body noise scrubbed), `compare`s them, and records a
+  single Experiment (with `mutation` provenance + `baseline_obs`) plus both raw
+  Observations. Deterministic first-pass classification only — suspicious (cross-
+  account bypass: B reached A's object) / secure / inconclusive; never `vulnerable`
+  (that needs the reproducibility slice). Auth secrets are `<redacted>` before any
+  Observation hits disk. Wired as the default orchestrator worker for both
+  `differential_*` techniques; the orchestrator adopts the runner's Experiment id
+  rather than recording a duplicate. `tests/test_differential.py` (safety invariants
+  first: a non-researcher-owned victim's object is never executed).
 
-## Backlog (priority order: scope→enforcement→state→provenance→usefulness)
+- **Slice 6 — finding-candidate lifecycle.** `finding.py`: a Finding promoted from a
+  `suspicious`/`vulnerable` Experiment (idempotent — one candidate per experiment),
+  walking a closed, forward-only pipeline OBSERVED → REPRODUCIBLE → IN_SCOPE →
+  BOUNDARY_CONFIRMED → IMPACT_CONFIRMED → DUPLICATE_CHECKED → REPORT_READY (or
+  DISMISSED, terminal). `reportable` is a deterministic policy check at promotion
+  (scope + non_reportable class) — found ≠ reportable, so an out-of-scope/excluded
+  candidate is still tracked but never reaches `report_ready()`. Every transition hits
+  the finding history AND the campaign audit. JSON per finding under the campaign dir,
+  same discipline as experiments/observations. Promotion is an explicit primitive, not
+  auto-wired into `step()` — deciding a candidate is interesting stays NYX's call.
+  `tests/test_finding.py`.
 
-1. **Differential runner** — baseline → one controlled mutation → compare, across
-   authorized identities only. Each request a cross_account/state_change technique →
-   can_test → the owned-victim/approval path. The highest-risk slice (active
-   execution): gets its own careful pass. ARGUS-owned execution; NYX classifies.
-2. **Endpoint/application mapping primitives** — routes/params/methods catalog.
-3. **Finding-candidate lifecycle** — OBSERVED→REPRODUCIBLE→IN_SCOPE→
-   BOUNDARY_CONFIRMED→IMPACT_CONFIRMED→DUPLICATE_CHECKED→REPORT_READY.
-4. **Evidence collection + secret redaction** — reuse `providers.secrets_in`.
-5. **Reproducibility check** — fresh session, re-run, score.
-6. **Duplicate / root-cause grouping.**
-7. **Report generation primitives + deterministic report-critic checklist** (the
-   LLM critique is NYX; the rule checks are ARGUS).
-8. **NYX interface** — the task-proposal / observation-interpretation seam.
+- **Slice 7 — reproducibility engine.** `reproduce.py`: `verify()` re-runs the exact
+  controlled differential N trials (each a fresh policy-gated Experiment with its own
+  Observations — reproduction adds evidence, never overwrites it), and judges
+  stability strictly: reproduced ⇔ every trial agrees AND the class is `suspicious`. On
+  reproduction, advances the linked finding OBSERVED → REPRODUCIBLE. A flaky target
+  (split results) does NOT reproduce. Pure ARGUS — no NYX. `tests/test_reproduce.py`.
+- **Slice 8 — report generation + critic.** `report.py`: `generate()` assembles a
+  Report from a finding + its source experiment's Observations (baseline first), runs a
+  fixed deterministic critic checklist (reportable? REPORT_READY? reproduced? baseline
+  +mutation evidence present? titled?), and `render()`s submittable markdown.
+  `submittable` ⇔ critic clean AND policy-reportable. A response body that leaked a
+  secret is reported as IMPACT via `providers.secrets_in` (masked) and the raw body is
+  WITHHELD — Argus proves the leak, never re-leaks it. The LLM prose critique is NYX's
+  optional layer; this produces a submittable report with no NYX. `tests/test_report.py`.
+
+ARGUS now runs end-to-end standalone: **campaign → differential → finding → reproduce
+→ report**, deterministic throughout, no NYX required at any step.
+
+- **Slice 9 — CLI surface.** `argus campaign {new|identity|diff|report|list}` drives the
+  whole pipeline from the terminal (`cli._cmd_campaign`). Safe by default: a diff whose
+  targeted object isn't researcher-owned, or whose host is out of scope, prints
+  `not executed` and sends nothing. A suspicious diff promotes a finding; `--trials N`
+  reproduces and advances it; `report` renders submittable markdown. A pasted secret as
+  `--cred` is rejected at the boundary. `tests/test_cli_campaign.py`.
+
+ARGUS is a usable standalone product: `argus campaign new → identity → diff → report`.
+
+## Backlog (priority order)
+
+1. **Endpoint/application mapping primitives** — routes/params/methods catalog
+   (feeds differential `path`/`method` instead of hand-written specs).
+2. **Duplicate / root-cause grouping** — cluster findings before DUPLICATE_CHECKED.
+3. **Operator UI** — the SOC-workstation surface over the above APIs (next track).
+
+### NYX (optional add-on — ARGUS must never depend on it)
+
+**NYX interface** is a seam, not a dependency: a `suspicious` experiment is already a
+tracked candidate and a reproduced one already advances, all deterministically. NYX, if
+present, only *proposes* which boundary to test next and *interprets* observations into
+richer prose — it never gates, promotes, or reports on its own, and ARGUS is fully
+functional with NYX absent. Build this last.
 
 ## Deliberately NOT built (YAGNI for a single-operator CLI)
 

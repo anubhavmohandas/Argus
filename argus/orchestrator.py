@@ -43,6 +43,9 @@ class Task:
     identity: str = ""
     intensity: float = 1.0
     account: object = None
+    # technique-specific parameters a generic Task can't model — e.g. a differential's
+    # {baseline, mutation} variant specs. In-memory only; the Experiment is what persists.
+    spec: dict | None = None
     deps: list[str] = field(default_factory=list)
     # priority = impact · confidence · novelty / cost (spec formula; scope_certainty
     # is folded into can_test — an out-of-scope task never reaches the queue).
@@ -138,7 +141,7 @@ class Orchestrator:
             return t
         t.state, t.attempts = "RUNNING", t.attempts + 1
         try:
-            obs_dict, classification = worker(t, self.c)
+            result = worker(t, self.c)
         except Exception as e:                  # noqa: BLE001 — a worker fault must not kill the loop
             t.state = "QUEUED" if t.attempts < self.max_attempts else "FAILED"
             self.c.audit("task_retry" if t.state == "QUEUED" else "task_failed",
@@ -146,15 +149,23 @@ class Orchestrator:
             return t
         if self.budget is not None:
             self.budget -= 1
-        exp = self.c.save_experiment(Experiment(
-            campaign_id=self.c.id, hypothesis=t.hypothesis, technique=t.technique, host=t.host,
-            verdict=t.verdict, verdict_reason=t.verdict_reason, identity=t.identity,
-            limits=t.limits, status="COMPLETED", classification=classification or ""))
-        t.experiment_id = exp.id
-        if obs_dict is not None:
-            self.c.save_observation(Observation(experiment_id=exp.id, **obs_dict))
+        # A worker may return (obs_dict, classification) for the generic path, or
+        # (obs_dict, classification, experiment_id) when it already recorded a richer
+        # Experiment itself (the differential runner) — adopt that id, don't duplicate.
+        obs_dict, classification = result[0], result[1]
+        adopted_id = result[2] if len(result) > 2 else None
+        if adopted_id:
+            t.experiment_id = adopted_id
+        else:
+            exp = self.c.save_experiment(Experiment(
+                campaign_id=self.c.id, hypothesis=t.hypothesis, technique=t.technique, host=t.host,
+                verdict=t.verdict, verdict_reason=t.verdict_reason, identity=t.identity,
+                limits=t.limits, status="COMPLETED", classification=classification or ""))
+            t.experiment_id = exp.id
+            if obs_dict is not None:
+                self.c.save_observation(Observation(experiment_id=exp.id, **obs_dict))
         t.state = "EVALUATED"
-        self.c.audit("experiment_recorded", task=t.id, experiment=exp.id,
+        self.c.audit("experiment_recorded", task=t.id, experiment=t.experiment_id,
                      classification=classification or "")
         return t
 
@@ -182,8 +193,48 @@ def _http_probe_worker(task: Task, campaign):
     return obs, ""
 
 
+def _variant_from_spec(campaign, spec: dict):
+    """Build a differential Variant from a task spec's identity NAMES, resolving each to
+    a registered Identity. An unknown identity name is a hard error — the runner must
+    never fabricate an account, since ownership drives the cross-account safety gate."""
+    from . import differential, identity as id_mod
+    ANON = id_mod.ANONYMOUS
+
+    def ident(name: str):
+        if not name or name == "anonymous":
+            return ANON
+        got = id_mod.get(campaign, name)
+        if got is None:
+            raise ValueError(f"unknown identity {name!r} — register it before a differential")
+        return got
+
+    owner = spec.get("owner")
+    return differential.Variant(
+        identity=ident(spec["identity"]),
+        method=spec.get("method", "GET"), path=spec.get("path", "/"),
+        body=spec.get("body", ""), resource=spec.get("resource", ""),
+        owner=ident(owner) if owner else None)
+
+
+def _differential_worker(task: Task, campaign):
+    """ARGUS differential primitive, driven by a gated Task. The orchestrator already
+    cleared the parent task; the runner independently re-gates EACH outbound request via
+    can_test. Returns (None, classification, experiment_id) — the runner owns the richer
+    Experiment + its two Observations, so the orchestrator adopts the id rather than
+    recording a duplicate."""
+    from . import differential
+    spec = task.spec or {}
+    base = _variant_from_spec(campaign, spec["baseline"])
+    mut = _variant_from_spec(campaign, spec["mutation"])
+    r = differential.run(campaign, task.technique, task.host, base, mut,
+                         hypothesis=task.hypothesis, intensity=task.intensity)
+    return None, r.classification, r.experiment_id
+
+
 _DEFAULT_WORKERS: dict[str, callable] = {
     "http_probe": _http_probe_worker,
+    "differential_same_account": _differential_worker,
+    "differential_cross_account": _differential_worker,
 }
 
 

@@ -378,6 +378,92 @@ def _queue_line(a):
     return f"  {('tier' + str(a.tier)) if a.tier else 'tier-':<6} {a.action:<8} {a.pattern}"
 
 
+def _cmd_campaign(args):
+    """The differential-testing pipeline as a terminal flow. Imports the pipeline modules
+    lazily so the recon-only commands don't pay for them. Safe by default: a cross-account
+    diff against a non-researcher-owned object is parked (prints 'not executed'), never run."""
+    from . import (campaign as cmod, differential as dmod, finding as fmod,
+                   identity as imod, report as rmod, reproduce as rep)
+
+    verb = getattr(args, "verb", None)
+    if verb == "new":
+        text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text()
+        print(cmod.create(text, name=args.name).id)
+        return 0
+    if verb == "list" and not args.campaign:
+        for cid in cmod.listing():
+            print(cid)
+        return 0
+    if verb is None:
+        print("usage: argus campaign {new|identity|diff|report|list}", file=sys.stderr)
+        return 2
+
+    try:
+        c = cmod.load(args.campaign)
+    except OSError:
+        print(f"error: no campaign {args.campaign!r} (argus campaign list)", file=sys.stderr)
+        return 2
+
+    if verb == "identity":
+        try:
+            ident = imod.register(c, imod.Identity(
+                name=args.name, role=args.role, researcher_owned=args.owned, credential_ref=args.cred))
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        print(f"registered {ident.name} (researcher_owned={ident.researcher_owned}, "
+              f"cred={args.cred or 'none'})")
+        return 0
+
+    if verb == "list":
+        rows = fmod.findings(c)
+        if not rows:
+            print("(no findings yet)")
+        for d in rows:
+            flag = "reportable" if d["reportable"] else "SUPPRESSED"
+            print(f"{d['id']}  {d['state']:<18} {flag:<11} {d['technique']}  {d['host']}")
+        return 0
+
+    if verb == "report":
+        try:
+            print(rmod.render(rmod.generate(c, args.finding)))
+        except KeyError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        return 0
+
+    if verb == "diff":
+        technique = "differential_same_account" if args.same else "differential_cross_account"
+        base_id, mut_id = imod.get(c, args.baseline), imod.get(c, args.mutation)
+        if base_id is None or mut_id is None:
+            print("error: unknown identity — register it with 'argus campaign identity' first",
+                  file=sys.stderr)
+            return 2
+        owner = imod.get(c, args.owner) if args.owner else base_id
+        mk = lambda who: dmod.Variant(who, method=args.method, path=args.path,
+                                      resource=args.resource, owner=owner)
+        r = dmod.run(c, technique, args.host, mk(base_id), mk(mut_id), hypothesis="cli differential")
+        print(f"experiment {r.experiment_id}: {r.decision} → {r.classification}")
+        if not r.executed:
+            print(f"  not executed: {r.decision_reason}")
+            return 0
+        if r.classification not in ("suspicious", "vulnerable"):
+            return 0
+        exp = next(e for e in c.experiments() if e["id"] == r.experiment_id)
+        f = fmod.promote(c, exp)
+        print(f"  finding {f.id} ({f.state}, {'reportable' if f.reportable else 'SUPPRESSED'})")
+        if args.trials > 0:
+            rr = rep.verify(c, technique, args.host, mk(base_id), mk(mut_id),
+                            trials=args.trials, finding_id=f.id)
+            hits = sum(1 for x in rr.classifications if x == "suspicious")
+            print(f"  reproduce {hits}/{len(rr.classifications)} → "
+                  f"{'REPRODUCED' if rr.reproduced else 'flaky'} ({fmod._get(c, f.id).state})")
+        return 0
+
+    print("usage: argus campaign {new|identity|diff|report|list}", file=sys.stderr)
+    return 2
+
+
 def main(argv=None):
     """Console entrypoint. Wraps the real dispatch so a Ctrl-C during a slow
     pivot prints one clean line instead of a socket-level traceback. interactive()
@@ -466,7 +552,38 @@ def _run(argv=None):
     sub.add_parser("modules", help="List available modules")
     sub.add_parser("coverage", help="Which engine predicates have an evidence provider (the roadmap)")
 
+    # The authorized differential-testing pipeline: campaign → identity → differential →
+    # finding → reproduce → report. Every active request is gated by EngagementPolicy.
+    cp = sub.add_parser("campaign", help="Run the authorized differential-testing pipeline")
+    cps = cp.add_subparsers(dest="verb")
+    cnew = cps.add_parser("new", help="Create a campaign from a pasted program page ('-' = stdin)")
+    cnew.add_argument("file"); cnew.add_argument("--name", default="")
+    cid = cps.add_parser("identity", help="Register an authorized test identity")
+    cid.add_argument("campaign"); cid.add_argument("name"); cid.add_argument("--role", default="")
+    cid.add_argument("--owned", action="store_true",
+                     help="researcher-owned authorized test account (required for auto cross-account)")
+    cid.add_argument("--cred", default="", metavar="ENV_VAR",
+                     help="ENV VAR NAME holding the secret — never the secret itself")
+    cd = cps.add_parser("diff", help="Run one gated differential (baseline vs ONE controlled mutation)")
+    cd.add_argument("campaign"); cd.add_argument("host")
+    cd.add_argument("--baseline", required=True, metavar="IDENTITY")
+    cd.add_argument("--mutation", required=True, metavar="IDENTITY")
+    cd.add_argument("--path", default="/"); cd.add_argument("--method", default="GET")
+    cd.add_argument("--resource", default="")
+    cd.add_argument("--owner", default="", metavar="IDENTITY",
+                    help="identity that OWNS the targeted object (defaults to baseline)")
+    cd.add_argument("--same", action="store_true", help="same-account differential (default: cross-account)")
+    cd.add_argument("--trials", type=int, default=0,
+                    help="if suspicious, reproduce N extra times and advance the finding")
+    crp = cps.add_parser("report", help="Render a finding's report as markdown")
+    crp.add_argument("campaign"); crp.add_argument("finding")
+    cls = cps.add_parser("list", help="List campaigns, or one campaign's findings")
+    cls.add_argument("campaign", nargs="?")
+
     args = p.parse_args(argv)
+
+    if args.cmd == "campaign":
+        return _cmd_campaign(args)
 
     if args.cmd == "modules":
         for name, m in sorted(MODULES.items()):

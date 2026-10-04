@@ -332,17 +332,19 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def _fetch(url: str, timeout: float, data: bytes | None = None,
-           extra_headers: dict | None = None) -> tuple[int, dict, str]:
+           extra_headers: dict | None = None, method: str | None = None) -> tuple[int, dict, str]:
     """GET (or POST when `data` is given) without redirects. Returns (status,
     lowercased headers, body). Unreachable => (0, {}, "") — a failure to connect
     establishes nothing. `extra_headers` add to the defaults (Origin for CORS,
-    Content-Type for a GraphQL POST); they never override the User-Agent."""
+    Content-Type for a GraphQL POST); they never override the User-Agent. `method`
+    forces the verb (PUT/DELETE/PATCH for a differential state-change) — None keeps
+    urllib's default (GET, or POST when `data` is present)."""
     if not _throttle.acquire():
         return 0, {}, ""        # request budget exhausted: we didn't reach it (I-1)
     # Program-mandated identity headers win over per-call extras: the engagement
     # contract outranks any single probe's convenience.
     hdrs = {"User-Agent": _UA, "Accept": "*/*", **(extra_headers or {}), **_ID_HEADERS}
-    req = urllib.request.Request(url, data=data, headers=hdrs)
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
         with _OPENER.open(req, timeout=timeout) as r:  # noqa: S310 (probes external targets by design)
             body = r.read(_BODY_CAP).decode("utf-8", "replace")

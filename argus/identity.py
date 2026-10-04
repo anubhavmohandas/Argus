@@ -31,16 +31,30 @@ class Identity:
     researcher_owned: bool = False  # True ONLY for the researcher's own authorized test accounts
     credential_ref: str = ""        # ENV VAR NAME holding the secret — never the secret itself
     tenant: str = ""
+    # How the resolved secret becomes a request header. The default is a bearer
+    # token; a cookie/API-key auth is the real-world calibration knob: set
+    # auth_header="Cookie", auth_template="session={}" (or "X-API-Key", "{}").
+    auth_header: str = "Authorization"
+    auth_template: str = "Bearer {}"
 
     def __post_init__(self):
         if self.credential_ref and not _ENV_NAME.fullmatch(self.credential_ref):
             raise ValueError(
                 f"credential_ref {self.credential_ref!r} must be an ENV VAR NAME, not a secret value")
+        if "{}" not in self.auth_template:
+            raise ValueError(f"auth_template {self.auth_template!r} must contain '{{}}' for the secret")
 
     def resolve_credential(self) -> str | None:
         """The secret, read from the environment at use time. None if unset — a
         missing credential is 'unauthenticated', never a stored fallback."""
         return os.environ.get(self.credential_ref) if self.credential_ref else None
+
+    def auth_headers(self) -> dict[str, str]:
+        """The request header(s) that authenticate AS this identity, resolved at use
+        time. Empty when no credential is set — that is the unauthenticated baseline
+        (anonymous), never a silent fallback to someone else's session."""
+        tok = self.resolve_credential()
+        return {self.auth_header: self.auth_template.format(tok)} if tok else {}
 
 
 # The unauthenticated baseline. Owned (it's no one's account) and credential-free:
