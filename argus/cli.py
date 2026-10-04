@@ -383,7 +383,7 @@ def _cmd_campaign(args):
     lazily so the recon-only commands don't pay for them. Safe by default: a cross-account
     diff against a non-researcher-owned object is parked (prints 'not executed'), never run."""
     from . import (campaign as cmod, differential as dmod, finding as fmod,
-                   identity as imod, report as rmod, reproduce as rep)
+                   identity as imod, orchestrator as omod, report as rmod, reproduce as rep)
 
     verb = getattr(args, "verb", None)
     if verb == "new":
@@ -440,16 +440,31 @@ def _cmd_campaign(args):
                   file=sys.stderr)
             return 2
         owner = imod.get(c, args.owner) if args.owner else base_id
+        # Route the active differential through the Orchestrator, not straight to the
+        # runner: the parent Task is gated by can_test (DENY/approval park it here) and
+        # the whole run executes under this campaign's bound ExecutionContext. The runner's
+        # own per-request can_test remains as the independent second gate (defence-in-depth).
+        vspec = lambda who: {"identity": who.name, "method": args.method, "path": args.path,
+                             "resource": args.resource, "owner": owner.name}
+        orch = omod.Orchestrator(c)
+        task = orch.propose(omod.Task(
+            campaign_id=c.id, technique=technique, host=args.host, hypothesis="cli differential",
+            account=owner, spec={"baseline": vspec(base_id), "mutation": vspec(mut_id)}))
+        if task.state in ("DENIED", "APPROVAL_REQUIRED"):
+            print(f"experiment -: {task.verdict} → not executed")
+            print(f"  not executed: {task.verdict_reason}")
+            return 0
+        orch.run()                                  # steps the queued task through the worker
+        if task.state != "EVALUATED" or not task.experiment_id:
+            print(f"experiment -: {task.verdict} → {task.state.lower()}")
+            return 0
+        exp = next(e for e in c.experiments() if e["id"] == task.experiment_id)
+        classification = exp.get("classification", "")
+        print(f"experiment {task.experiment_id}: {task.verdict} → {classification or 'inconclusive'}")
+        if classification not in ("suspicious", "vulnerable"):
+            return 0
         mk = lambda who: dmod.Variant(who, method=args.method, path=args.path,
                                       resource=args.resource, owner=owner)
-        r = dmod.run(c, technique, args.host, mk(base_id), mk(mut_id), hypothesis="cli differential")
-        print(f"experiment {r.experiment_id}: {r.decision} → {r.classification}")
-        if not r.executed:
-            print(f"  not executed: {r.decision_reason}")
-            return 0
-        if r.classification not in ("suspicious", "vulnerable"):
-            return 0
-        exp = next(e for e in c.experiments() if e["id"] == r.experiment_id)
         f = fmod.promote(c, exp)
         print(f"  finding {f.id} ({f.state}, {'reportable' if f.reportable else 'SUPPRESSED'})")
         if args.trials > 0:

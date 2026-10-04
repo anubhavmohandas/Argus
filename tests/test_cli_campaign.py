@@ -43,6 +43,22 @@ def test_new_identity_and_safe_gating(home, capsys):
     assert "not executed" in out and "DENY" in out
 
 
+def test_cli_diff_routes_through_the_orchestrator(home, capsys):
+    # The active CLI diff must PROPOSE a Task to the orchestrator, not call the runner
+    # directly. The orchestrator is the only path that writes task_proposed + a
+    # policy_decision to the audit trail, so their presence proves it was not bypassed —
+    # and the DENY proves the parent task was gated, not just the per-request backstop.
+    from argus import campaign as cmod
+    cid = _new_campaign(home)
+    main(["campaign", "identity", cid, "user_a", "--owned", "--cred", "A_TOK"])
+    main(["campaign", "identity", cid, "user_b", "--owned", "--cred", "B_TOK"])
+    capsys.readouterr()
+    main(["campaign", "diff", cid, "evil.example", "--baseline", "user_a", "--mutation", "user_b"])
+    events = [a["event"] for a in cmod.load(cid).audit_trail()]
+    assert "task_proposed" in events          # went through orchestrator.propose
+    assert "policy_decision" in events        # the parent task was gated by can_test
+
+
 def test_pasted_secret_rejected_at_cli(home, capsys):
     cid = _new_campaign(home)
     rc = main(["campaign", "identity", cid, "bad", "--cred", "not a varname"])

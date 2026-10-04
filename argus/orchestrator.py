@@ -21,6 +21,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
+from . import providers
 from .campaign import Experiment, Observation, _now
 from .policy import Verdict
 
@@ -186,7 +187,11 @@ class Orchestrator:
         t.state, t.attempts = "RUNNING", t.attempts + 1
         self._snapshot()                        # UI sees "currently executing" this task
         try:
-            result = worker(t, self.c)
+            # Bind THIS campaign's engagement context for the span of the worker, so its
+            # outbound requests (and its fan-out threads, via providers._CtxPool) use this
+            # campaign's scope/rate/budget/headers — never another campaign's process state.
+            with providers.bound_context(self.c.policy.execution_context(self.c.id)):
+                result = worker(t, self.c)
         except Exception as e:                  # noqa: BLE001 — a worker fault must not kill the loop
             t.state = "QUEUED" if t.attempts < self.max_attempts else "FAILED"
             self.c.audit("task_retry" if t.state == "QUEUED" else "task_failed",

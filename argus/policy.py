@@ -258,6 +258,20 @@ class EngagementPolicy:
             hdrs["User-Agent"] = self.user_agent
         providers.set_headers(hdrs)
 
+    def execution_context(self, campaign_id: str | None = None):
+        """Build a campaign-bound ExecutionContext from this policy snapshot — the same
+        scope / rate / budget / identity headers `apply()` pushes to the process globals,
+        but isolated to one campaign instead of mutating shared state. The orchestrator
+        binds this around a campaign's active work so two campaigns never share terms.
+        Placeholder header values are dropped, exactly as `apply()` drops them."""
+        from . import providers   # lazy: avoid import cycle at module load
+        ctx = providers.ExecutionContext(campaign_id=campaign_id, scope=self.scope, policy=self)
+        ctx.throttle.configure(self.rate_per_sec, self.max_requests)
+        ctx.id_headers = {k: v for k, v in self.request_headers.items() if not _is_placeholder(v)}
+        if self.user_agent:
+            ctx.user_agent = self.user_agent
+        return ctx
+
     def unfilled_headers(self) -> list[str]:
         """Required headers whose value is still the page's placeholder — the
         operator must supply a real one or the engagement is unattributable."""

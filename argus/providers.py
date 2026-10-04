@@ -27,6 +27,8 @@ never runs by default.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import contextvars
 import hashlib
 import ipaddress
 import json
@@ -39,6 +41,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 
 _UA = "Argus-Recon/0.1.0"
 _BODY_CAP = 65536          # enough for <head>; we only ever read the title
@@ -184,80 +187,20 @@ def _resolvable_and_global(host: str) -> bool:
 # --- engagement gate: SSRF guard AND the operator's scope --------------------
 # Two orthogonal reasons never to touch a host: it resolves inward (SSRF — always
 # enforced), or the program put it out of scope (operator policy — enforced only
-# when a scope file is loaded). Every ACTIVE probe asks `_permitted` instead of
-# the raw SSRF guard, so a scope is honoured everywhere at once, by construction.
-_SCOPE = None   # a scope.Scope, or None for "no scope loaded => SSRF is the only gate"
-_POLICY = None  # an EngagementPolicy once apply()d: ARMS the gate (action_for + fail-closed)
+# when a scope/policy is loaded). Every ACTIVE probe asks `_permitted`, and every
+# outbound request goes through `_fetch`; both read the ACTIVE ExecutionContext,
+# so scope/policy/rate/headers/budget are honoured everywhere at once.
 
 
-def set_scope(scope) -> None:
-    """Install (or clear, with None) the engagement scope every probe honours."""
-    global _SCOPE
-    _SCOPE = scope
-
-
-def set_policy(policy) -> None:
-    """Arm (or disarm, with None) the full engagement gate. When armed, `_permitted`
-    enforces the policy's host-level decision (scope + per-asset action + fail-closed
-    on undefined scope), not just the raw scope allowlist. The technique-aware
-    verdict (forbidden / high-risk / approval) is `policy.can_test`, which the
-    orchestrator calls before dispatch; this is the provider-layer backstop no probe
-    can bypass."""
-    global _POLICY
-    _POLICY = policy
-
-
-def reset_engagement() -> None:
-    """Clear every engagement global at once — scope, policy, rate/budget, headers —
-    so a run inherits NOTHING from a prior --policy run. One call because the leaks
-    here come from forgetting one global (a stale ID header, now a stale policy);
-    there is no safe partial reset."""
-    set_scope(None)
-    set_policy(None)
-    set_rate()
-    set_headers()
-
-
-# Programs mandate an identification header ("X-HackerOne: <handle>",
-# "X-Intigriti: <username>") so the target can tell authorised research from an
-# attack. Set once from the engagement policy; carried by every probe.
-_ID_HEADERS: dict[str, str] = {}
-
-
-def set_headers(headers: dict | None = None) -> None:
-    """Install (or clear, with None) headers every probe must carry. A
-    "User-Agent" key here overrides the default agent."""
-    global _ID_HEADERS
-    _ID_HEADERS = {k: v for k, v in (headers or {}).items() if k and v}
-
-
-def _permitted(host: str) -> bool:
-    """May a provider connect to `host`? Engagement gate AND globally routable.
-    Passive discovery/analysis providers don't ask this — scope gates engagement
-    with the target, not public-record lookups (see scope.py).
-
-    When a full policy is armed (`set_policy`), the host decision is the policy's
-    (`host_permitted`: scope + per-asset action + fail-closed on undefined scope).
-    With only a bare scope installed, the legacy allowlist applies. SSRF
-    (`_resolvable_and_global`) always wins — it can never be policy-disabled."""
-    if _POLICY is not None:
-        if not _POLICY.host_permitted(host):
-            return False
-    elif _SCOPE is not None and not _SCOPE.allows(host):
-        return False
-    return _resolvable_and_global(host)
-
-
-# --- politeness: a global rate limiter + request budget ----------------------
-# Bug-bounty rules of engagement cap request rate; a full --probe-paths sweep can
-# fire dozens of requests per host across a threadpool. This throttles every
-# outbound HTTP request through _fetch to a chosen rate and an optional hard
-# budget, and slows the whole run when a target answers 429/503. Default is
-# unlimited — zero overhead and no behaviour change until the operator opts in.
+# --- politeness: a rate limiter + request budget -----------------------------
+# Bug-bounty rules of engagement cap request rate; a full sweep can fire dozens of
+# requests per host across a threadpool. This throttles every outbound request to a
+# chosen rate and optional hard budget, and slows the whole run on a 429/503. One
+# throttle lives per ExecutionContext, so one campaign's budget is not another's.
 class _Throttle:
     def __init__(self):
         self.min_interval = 0.0     # seconds between requests (0 = unlimited)
-        self.remaining = None       # global request budget (None = unbounded)
+        self.remaining = None       # request budget (None = unbounded)
         self._next_at = 0.0
         self._lock = threading.Lock()
 
@@ -293,19 +236,155 @@ class _Throttle:
             self._next_at = max(self._next_at, time.monotonic() + seconds)
 
 
+@dataclass
+class ExecutionContext:
+    """Campaign-bound engagement state: the scope, policy, rate/budget and identity
+    headers that govern ONE campaign's active work.
+
+    It exists so that once the in-process API runs more than one campaign, A cannot
+    inherit B's scope / rate / headers / budget / policy. Bind one for the span of a
+    campaign's active work with `bound_context(ctx)`; `_permitted` and `_fetch` read
+    whichever context is bound. Unbound work (the single-run CLI, tests) falls back
+    to the module-level defaults the legacy setters below still write — those globals
+    are the migration shim, consulted only when nothing is bound."""
+    campaign_id: str | None = None
+    scope: object | None = None            # scope.Scope
+    policy: object | None = None           # policy.EngagementPolicy snapshot
+    id_headers: dict = field(default_factory=dict)
+    user_agent: str = _UA
+    throttle: _Throttle = field(default_factory=_Throttle)
+    sent: int = 0                          # requests actually sent under this context
+
+
+# Legacy/default engagement state: what the single-run CLI and `policy.apply()` set.
+# Authoritative ONLY when no ExecutionContext is bound (migration shim, see above).
+_SCOPE = None
+_POLICY = None
+_ID_HEADERS: dict = {}
 _throttle = _Throttle()
+
+# The campaign context in force for the current thread/task. None => fall back to the
+# legacy globals. A ContextVar (not a plain global) so two campaigns on one process,
+# or two async tasks, can never read each other's engagement terms.
+_active_ctx = contextvars.ContextVar("argus_execution_context", default=None)
+
+
+def _active() -> "ExecutionContext":
+    """The ExecutionContext governing work on this thread right now: the bound
+    campaign context, or a view over the legacy globals when nothing is bound."""
+    ctx = _active_ctx.get()
+    if ctx is not None:
+        return ctx
+    return ExecutionContext(scope=_SCOPE, policy=_POLICY,
+                            id_headers=_ID_HEADERS, throttle=_throttle)
+
+
+@contextlib.contextmanager
+def bound_context(ctx: "ExecutionContext"):
+    """Bind `ctx` as the active engagement context for the duration of the block. All
+    `_permitted`/`_fetch` calls on this thread — and on worker threads from `_CtxPool`
+    pools created inside it — execute under `ctx`, never the legacy globals."""
+    token = _active_ctx.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _active_ctx.reset(token)
+
+
+class _CtxPool(concurrent.futures.ThreadPoolExecutor):
+    """A ThreadPoolExecutor that carries the submitting thread's ExecutionContext into
+    its worker threads. ThreadPoolExecutor does NOT propagate contextvars, so without
+    this a provider's fan-out workers would lose the bound campaign context and read
+    the legacy globals. Each task runs inside a snapshot of the context live at submit."""
+    def submit(self, fn, /, *args, **kwargs):
+        ctx = contextvars.copy_context()
+        return super().submit(lambda: ctx.run(fn, *args, **kwargs))
+
+
+def set_scope(scope) -> None:
+    """Install (or clear, with None) the legacy default-context scope."""
+    global _SCOPE
+    _SCOPE = scope
+
+
+def set_policy(policy) -> None:
+    """Arm (or disarm, with None) the legacy default-context policy gate. When armed,
+    `_permitted` enforces the policy's host decision (scope + per-asset action +
+    fail-closed on undefined scope). The technique-aware verdict is `policy.can_test`,
+    which the orchestrator calls before dispatch; this is the provider-layer backstop."""
+    global _POLICY
+    _POLICY = policy
+
+
+def set_headers(headers: dict | None = None) -> None:
+    """Install (or clear, with None) legacy default-context identity headers. A
+    "User-Agent" key here overrides the default agent."""
+    global _ID_HEADERS
+    _ID_HEADERS = {k: v for k, v in (headers or {}).items() if k and v}
 
 
 def set_rate(rate: float | None = None, max_requests: int | None = None) -> None:
-    """Set the global request rate (req/sec) and/or hard request budget. Both
+    """Set the legacy default-context request rate (req/sec) and/or hard budget. Both
     None (the default) means unlimited — probing behaves exactly as before."""
     _throttle.configure(rate, max_requests)
 
 
+def reset_engagement() -> None:
+    """Clear every legacy engagement global at once — scope, policy, rate/budget,
+    headers — so a run inherits NOTHING from a prior --policy run. One call because the
+    leaks here come from forgetting one global; there is no safe partial reset."""
+    set_scope(None)
+    set_policy(None)
+    set_rate()
+    set_headers()
+
+
+def _permitted(host: str) -> bool:
+    """May a provider connect to `host`? Engagement gate AND globally routable, read
+    from the ACTIVE ExecutionContext. Passive discovery/analysis providers don't ask
+    this — scope gates engagement with the target, not public-record lookups.
+
+    When a full policy is armed, the host decision is the policy's (`host_permitted`:
+    scope + per-asset action + fail-closed on undefined scope). With only a bare scope,
+    the legacy allowlist applies. SSRF (`_resolvable_and_global`) always wins — it can
+    never be policy-disabled."""
+    ctx = _active()
+    if ctx.policy is not None:
+        if not ctx.policy.host_permitted(host):
+            return False
+    elif ctx.scope is not None and not ctx.scope.allows(host):
+        return False
+    return _resolvable_and_global(host)
+
+
+def _gate(host: str, technique: str, intensity: float = 1.0, account=None) -> bool:
+    """Technique-aware authorization for a legacy, non-orchestrated active provider.
+
+    The orchestrated path gates every task through `policy.can_test` BEFORE dispatch.
+    The CLI pivot/probe path drives these providers directly, so it must reach the SAME
+    decision — not just the host-level `_permitted` backstop. This routes that one
+    capability through `can_test` (the single decision source, never re-implemented):
+
+      - a full policy armed  -> run iff can_test is ALLOW / ALLOW_WITH_LIMITS. DENY and
+        HUMAN_APPROVAL both mean 'do not auto-execute here' (there is no task to park;
+        parking-for-approval is the orchestrator's job). A program that FORBIDS a
+        technique now blocks it through the legacy path too, which it did not before.
+      - no policy armed (bare scope / no engagement) -> the host-level `_permitted`
+        backstop alone, so pre-policy probe behaviour is unchanged.
+
+    `_permitted` (SSRF + host scope) remains defence-in-depth: every provider still
+    calls it, and it can never be policy-disabled."""
+    ctx = _active()
+    if ctx.policy is not None and not ctx.policy.can_test(host, technique, intensity, account).allowed:
+        return False
+    return _permitted(host)
+
+
 def budget_exhausted() -> bool:
-    """True when a shared request budget was set and is spent — lets a multi-host
-    run stop before seeding a host it could never probe (invariant I-1)."""
-    return _throttle.remaining is not None and _throttle.remaining <= 0
+    """True when the ACTIVE context's shared request budget was set and is spent — lets
+    a multi-host run stop before seeding a host it could never probe (invariant I-1)."""
+    t = _active().throttle
+    return t.remaining is not None and t.remaining <= 0
 
 
 def _retry_after(headers) -> float:
@@ -339,11 +418,13 @@ def _fetch(url: str, timeout: float, data: bytes | None = None,
     Content-Type for a GraphQL POST); they never override the User-Agent. `method`
     forces the verb (PUT/DELETE/PATCH for a differential state-change) — None keeps
     urllib's default (GET, or POST when `data` is present)."""
-    if not _throttle.acquire():
+    ctx = _active()
+    if not ctx.throttle.acquire():
         return 0, {}, ""        # request budget exhausted: we didn't reach it (I-1)
+    ctx.sent += 1
     # Program-mandated identity headers win over per-call extras: the engagement
     # contract outranks any single probe's convenience.
-    hdrs = {"User-Agent": _UA, "Accept": "*/*", **(extra_headers or {}), **_ID_HEADERS}
+    hdrs = {"User-Agent": ctx.user_agent, "Accept": "*/*", **(extra_headers or {}), **ctx.id_headers}
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
         with _OPENER.open(req, timeout=timeout) as r:  # noqa: S310 (probes external targets by design)
@@ -352,7 +433,7 @@ def _fetch(url: str, timeout: float, data: bytes | None = None,
     except urllib.error.HTTPError as e:      # 3xx/4xx/5xx are answers, not errors
         hdrs_out = {k.lower(): v for k, v in (e.headers or {}).items()}
         if e.code in (429, 503):             # the target asked us to slow down — honour it
-            _throttle.backoff(_retry_after(hdrs_out))
+            ctx.throttle.backoff(_retry_after(hdrs_out))
         body = ""
         try:
             body = e.read(_BODY_CAP).decode("utf-8", "replace")
@@ -522,7 +603,7 @@ def probe(host: str, timeout: float = 8.0) -> tuple[dict, dict]:
     """Probe one host over HTTPS, then HTTP. Returns (evidence, observed):
     evidence is engine-vocabulary predicates; observed is non-predicate facts
     (e.g. a product version) that OTHER providers read. Unreachable => ({}, {})."""
-    if not _permitted(host):
+    if not _gate(host, "http_probe"):
         return {}, {}
     for scheme in ("https", "http"):
         status, headers, body = _fetch(f"{scheme}://{host}/", timeout)
@@ -577,7 +658,7 @@ def enrich(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     reached = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, (ev, obs) in zip(targets, ex.map(lambda e: probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
@@ -709,7 +790,7 @@ def _tls_fetch(host: str, timeout: float = 8.0) -> bytes | None:
 def tls_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host's TLS cert. Returns an observation (fingerprint), never a
     predicate — 'reused' is the analyzer's graph-wide call, not this probe's."""
-    if not _permitted(host):
+    if not _gate(host, "tls_probe"):
         return {}
     der = _tls_fetch(host, timeout)
     return {"cert_fingerprint": cert_fingerprint(der)} if der else {}
@@ -722,7 +803,7 @@ def enrich_tls(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     reached = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, obs in zip(targets, ex.map(lambda e: tls_probe(e.value, timeout), targets)):
             if obs:
                 ent.observed.update(obs)
@@ -824,7 +905,7 @@ def admin_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host's administrative paths. Returns evidence; {} establishes
     nothing. Control request first — it both picks the scheme and defines what
     'nothing here' looks like, so an unreachable host costs exactly one request."""
-    if not _permitted(host):
+    if not _gate(host, "path_probe"):
         return {}
     for scheme in ("https", "http"):
         status, headers, body = _fetch(f"{scheme}://{host}{_CONTROL_PATH}", timeout)
@@ -847,7 +928,7 @@ def enrich_admin(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     marked = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, ev in zip(targets, ex.map(lambda e: admin_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
@@ -938,7 +1019,7 @@ def exposure_probe(host: str, timeout: float = 8.0) -> tuple[dict, dict]:
     recovered file verifies as the real thing, its body is scanned for live-format
     secrets: a hit escalates the evidence to `exposed_secret` and the redacted
     matches ride in observed['secrets'] for the dossier/report."""
-    if not _permitted(host):
+    if not _gate(host, "path_probe"):
         return {}, {}
     for scheme in ("https", "http"):
         status, headers, body = _fetch(f"{scheme}://{host}{_CONTROL_PATH}", timeout)
@@ -969,7 +1050,7 @@ def enrich_exposure(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     marked = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, (ev, obs) in zip(targets, ex.map(lambda e: exposure_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
@@ -1098,9 +1179,9 @@ def _probe_port(host: str, port: int, timeout: float) -> tuple:
     sends nothing.
 
     A TCP connect IS outbound engagement, so it obeys the same politeness contract
-    as HTTP: it acquires from the global `_throttle`, serializing every worker to
-    the program's request rate + budget instead of firing sockets unthrottled."""
-    if not _throttle.acquire():
+    as HTTP: it acquires from the active context's throttle, serializing every worker
+    to the program's request rate + budget instead of firing sockets unthrottled."""
+    if not _active().throttle.acquire():
         return "skipped", ""            # budget spent: never reached it (I-1)
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
@@ -1128,11 +1209,11 @@ def scan_host(host: str, ports=None, timeout: float = 4.0, workers: int = 32) ->
     {} if `host` is not a safe, globally-routable target — the same SSRF guard
     every probe uses: a discovered name pointing inward is never connected to."""
     ports = list(_DEFAULT_PORTS) if ports is None else list(ports)   # [] means none, not default
-    if not ports or not _permitted(host):
+    if not ports or not _gate(host, "port_scan"):
         return {}
     open_ports, filtered, services, cves = [], [], [], []
     skipped = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(ports))) as ex:
+    with _CtxPool(max_workers=min(workers, len(ports))) as ex:
         for port, (state, banner) in zip(ports, ex.map(lambda p: _probe_port(host, p, timeout), ports)):
             if state == "filtered":
                 filtered.append(port)
@@ -1171,7 +1252,7 @@ def enrich_scan(g, ports=None, timeout: float = 4.0, workers: int = 8) -> int:
     if not targets:
         return 0
     vulnerable = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, obs in zip(targets, ex.map(lambda e: scan_host(e.value, ports, timeout), targets)):
             if obs:
                 # merge, don't overwrite — http_probe's JS-library CVEs may already
@@ -1386,7 +1467,7 @@ def traversal_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host for path traversal. Returns evidence; {} establishes nothing.
     Control request first — it picks the scheme and defines 'nothing here', so an
     unreachable host costs exactly one request (same shape as exposure_probe)."""
-    if not _permitted(host):
+    if not _gate(host, "path_probe"):
         return {}
     for scheme in ("https", "http"):
         status, headers, body = _fetch(f"{scheme}://{host}{_CONTROL_PATH}", timeout)
@@ -1408,7 +1489,7 @@ def enrich_traversal(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     marked = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, ev in zip(targets, ex.map(lambda e: traversal_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
@@ -1467,7 +1548,7 @@ def cors_probe(host: str, timeout: float = 8.0) -> dict:
     arbitrary origin, then (only if that didn't fire) `Origin: null`. Returns
     evidence; {} establishes nothing. Costs one GET, plus one more for the null
     check — an unreachable or out-of-scope host costs nothing (gate first)."""
-    if not _permitted(host):
+    if not _gate(host, "cors_probe"):
         return {}
     for scheme in ("https", "http"):
         status, headers, _ = _fetch(f"{scheme}://{host}/", timeout,
@@ -1492,7 +1573,7 @@ def enrich_cors(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     marked = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, ev in zip(targets, ex.map(lambda e: cors_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
@@ -1531,7 +1612,7 @@ def graphql_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host's conventional GraphQL paths for enabled introspection.
     Returns evidence; {} establishes nothing. A cheap reachability GET first, so
     an unreachable host costs one request before any POSTs (SSRF guard first)."""
-    if not _permitted(host):
+    if not _gate(host, "http_probe"):
         return {}
     for scheme in ("https", "http"):
         if not _fetch(f"{scheme}://{host}/", timeout)[0]:
@@ -1555,7 +1636,7 @@ def enrich_graphql(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     marked = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, ev in zip(targets, ex.map(lambda e: graphql_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
@@ -1605,7 +1686,7 @@ def enrich_email_spoof(g, workers: int = 8) -> int:
     if not domains:
         return 0
     marked = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         results = ex.map(lambda e: email_spoofable(_txt_records(f"_dmarc.{e.value}")), domains)
         for ent, spoofable in zip(domains, results):
             if spoofable:
@@ -1650,7 +1731,7 @@ def redirect_evidence(responses: dict, canary_host: str = _REDIRECT_HOST) -> dic
 def redirect_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host for an open redirect. Returns evidence; {} establishes nothing.
     Reachability GET first, so an unreachable host costs one request (SSRF guard first)."""
-    if not _permitted(host):
+    if not _gate(host, "http_probe"):
         return {}
     payload = urllib.parse.quote(_REDIRECT_CANARY, safe="")
     for scheme in ("https", "http"):
@@ -1673,7 +1754,7 @@ def enrich_redirect(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     marked = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, ev in zip(targets, ex.map(lambda e: redirect_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
@@ -1720,7 +1801,7 @@ def injection_evidence(bodies) -> dict:
 def injection_probe(host: str, timeout: float = 8.0) -> dict:
     """Probe one host for reflected XSS / SSTI. Returns evidence; {} establishes
     nothing. Reachability GET first, so an unreachable host costs one request."""
-    if not _permitted(host):
+    if not _gate(host, "injection_probe"):
         return {}
     payload = urllib.parse.quote(_INJECT_PAYLOAD, safe="")
     for scheme in ("https", "http"):
@@ -1740,7 +1821,7 @@ def enrich_injection(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     marked = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, ev in zip(targets, ex.map(lambda e: injection_probe(e.value, timeout), targets)):
             if ev:
                 ent.evidence.update(ev)
@@ -1777,7 +1858,7 @@ def security_txt_probe(host: str, timeout: float = 8.0) -> dict:
     {'security_txt': {url, contact, policy}} or {} — an observation, never a
     predicate. Reachability GET first, so an unreachable/out-of-scope host costs
     at most one request (gate first)."""
-    if not _permitted(host):
+    if not _gate(host, "http_probe"):
         return {}
     for scheme in ("https", "http"):
         if not _fetch(f"{scheme}://{host}/", timeout)[0]:
@@ -1802,7 +1883,7 @@ def enrich_security_txt(g, timeout: float = 8.0, workers: int = 8) -> int:
     if not targets:
         return 0
     found = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    with _CtxPool(max_workers=workers) as ex:
         for ent, obs in zip(targets, ex.map(lambda e: security_txt_probe(e.value, timeout), targets)):
             if obs:
                 ent.observed.update(obs)
