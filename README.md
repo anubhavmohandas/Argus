@@ -1,7 +1,7 @@
 # Argus
 
 **Autonomous correlation recon engine.** One seed in → a connected
-entity-graph dossier out. Argus doesn't just *look things up* — it pivots
+entity-graph dossier out. Argus doesn't just *look things up*  it pivots
 across every source on its own, links what it finds into a single graph,
 scores it, and hands you an intelligence brief.
 
