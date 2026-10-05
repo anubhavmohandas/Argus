@@ -143,6 +143,12 @@ class CampaignRunCoordinator:
         # so each transition is one audit record (maps to a campaign.run.* event).
         self.c.audit("run_transition", state=state, run_id=self._run_id, detail=detail)
 
+    def is_active(self) -> bool:
+        """True while a run owns this campaign (a loop is or should be live). Used to reject
+        a competing operation — e.g. reproduce while a pivot runs (one execution owner)."""
+        with self._lock:
+            return self._state in _ACTIVE
+
     # --- public snapshot --------------------------------------------------
     def snapshot(self) -> dict:
         """What an API handler returns immediately. Run state (activity) is kept separate

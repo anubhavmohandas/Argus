@@ -21,6 +21,7 @@ flakiness scoring are the upgrade path when a target proves genuinely noisy.
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 
 from . import differential, finding as finding_mod
@@ -67,6 +68,69 @@ def verify(campaign, technique: str, host: str, baseline, mutation,
                                      f"{len(rep.classifications)} trials")
             rep.finding_id = finding_id
     return rep
+
+
+def background_verify(campaign, finding_id: str, trials: int = 2):
+    """Return (planner, on_complete) to reproduce a finding through a CampaignRunCoordinator
+    — the SAME execution system as a pivot, not a separate one. The planner proposes
+    `trials` differential Tasks (reusing the orchestrator's differential worker and the
+    ORIGINAL task's persisted baseline/mutation spec, so the exact controlled differential
+    re-runs); the coordinator drains them under can_test like any task, so pause/stop apply.
+    on_complete judges stability from the trial Observations' classifications and advances
+    the finding OBSERVED → REPRODUCIBLE on a clean reproduction.
+
+    Strict judgement is unchanged: reproduced ⇔ every trial agrees AND the class is
+    suspicious. Raises ValueError (the caller turns it into a 4xx) if the finding or its
+    original differential task cannot be found — reproduction is never fabricated."""
+    from .orchestrator import Task
+    f = finding_mod._get(campaign, finding_id)
+    if f is None:
+        raise ValueError(f"no finding {finding_id!r}")
+    if not f.technique.startswith("differential"):
+        raise ValueError(f"finding {finding_id!r} is not a differential — nothing to re-run")
+    group = f"repro-{uuid.uuid4().hex[:8]}"
+
+    def planner(co):
+        orig = next((t for t in co.orch.tasks.values()
+                     if t.experiment_id == f.experiment_id and t.spec and "baseline" in t.spec), None)
+        if orig is None:
+            raise ValueError(f"no original differential task for finding {finding_id!r} to reproduce")
+        original = next((e.get("classification") for e in co.c.experiments()
+                         if e["id"] == f.experiment_id), "") or "suspicious"
+        # carry the original's executing identity so a trial re-runs under the SAME
+        # authorization as the original (not re-parked for approval on a technicality).
+        acct = orig.account
+        if acct is None and orig.account_name:
+            from . import identity as id_mod
+            acct = id_mod.get(co.c, orig.account_name)
+        for _ in range(max(1, trials)):
+            spec = dict(orig.spec)
+            spec.update(_repro=group, _finding=finding_id, _original=original)
+            co.orch.propose(Task(campaign_id=co.c.id, technique=f.technique, host=f.host,
+                                 hypothesis=f"reproduce: {original}", intensity=orig.intensity,
+                                 account=acct, account_name=orig.account_name, spec=spec))
+
+    def on_complete(co):
+        trials_done = [t for t in co.orch.tasks.values()
+                       if (t.spec or {}).get("_repro") == group]
+        if not trials_done:
+            return
+        original = (trials_done[0].spec or {}).get("_original", "suspicious")
+        by_exp = {e["id"]: e for e in co.c.experiments()}
+        classes = [by_exp.get(t.experiment_id, {}).get("classification", "")
+                   for t in trials_done if t.state == "EVALUATED"]
+        reproduced = (original == "suspicious" and len(classes) == len(trials_done)
+                      and all(cl == original for cl in classes))
+        co.c.audit("reproducibility_check", technique=f.technique, host=f.host,
+                   original=original, trials=len(trials_done), classifications=classes,
+                   reproduced=reproduced, finding=finding_id)
+        if reproduced:
+            cur = finding_mod._get(co.c, finding_id)
+            if cur is not None and cur.state == "OBSERVED":
+                finding_mod.advance(co.c, finding_id, "REPRODUCIBLE",
+                                    note=f"reproduced {len(classes)}/{len(trials_done)} trials")
+
+    return planner, on_complete
 
 
 def demo() -> None:

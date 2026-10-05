@@ -144,3 +144,37 @@ def test_run_control_on_idle_campaign_is_safe(api):
     cid = _campaign(api)
     code, body = _req(api, f"/api/campaign/{cid}/stop", "POST", {})
     assert code == 200 and body["run"]["campaign_id"] == cid
+
+
+# --- reproduce endpoint validation ---------------------------------------
+def test_reproduce_unknown_finding_409(api):
+    cid = _campaign(api)
+    code, body = _req(api, f"/api/campaign/{cid}/findings/nope/reproduce", "POST", {})
+    assert code == 409 and "finding" in body["error"]
+
+
+def test_reproduce_rejects_out_of_range_trials(api):
+    cid = _campaign(api)
+    code, body = _req(api, f"/api/campaign/{cid}/findings/x/reproduce", "POST", {"trials": 99})
+    assert code == 400 and "trials" in body["error"]
+
+
+def test_reproduce_refused_while_a_run_is_active(api, monkeypatch):
+    # hold a pivot run open with a latching worker, then a reproduce request must 409
+    entered = {"api.acme.example": threading.Event()}
+    release = {"api.acme.example": threading.Event()}
+
+    def worker(t, c):
+        entered[t.host].set()
+        release[t.host].wait(5)
+        return ({"request": {"method": "GET", "url": f"https://{t.host}/", "headers": {}, "body": ""},
+                 "response": {"status": 200}}, "")
+    _stub_planner(monkeypatch, worker)
+    cid = _campaign(api)
+    _req(api, f"/api/campaign/{cid}/pivot", "POST", {"level": "active"})
+    co = _coordinator(cid)
+    assert _wait(lambda: entered["api.acme.example"].is_set())
+    code, body = _req(api, f"/api/campaign/{cid}/findings/x/reproduce", "POST", {})
+    assert code == 409 and "already active" in body["error"]
+    release["api.acme.example"].set()
+    _wait(lambda: not co.is_active())

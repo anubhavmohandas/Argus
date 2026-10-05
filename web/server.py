@@ -394,6 +394,7 @@ _EVENT_MAP = {
     "differential_recorded": "experiment.completed",
     "differential_blocked": "policy.deny",
     "run_recovered": "campaign.run.recovered",
+    "reproducibility_check": "reproduction.checked",
 }
 _VERDICT_EVENT = {
     "ALLOW": "policy.allow", "ALLOW_WITH_LIMITS": "policy.limit",
@@ -551,6 +552,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._start_pivot(c)
         if rest and rest[0] in ("pause", "resume", "stop") and len(rest) == 1:
             return self._run_control(c, rest[0])
+        # /findings/{finding}/reproduce
+        if len(rest) == 3 and rest[0] == "findings" and rest[2] == "reproduce":
+            return self._reproduce_finding(c, rest[1])
         # /tasks/{task}/{action}
         if len(rest) == 3 and rest[0] == "tasks" and rest[2] in ("approve", "deny", "cancel"):
             return self._task_decision(c, rest[1], rest[2])
@@ -633,6 +637,35 @@ class Handler(BaseHTTPRequestHandler):
         co = _coordinator(c)
         snap = co.start(planner=planner, on_complete=on_complete)
         self._send_json({"run": snap, "seed": seed, "level": level}, code=202)
+
+    def _reproduce_finding(self, c, finding_id: str):
+        """POST /api/campaign/{id}/findings/{fid}/reproduce — re-run a finding's controlled
+        differential through the SAME coordinator (not a separate engine). Returns 202 with
+        the run snapshot; the reproducibility verdict + finding advance arrive via SSE.
+        409 if a run is already active (one execution owner per campaign) or the finding has
+        no re-runnable differential."""
+        body = self._json_body() or {}
+        try:
+            trials = int(body.get("trials") or 2)
+        except (TypeError, ValueError):
+            self._send_json({"error": "trials must be an integer"}, code=400)
+            return
+        if not (1 <= trials <= 10):
+            self._send_json({"error": "trials out of range [1,10]"}, code=400)
+            return
+        co = _coordinator(c)
+        if co.is_active():
+            self._send_json({"error": "a run is already active; stop it before reproducing"},
+                            code=409)
+            return
+        from argus import reproduce
+        try:
+            planner, on_complete = reproduce.background_verify(c, finding_id, trials=trials)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, code=409)
+            return
+        snap = co.start(planner=planner, on_complete=on_complete)
+        self._send_json({"run": snap, "finding": finding_id, "trials": trials}, code=202)
 
     def _run_control(self, c, action: str):
         """POST /api/campaign/{id}/{pause|resume|stop} — thin controller over the

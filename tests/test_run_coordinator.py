@@ -245,6 +245,42 @@ def test_progress_percentage_tracks_only_completed_work(home):
     assert p["percentage"] == 100 and p["completed"] == 4 and p["planned"] == 4
 
 
+# --- reproduction rides the same coordinator ------------------------------
+def test_reproduction_runs_through_the_coordinator_and_advances_finding(home, monkeypatch):
+    from argus import differential, finding as finding_mod, identity as id_mod, reproduce
+    monkeypatch.setenv("A_TOK", "tok-a")
+    monkeypatch.setenv("B_TOK", "tok-b")
+    c = campaign_mod.create("In scope:\napi.acme.example\nRate: 20 requests/sec\n", name="repro")
+    a = id_mod.register(c, id_mod.Identity(name="user_a", researcher_owned=True, credential_ref="A_TOK"))
+    id_mod.register(c, id_mod.Identity(name="user_b", researcher_owned=True, credential_ref="B_TOK"))
+    # stable leak: B always gets 200 on A's object -> "suspicious", every time
+    monkeypatch.setattr(differential, "_default_fetch",
+                        lambda *x: (200, {"content-type": "application/json"}, "{}"))
+    co = coordinator_for(c)
+    spec = {"baseline": {"identity": "user_a", "method": "POST", "path": "/o/1/cancel",
+                         "resource": "o1", "owner": "user_a"},
+            "mutation": {"identity": "user_b", "method": "POST", "path": "/o/1/cancel",
+                         "resource": "o1", "owner": "user_a"}}
+    orig = co.orch.propose(Task(campaign_id=c.id, technique="differential_cross_account",
+                                host="api.acme.example", spec=spec, hypothesis="idor?",
+                                account=a, account_name="user_a"))
+    co.start()
+    assert _wait(lambda: orig.state == "EVALUATED")
+    assert _wait(lambda: not co.is_active())
+
+    exp = next(e for e in c.experiments() if e["id"] == orig.experiment_id)
+    assert exp["classification"] == "suspicious"
+    f = finding_mod.promote(c, exp)
+    assert f.state == "OBSERVED"
+
+    # reproduce through the SAME coordinator — trials are gated differential Tasks
+    planner, on_complete = reproduce.background_verify(c, f.id, trials=3)
+    co.start(planner=planner, on_complete=on_complete)
+    assert _wait(lambda: finding_mod._get(c, f.id).state == "REPRODUCIBLE")
+    checks = [a for a in c.audit_trail() if a["event"] == "reproducibility_check"]
+    assert checks and checks[-1]["reproduced"] is True and checks[-1]["trials"] == 3
+
+
 # --- SSE source: run transitions land in the audit log in order -----------
 def test_run_transitions_are_audited_in_order(home):
     c = _camp()
