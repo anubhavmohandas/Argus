@@ -311,6 +311,55 @@ def _identity_mod():
     return identity_mod
 
 
+# --- structured campaign events (Phase 3) ---------------------------------
+# The event stream is built from the campaign's PERSISTED, append-only audit log
+# (campaign/audit.jsonl) — NOT from forwarded stderr. Each audit record maps to one or
+# more structured events in a stable vocabulary the UI consumes. The mapping is lossless:
+# anything without a specific mapping is still emitted as `argus.<raw_event>`.
+_EVENT_MAP = {
+    "campaign_created": "campaign.created",
+    "task_proposed": "task.proposed",
+    "task_cancelled": "task.cancelled",
+    "task_retry": "task.retry",
+    "recovered_interrupted": "task.retry",
+    "no_worker": "task.failed",
+    "human_approved": "approval.approved",
+    "human_denied": "approval.denied",
+    "approval_overruled_by_policy": "policy.deny",
+    "finding_promoted": "finding.promoted",
+    "finding_transition": "finding.transition",
+    "identity_registered": "identity.registered",
+    "differential_recorded": "experiment.completed",
+    "differential_blocked": "policy.deny",
+}
+_VERDICT_EVENT = {
+    "ALLOW": "policy.allow", "ALLOW_WITH_LIMITS": "policy.limit",
+    "DENY": "policy.deny", "HUMAN_APPROVAL": "policy.approval_required",
+}
+
+
+def _structured_events(rec: dict, seq: int):
+    """Yield (event_name, data) for one audit record. `seq` is the record's line index,
+    echoed back so a client can resume with ?since=<seq+1>. A policy_decision fans out
+    into its verdict event plus the lifecycle event that verdict implies (queued /
+    approval requested), so the UI's queue + approval panels update from one record."""
+    data = dict(rec, seq=seq)
+    ev = rec.get("event", "")
+    if ev == "policy_decision":
+        verdict = rec.get("verdict", "")
+        yield _VERDICT_EVENT.get(verdict, "policy.decision"), data
+        if verdict in ("ALLOW", "ALLOW_WITH_LIMITS"):
+            yield "task.queued", data
+        elif verdict == "HUMAN_APPROVAL":
+            yield "approval.requested", data
+        return
+    if ev == "experiment_recorded":
+        yield "task.completed", data
+        yield "experiment.created", data
+        return
+    yield _EVENT_MAP.get(ev, f"argus.{ev}"), data
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ArgusWeb/0.1"
 
@@ -555,8 +604,68 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(detail)
             return
 
+        # structured campaign event stream (Phase 3): /api/campaign/{id}/events
+        parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "events":
+            return self._campaign_events(parts[2], parse_qs(parsed.query))
+
         # otherwise: static frontend
         self._serve_static(path)
+
+    def _campaign_events(self, cid: str, qs: dict):
+        """SSE stream of one campaign's structured events, replayed from its durable audit
+        log then tailed live. `?since=N` resumes after record N; `?once=1` replays current
+        events + a progress snapshot and closes (no tail) — deterministic for clients that
+        only want the backlog. The audit log is the source of truth, so a reconnect with
+        ?since= never loses or double-counts an event."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        c = campaign_mod.load(cid)
+        try:
+            since = max(0, int((qs.get("since", ["0"])[0]) or 0))
+        except ValueError:
+            since = 0
+        once = (qs.get("once", ["0"])[0]) in ("1", "true", "yes")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        # a one-shot replay must CLOSE so the client sees EOF (SSE carries no
+        # Content-Length); a live tail stays open.
+        self.send_header("Connection", "close" if once else "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        if once:
+            self.close_connection = True
+
+        def emit_new(n_seen: int) -> int:
+            trail = c.audit_trail()
+            for seq in range(n_seen, len(trail)):
+                for event, data in _structured_events(trail[seq], seq):
+                    self._sse_event(event, data)
+            return len(trail)
+
+        try:
+            seen = emit_new(since)
+            self._sse_event("campaign.progress", c.progress())
+            if once:
+                return
+            # live tail: emit new audit records as they land, with a periodic progress
+            # refresh + heartbeat so proxies and the client keep the connection open.
+            idle = 0
+            while True:
+                time.sleep(0.5)
+                before = seen
+                seen = emit_new(seen)
+                idle = 0 if seen != before else idle + 1
+                if idle % 4 == 0:                      # every ~2s of quiet
+                    self._sse_event("campaign.progress", c.progress())
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client navigated away
 
     def _serve_static(self, path: str):
         if not FRONTEND_DIST.is_dir():

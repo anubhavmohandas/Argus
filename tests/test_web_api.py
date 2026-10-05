@@ -126,6 +126,72 @@ def test_api_approval_cannot_override_scope_deny(api):
     assert next(x for x in detail["tasks"] if x["id"] == t.id)["state"] == "DENIED"
 
 
+def _sse_once(base, path):
+    """Fetch an SSE endpoint that closes itself (?once=1) and parse (event, data) pairs."""
+    with urllib.request.urlopen(base + path, timeout=10) as resp:
+        raw = resp.read().decode()
+    out = []
+    for block in raw.split("\n\n"):
+        ev = dat = None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                ev = line[7:]
+            elif line.startswith("data: "):
+                dat = json.loads(line[6:])
+        if ev is not None:
+            out.append((ev, dat))
+    return out
+
+
+def test_sse_replays_structured_events_from_the_audit_log(api):
+    cid = _campaign(api)
+    # generate durable audit events through the orchestrator (not stderr)
+    from argus import campaign as cmod
+    from argus.orchestrator import Orchestrator, Task
+    c = cmod.load(cid)
+    orch = Orchestrator(c)
+    orch.propose(Task(campaign_id=c.id, technique="http_probe",
+                      host="api.acme.example", hypothesis="in scope"))        # -> ALLOW
+    orch.propose(Task(campaign_id=c.id, technique="http_probe",
+                      host="evil.out.example", hypothesis="oob"))             # -> DENY
+    orch.propose(Task(campaign_id=c.id, technique="state_change",
+                      host="api.acme.example", hypothesis="write?"))          # -> HUMAN_APPROVAL
+
+    events = _sse_once(api, f"/api/campaign/{cid}/events?once=1")
+    names = [e for e, _ in events]
+    assert "campaign.created" in names
+    assert "task.proposed" in names
+    assert "policy.allow" in names and "task.queued" in names
+    assert "policy.deny" in names
+    assert "policy.approval_required" in names and "approval.requested" in names
+    assert names[-1] == "campaign.progress"          # stream ends on a progress snapshot
+    # every event carries a monotonic seq for ?since= resume
+    seqs = [d["seq"] for e, d in events if e != "campaign.progress"]
+    assert seqs == sorted(seqs)
+
+
+def test_sse_since_resumes_without_replaying_the_backlog(api):
+    cid = _campaign(api)
+    from argus import campaign as cmod
+    from argus.orchestrator import Orchestrator, Task
+    c = cmod.load(cid)
+    orch = Orchestrator(c)
+    orch.propose(Task(campaign_id=c.id, technique="http_probe", host="api.acme.example"))
+    full = _sse_once(api, f"/api/campaign/{cid}/events?once=1")
+    last_seq = max(d["seq"] for e, d in full if e != "campaign.progress")
+    # resume strictly after the last seen record: no old events, only the progress tail
+    resumed = _sse_once(api, f"/api/campaign/{cid}/events?once=1&since={last_seq + 1}")
+    assert [e for e, _ in resumed] == ["campaign.progress"]
+
+
+def test_sse_unknown_campaign_404(api):
+    try:
+        urllib.request.urlopen(api + "/api/campaign/nope-000/events?once=1", timeout=5)
+        assert False, "expected 404"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
 def test_write_api_input_validation(api):
     cid = _campaign(api)
     # malformed JSON
