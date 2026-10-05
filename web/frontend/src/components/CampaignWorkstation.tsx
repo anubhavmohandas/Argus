@@ -1,13 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CampaignDetail, CampaignSummary, Progress, Task, TaskState } from "../types";
+import type {
+  CampaignDetail,
+  CampaignRunState,
+  CampaignSummary,
+  EngagementLevel,
+  Progress,
+  Task,
+  TaskState,
+} from "../types";
 import {
   createCampaign,
   decideTask,
   getCampaign,
   listCampaigns,
+  startPivot,
   subscribeCampaign,
 } from "../api";
 import CampaignProgress from "./CampaignProgress";
+
+const RUN_PREFIX = "campaign.run.";
+const ACTIVE_RUN = new Set<CampaignRunState>([
+  "STARTING", "RUNNING", "PAUSING", "PAUSED", "WAITING_APPROVAL", "STOPPING",
+]);
 
 // The campaign workstation: pick/create a campaign, watch its orchestrated work live
 // (progress + dense task table + approvals), and action parked tasks. Every mutation
@@ -29,9 +43,11 @@ function hhmm(iso: string): string {
 export default function CampaignWorkstation({
   onSelectTask,
   onProgress,
+  onRunState,
 }: {
   onSelectTask?: (t: Task | null) => void;
   onProgress?: (cid: string, p: Progress) => void;
+  onRunState?: (cid: string, run: CampaignRunState) => void;
 }) {
   const [campaigns, setCampaigns] = useState<CampaignSummary[]>([]);
   const [cid, setCid] = useState<string | null>(null);
@@ -40,6 +56,7 @@ export default function CampaignWorkstation({
   const [creating, setCreating] = useState(false);
   const [programText, setProgramText] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
+  const [runState, setRunState] = useState<CampaignRunState | null>(null);
   const refetchTimer = useRef<number | null>(null);
 
   const refreshList = useCallback(() => {
@@ -66,10 +83,21 @@ export default function CampaignWorkstation({
   useEffect(() => {
     if (!cid) {
       setDetail(null);
+      setRunState(null);
       return;
     }
     loadDetail(cid);
-    const unsub = subscribeCampaign(cid, () => {
+    const unsub = subscribeCampaign(cid, (ev) => {
+      // the coordinator's run-state transitions are the authority for activity — track
+      // them directly (replayed on connect, so a fresh subscription learns current state).
+      if (ev.event.startsWith(RUN_PREFIX)) {
+        const suffix = ev.event.slice(RUN_PREFIX.length).toUpperCase();
+        if (suffix !== "RECOVERED") {
+          const rs = suffix as CampaignRunState;
+          setRunState(rs);
+          onRunState?.(cid, rs);
+        }
+      }
       if (refetchTimer.current) window.clearTimeout(refetchTimer.current);
       refetchTimer.current = window.setTimeout(() => loadDetail(cid), 250);
     });
@@ -77,7 +105,7 @@ export default function CampaignWorkstation({
       unsub();
       if (refetchTimer.current) window.clearTimeout(refetchTimer.current);
     };
-  }, [cid, loadDetail]);
+  }, [cid, loadDetail, onRunState]);
 
   const onCreate = useCallback(async () => {
     if (!programText.trim()) return;
@@ -92,6 +120,20 @@ export default function CampaignWorkstation({
       setError(String(e));
     }
   }, [programText, refreshList]);
+
+  const [pivotLevel, setPivotLevel] = useState<EngagementLevel>("active");
+  const onLaunchPivot = useCallback(async () => {
+    if (!cid) return;
+    setBusy("pivot");
+    setError(null);
+    try {
+      await startPivot(cid, pivotLevel);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }, [cid, pivotLevel]);
 
   const onDecide = useCallback(
     async (taskId: string, action: "approve" | "deny" | "cancel") => {
@@ -183,6 +225,33 @@ export default function CampaignWorkstation({
       {detail && (
         <>
           <CampaignProgress p={detail.progress} />
+
+          <div className="flex items-center gap-2 bg-panel border border-edge rounded-lg px-3 py-2">
+            <span className="text-[10px] font-mono uppercase tracking-wide text-mute">Pivot</span>
+            <select
+              value={pivotLevel}
+              onChange={(e) => setPivotLevel(e.target.value as EngagementLevel)}
+              disabled={runState != null && ACTIVE_RUN.has(runState)}
+              className="bg-panel2 border border-edge rounded px-2 py-1 text-xs font-mono text-ink outline-none focus:border-accent/60 disabled:opacity-40"
+            >
+              <option value="passive">passive</option>
+              <option value="active">active</option>
+              <option value="active-plus">active-plus</option>
+              <option value="full">full</option>
+            </select>
+            <button
+              onClick={onLaunchPivot}
+              disabled={busy === "pivot" || (runState != null && ACTIVE_RUN.has(runState))}
+              className="text-xs font-mono bg-accent/15 text-accent border border-accent/40 rounded px-3 py-1 disabled:opacity-40 hover:bg-accent/25"
+            >
+              {busy === "pivot" ? "starting…" : "start background pivot"}
+            </button>
+            {runState != null && ACTIVE_RUN.has(runState) && (
+              <span className="text-[11px] font-mono text-accent ml-1">
+                run {runState.toLowerCase()} — control it from the execution rail ↓
+              </span>
+            )}
+          </div>
 
           {pending.length > 0 && (
             <div className="bg-panel border border-medium/30 rounded-lg p-3">

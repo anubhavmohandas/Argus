@@ -190,6 +190,7 @@ import type {
   CampaignDetail,
   CampaignEvent,
   CampaignSummary,
+  RunSnapshot,
   Task,
 } from "./types";
 
@@ -246,6 +247,52 @@ export function decideTask(
   );
 }
 
+/** Start a real background pivot bound to a campaign (coordinator-owned). The body
+ * carries only bounded config (level + discovery budgets + ports) — it can never name a
+ * provider. Returns immediately with the run snapshot; SSE carries discovery + progress. */
+export function startPivot(
+  cid: string,
+  level: EngagementLevel,
+  opts: RunOptions = {}
+): Promise<{ run: RunSnapshot; seed: string; level: string }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/pivot`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ level, ...opts }),
+  });
+}
+
+/** Pause / resume / stop a campaign's run — thin controllers over the coordinator. PAUSE
+ * stops NEW dispatch (a bounded task in flight finishes); STOP preserves durable queued
+ * work. The operation is applied on the coordinator's single thread, never racing a run. */
+export function controlRun(
+  cid: string,
+  action: "pause" | "resume" | "stop"
+): Promise<{ run: RunSnapshot }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+}
+
+/** Reproduce a finding's controlled differential through the same coordinator. 409s if a
+ * run is already active (one execution owner) or the finding has no re-runnable differential. */
+export function reproduceFinding(
+  cid: string,
+  findingId: string,
+  trials = 2
+): Promise<{ run: RunSnapshot; finding: string; trials: number }> {
+  return jsonFetch(
+    `/api/campaign/${encodeURIComponent(cid)}/findings/${encodeURIComponent(findingId)}/reproduce`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trials }),
+    }
+  );
+}
+
 /** Subscribe to a campaign's structured event stream (replay from the durable audit
  * log, then live tail). Returns an unsubscribe function. The named events match
  * web/server.py's vocabulary; `onEvent` also receives every event generically so a
@@ -265,6 +312,12 @@ export function subscribeCampaign(
     "approval.requested", "approval.approved", "approval.denied",
     "experiment.created", "experiment.completed",
     "finding.promoted", "finding.transition", "identity.registered",
+    "reproduction.checked",
+    // coordinator run-state transitions — the authority for campaign activity
+    "campaign.run.starting", "campaign.run.running", "campaign.run.pausing",
+    "campaign.run.paused", "campaign.run.waiting_approval", "campaign.run.stopping",
+    "campaign.run.stopped", "campaign.run.complete", "campaign.run.failed",
+    "campaign.run.recovered",
   ];
   const handle = (name: string) => (e: Event) => {
     try {

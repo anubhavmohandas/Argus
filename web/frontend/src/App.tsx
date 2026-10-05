@@ -1,6 +1,14 @@
 import { useCallback, useRef, useState } from "react";
-import type { Dossier, EngagementLevel, GraphNode, Progress, RunState, Task } from "./types";
-import { runPivot } from "./api";
+import type {
+  CampaignRunState,
+  Dossier,
+  EngagementLevel,
+  GraphNode,
+  Progress,
+  RunState,
+  Task,
+} from "./types";
+import { controlRun, runPivot } from "./api";
 import SeedBar from "./components/SeedBar";
 import type { PivotOptions } from "./components/SeedBar";
 import RunProgress from "./components/RunProgress";
@@ -29,12 +37,18 @@ const NAV: { group: string; items: { id: View; label: string }[] }[] = [
 export default function App() {
   const [view, setView] = useState<View>("command");
   const [railProgress, setRailProgress] = useState<{ cid: string; p: Progress } | null>(null);
+  const [railRun, setRailRun] = useState<{ cid: string; runState: CampaignRunState } | null>(null);
   const [inspectTask, setInspectTask] = useState<Task | null>(null);
 
   // stable identity — the workstation keys its SSE subscription off this callback, so a
   // new identity each render would thrash the EventSource connection.
   const onProgress = useCallback((cid: string, p: Progress) => {
     setRailProgress(p.state === "IDLE" ? null : { cid, p });
+  }, []);
+  // run activity is the coordinator's authority (SSE campaign.run.*), kept separate from
+  // the verified-work percentage — the rail drives its controls off this, not off progress.
+  const onRunState = useCallback((cid: string, runState: CampaignRunState) => {
+    setRailRun({ cid, runState });
   }, []);
 
   return (
@@ -46,7 +60,11 @@ export default function App() {
           <div className="max-w-[1400px] w-full mx-auto px-5 py-5">
             {view === "command" && <CommandCenter />}
             {view === "campaigns" && (
-              <CampaignWorkstation onSelectTask={setInspectTask} onProgress={onProgress} />
+              <CampaignWorkstation
+                onSelectTask={setInspectTask}
+                onProgress={onProgress}
+                onRunState={onRunState}
+              />
             )}
             {view === "capabilities" && <Capabilities />}
           </div>
@@ -57,6 +75,7 @@ export default function App() {
       </div>
       <ExecutionRail
         progress={railProgress}
+        run={railRun}
         onOpen={() => setView("campaigns")}
       />
     </div>
@@ -107,38 +126,89 @@ function LeftNav({ view, setView }: { view: View; setView: (v: View) => void }) 
   );
 }
 
+// The global live-activity surface AND the run controller. Activity (the dot + label +
+// which buttons show) is driven by the coordinator's run state; progress is telemetry
+// that changes beside it. Elapsed/queue depth move; the percentage only tracks verified
+// work — so a ten-minute task keeps the sweep moving at a steady "Done 6/10", never faking
+// progress. Every control here operates on real campaign state (no decorative buttons).
+const ACTIVE_RUN = new Set<CampaignRunState>([
+  "STARTING", "RUNNING", "PAUSING", "PAUSED", "WAITING_APPROVAL", "STOPPING",
+]);
+
 function ExecutionRail({
   progress,
+  run,
   onOpen,
 }: {
   progress: { cid: string; p: Progress } | null;
+  run: { cid: string; runState: CampaignRunState } | null;
   onOpen: () => void;
 }) {
-  if (!progress) return null;
-  const { cid, p } = progress;
-  const running = p.state === "RUNNING";
-  return (
+  const [busy, setBusy] = useState(false);
+  // show the rail while a run is active, or while a just-finished run's telemetry stands.
+  const cid = run?.cid ?? progress?.cid ?? null;
+  const runState = run && run.cid === cid ? run.runState : null;
+  const p = progress && progress.cid === cid ? progress.p : null;
+  if (!cid || (!runState && !p)) return null;
+
+  const running = runState === "RUNNING" || runState === "STARTING";
+  const paused = runState === "PAUSED" || runState === "PAUSING";
+  const blocked = runState === "WAITING_APPROVAL";
+  const active = runState != null && ACTIVE_RUN.has(runState);
+  const label = (runState ?? p?.state ?? "idle").toLowerCase().replace(/_/g, " ");
+
+  const control = async (action: "pause" | "resume" | "stop") => {
+    setBusy(true);
+    try {
+      await controlRun(cid, action);   // SSE pushes the resulting run state back
+    } catch {
+      /* surfaced in the workstation; the rail stays quiet */
+    } finally {
+      setBusy(false);
+    }
+  };
+  const Btn = ({ label, action, danger }: { label: string; action: "pause" | "resume" | "stop"; danger?: boolean }) => (
     <button
-      onClick={onOpen}
-      className="shrink-0 h-9 border-t border-edge bg-panel flex items-center gap-4 px-4 text-xs font-mono hover:bg-panel2"
+      onClick={(e) => { e.stopPropagation(); control(action); }}
+      disabled={busy}
+      className={`text-[11px] font-mono border rounded px-2 py-0.5 disabled:opacity-40 ${
+        danger ? "text-critical border-critical/40 hover:bg-critical/15"
+               : "text-accent border-accent/40 hover:bg-accent/15"
+      }`}
     >
-      <span className="flex items-center gap-1.5">
-        <span className={`inline-block w-2 h-2 rounded-full bg-accent ${running ? "pulse-dot" : ""}`} />
-        <span className={running ? "text-accent" : "text-mute"}>{p.state.toLowerCase()}</span>
-      </span>
-      <span className="text-ink truncate max-w-[280px]">{cid}</span>
-      {p.current_technique && (
+      {label}
+    </button>
+  );
+
+  return (
+    <div className="shrink-0 h-9 border-t border-edge bg-panel flex items-center gap-4 px-4 text-xs font-mono">
+      <button onClick={onOpen} className="flex items-center gap-1.5 hover:text-accent">
+        <span className={`inline-block w-2 h-2 rounded-full ${active ? "bg-accent" : "bg-mute"} ${running ? "pulse-dot" : ""}`} />
+        <span className={active ? "text-accent" : "text-mute"}>{label}</span>
+      </button>
+      <button onClick={onOpen} className="text-ink truncate max-w-[260px] hover:underline">{cid}</button>
+      {p?.current_technique && (
         <span className="text-mute truncate">
           {p.current_technique} {p.current_task && `· ${p.current_task}`}
         </span>
       )}
       <span className="ml-auto flex items-center gap-4 text-mute">
-        <span>Queue {p.queued}</span>
-        <span>Approvals {p.approval_required}</span>
-        <span>Done {p.completed}/{p.planned}</span>
-        <span className={p.failed ? "text-critical" : ""}>Errors {p.failed}</span>
+        {p && <span>Queue {p.queued}</span>}
+        {p && <span>Approvals {p.approval_required}</span>}
+        {p && <span>Done {p.completed}/{p.planned}</span>}
+        {p && <span className={p.failed ? "text-critical" : ""}>Errors {p.failed}</span>}
+        {/* controls: each only appears when it can actually act on the current run */}
+        {(running || blocked) && <Btn label="pause" action="pause" />}
+        {paused && <Btn label="resume" action="resume" />}
+        {blocked && (
+          <button onClick={(e) => { e.stopPropagation(); onOpen(); }}
+            className="text-[11px] font-mono text-medium border border-medium/40 rounded px-2 py-0.5 hover:bg-medium/15">
+            open approvals
+          </button>
+        )}
+        {active && <Btn label="stop" action="stop" danger />}
       </span>
-    </button>
+    </div>
   );
 }
 

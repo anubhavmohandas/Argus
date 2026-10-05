@@ -150,6 +150,19 @@ export interface CampaignSummary {
   created_at: string;
   progress: Progress;
 }
+// The coordinator's run-activity state (argus/run.py RUN_STATES) — the authority for
+// "is this campaign executing", kept SEPARATE from Progress.percentage (verified work).
+export type CampaignRunState =
+  | "IDLE" | "STARTING" | "RUNNING" | "PAUSING" | "PAUSED"
+  | "WAITING_APPROVAL" | "STOPPING" | "STOPPED" | "FAILED" | "COMPLETE";
+export interface RunSnapshot {
+  campaign_id: string;
+  run_state: CampaignRunState;
+  run_id: string;
+  started_at: string;
+  detail: string;
+  updated_at: string;
+}
 export interface CampaignIdentity {
   name: string;
   role: string;
