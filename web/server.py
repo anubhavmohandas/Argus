@@ -46,6 +46,12 @@ from urllib.parse import urlparse, parse_qs
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST = Path(__file__).resolve().parent / "frontend" / "dist"
 
+# Serializes campaign WRITES (create / identity / task decisions) so two concurrent
+# HTTP threads never interleave rewrites of one campaign's durable task table.
+# occam: one global lock — campaigns are single-operator; swap for a per-campaign lock
+# only if the API ever serves enough concurrent writers for this to be a bottleneck.
+_WRITE_LOCK = threading.Lock()
+
 # Engagement level -> engine flags. Mirrors the CLI interactive menu in
 # argus/cli.py so the web UI and the terminal stay in lockstep.
 LEVELS: dict[str, list[str]] = {
@@ -279,6 +285,7 @@ def _campaign_detail(cid: str) -> dict | None:
     if cid not in set(campaign_mod.listing()):
         return None
     c = campaign_mod.load(cid)
+    identity_mod = _identity_mod()
     return {
         "id": c.id,
         "created_at": c.created_at,
@@ -288,8 +295,20 @@ def _campaign_detail(cid: str) -> dict | None:
         "experiments": c.experiments(),
         "observations": c.observations(),
         "findings": finding_mod.findings(c),
+        "tasks": c.tasks(),                   # durable orchestrator task table (the UI queue)
+        "approvals": c.approvals(),           # pending + resolved human decisions
+        "identities": [{"name": i.name, "role": i.role,
+                        "researcher_owned": i.researcher_owned, "tenant": i.tenant,
+                        "has_credential": bool(i.credential_ref)}   # never echo the ref itself
+                       for i in identity_mod.identities(c)],
         "audit": c.audit_trail()[-200:],      # tail; full trail is on disk
     }
+
+
+def _identity_mod():
+    _domain()                                 # ensures REPO_ROOT on sys.path
+    from argus import identity as identity_mod
+    return identity_mod
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -312,21 +331,56 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload.encode("utf-8"))
         self.wfile.flush()
 
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path != "/api/policy":
-            self._send_json({"error": "not found"}, code=404)
-            return
-        # Compile a pasted program page into the engagement contract. Pure parse —
-        # deterministic, no network, touches no target — so it is safe to accept a body.
+    # --- request-body helpers (trust boundary — every read is bounded + guarded) ---
+    def _raw_body(self, cap: int = 1_000_000) -> bytes | None:
+        """Read the request body, bounded. None (and a 400 already sent) if missing or
+        over `cap` — a client must never make the server allocate unboundedly."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        if length <= 0 or length > 1_000_000:          # 1 MB cap; a program page is a few KB
-            self._send_json({"error": "program text must be 1 byte - 1 MB"}, code=400)
+        if length <= 0 or length > cap:
+            self._send_json({"error": f"request body must be 1 byte - {cap} bytes"}, code=400)
+            return None
+        return self.rfile.read(length)
+
+    def _json_body(self, cap: int = 1_000_000) -> dict | None:
+        """Parse a bounded JSON object body, or send a 400 and return None."""
+        raw = self._raw_body(cap)
+        if raw is None:
+            return None
+        try:
+            obj = json.loads(raw.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            self._send_json({"error": "body is not valid JSON"}, code=400)
+            return None
+        if not isinstance(obj, dict):
+            self._send_json({"error": "body must be a JSON object"}, code=400)
+            return None
+        return obj
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/policy":
+            return self._post_policy()
+        if path == "/api/campaigns":
+            return self._post_create_campaign()
+        # /api/campaign/{id}/... remote-control endpoints — all IN-PROCESS domain calls,
+        # serialized so two writers never corrupt one campaign's durable task table.
+        parts = path.strip("/").split("/")       # ['api','campaign','{id}', ...]
+        if len(parts) >= 4 and parts[0] == "api" and parts[1] == "campaign":
+            cid, rest = parts[2], parts[3:]
+            with _WRITE_LOCK:
+                return self._post_campaign(cid, rest)
+        self._send_json({"error": "not found"}, code=404)
+
+    def _post_policy(self):
+        # Compile a pasted program page into the engagement contract. Pure parse —
+        # deterministic, no network, touches no target — so it is safe to accept a body.
+        raw = self._raw_body()
+        if raw is None:
             return
-        text = self.rfile.read(length).decode("utf-8", "replace")
+        text = raw.decode("utf-8", "replace")
         try:
             proc = subprocess.run(
                 [sys.executable, "-m", "argus", "policy", "inspect", "-", "--json"],
@@ -341,6 +395,87 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(json.loads(proc.stdout))
         except json.JSONDecodeError:
             self._send_json({"error": "could not parse compiler output"}, code=500)
+
+    def _post_create_campaign(self):
+        """POST /api/campaigns — open a campaign from a pasted program page. Frozen
+        policy is compiled in-process; no target is touched by creating one."""
+        body = self._json_body()
+        if body is None:
+            return
+        text = (body.get("program_text") or "").strip()
+        if not text:
+            self._send_json({"error": "program_text is required"}, code=400)
+            return
+        campaign_mod, _ = _domain()
+        try:
+            with _WRITE_LOCK:
+                c = campaign_mod.create(text, name=str(body.get("name") or ""))
+        except Exception as e:                      # noqa: BLE001 — report, don't crash the server
+            self._send_json({"error": f"could not create campaign: {e}"}, code=500)
+            return
+        self._send_json({"id": c.id, "created_at": c.created_at,
+                         "policy": c.policy.to_dict(), "progress": c.progress()}, code=201)
+
+    def _post_campaign(self, cid: str, rest: list[str]):
+        """Dispatch /api/campaign/{id}/... POSTs. Every branch ends at a domain /
+        orchestrator method — never at a provider. cid is validated against the
+        authoritative listing BEFORE any path is built from it (no traversal)."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        c = campaign_mod.load(cid)
+
+        if rest == ["identities"]:
+            return self._register_identity(c)
+        # /tasks/{task}/{action}
+        if len(rest) == 3 and rest[0] == "tasks" and rest[2] in ("approve", "deny", "cancel"):
+            return self._task_decision(c, rest[1], rest[2])
+        self._send_json({"error": "not found"}, code=404)
+
+    def _register_identity(self, c):
+        """POST /api/campaign/{id}/identities — declare an authorized test identity.
+        Identity.__post_init__ rejects a pasted secret as credential_ref at the boundary."""
+        body = self._json_body()
+        if body is None:
+            return
+        name = (body.get("name") or "").strip()
+        if not name:
+            self._send_json({"error": "identity name is required"}, code=400)
+            return
+        identity_mod = _identity_mod()
+        try:
+            ident = identity_mod.register(c, identity_mod.Identity(
+                name=name, role=str(body.get("role") or ""),
+                researcher_owned=bool(body.get("researcher_owned", False)),
+                credential_ref=str(body.get("credential_ref") or ""),
+                tenant=str(body.get("tenant") or "")))
+        except ValueError as e:                     # bad credential_ref / auth_template
+            self._send_json({"error": str(e)}, code=400)
+            return
+        self._send_json({"name": ident.name, "role": ident.role,
+                         "researcher_owned": ident.researcher_owned,
+                         "has_credential": bool(ident.credential_ref)}, code=201)
+
+    def _task_decision(self, c, task_id: str, action: str):
+        """POST /api/campaign/{id}/tasks/{task}/{approve|deny|cancel} — human action on a
+        parked task, straight through the Orchestrator. approve() RE-RUNS can_test, so an
+        API approval can never walk a scope/forbidden DENY back to the queue."""
+        from argus.orchestrator import Orchestrator
+        orch = Orchestrator(c)                       # adopts this campaign's durable task table
+        if task_id not in orch.tasks:
+            self._send_json({"error": f"no task {task_id!r} in campaign"}, code=404)
+            return
+        body = self._json_body() or {}
+        by = str(body.get("by") or "web-operator").strip() or "web-operator"
+        note = str(body.get("note") or "")
+        fn = {"approve": orch.approve, "deny": orch.deny, "cancel": orch.cancel}[action]
+        try:
+            t = fn(task_id, by, note)
+        except ValueError as e:                      # wrong state, or policy re-check denied
+            self._send_json({"error": str(e)}, code=409)
+            return
+        self._send_json({"task": t.to_record()})
 
     def do_GET(self):
         parsed = urlparse(self.path)
