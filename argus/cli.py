@@ -307,38 +307,35 @@ def _print_findings(findings, as_json: bool):
 
 
 def run_one(seed, pol, budget, *, on_step=None, probe=False, probe_paths=False,
-            scan=False, ports=None, cve=False, program=None):
-    """Execute ONE seed end-to-end: discovery → optional active evidence → reasoning
-    → policy filtering. The single-target primitive both `pivot` and `program` call,
-    so there is exactly one execution path. Scope/rate/budget must already be set on
-    the provider layer (the caller does that once); this never touches them, which is
-    what lets `program` share one request budget across every host. Returns
-    (graph, result, suppressed)."""
+            scan=False, ports=None, cve=False, program=None, campaign=None,
+            rate=None, max_requests=None, orch=None, scope=None):
+    """Execute ONE seed end-to-end: passive discovery → optional ACTIVE evidence
+    (orchestrated) → reasoning → policy filtering. The single-target primitive both
+    `pivot` and `program` call, so there is exactly one execution path.
+
+    Passive discovery is direct and campaign-free. Every target-touching capability
+    goes through `research.run_active` → the Orchestrator → `can_test` (first lock) →
+    worker → provider `_gate` (second lock): no active probe reaches a host without
+    orchestrator authorization. Active tiers REQUIRE an engagement context — `campaign`
+    is used when given (program/--policy), else a seed-scoped ephemeral one is created
+    so Quick Pivot stays fast but never runs fail-open. Returns (graph, result,
+    suppressed)."""
+    from . import research
     print(f"[argus] seed {seed!r} classified as: {classify(seed)}", file=sys.stderr)
     g = pivot(seed, budget, on_step=on_step)
-    if probe or probe_paths:   # providers add evidence only — the engine is untouched by this
-        n = providers.enrich(g)                 # HTTP probe -> evidence + version + clickjacking
-        t = providers.enrich_tls(g)             # TLS probe -> observed cert fingerprint
-        c = providers.enrich_cors(g)            # CORS probe -> cors_misconfig (one GET/host)
-        k = providers.enrich_kev(g)             # analysis: version -> known_exploited
-        r = providers.analyze_certificates(g)   # analysis: shared cert -> certificate_reused
-        m = providers.enrich_email_spoof(g)     # analysis: DMARC over DoH -> email_spoofable
-        s = providers.enrich_security_txt(g)    # disclosure: where to report (one GET/host)
-        line = f"probed {n} HTTP, {t} TLS, {c} CORS; {k} known-exploit, {r} cert-reuse, {m} email-spoofable, {s} security.txt"
-        if probe_paths:   # its own flag: multiplies the requests against the target
-            line += (f", {providers.enrich_admin(g)} admin-surface"
-                     f", {providers.enrich_exposure(g)} exposed-file"
-                     f", {providers.enrich_traversal(g)} path-traversal"
-                     f", {providers.enrich_graphql(g)} graphql-introspection"
-                     f", {providers.enrich_redirect(g)} open-redirect"
-                     f", {providers.enrich_injection(g)} xss/ssti")
-        print(f"[argus] {line} — evidence attached", file=sys.stderr)
-    if scan:   # loudest tier: a TCP connect scan is unmistakable in the target's logs
-        v = providers.enrich_scan(g, ports=ports)
-        print(f"[argus] port-scanned hosts; {v} with a catalog CVE — evidence attached", file=sys.stderr)
-    if cve:   # live NVD lookup over versions the probe/scan observed
-        v = providers.enrich_nvd(g)
-        print(f"[argus] NVD live lookup; {v} host(s) with a live CVE + references — evidence attached", file=sys.stderr)
+    tiers = research.tiers_for(probe, probe_paths, scan)
+    if tiers:
+        if campaign is None:   # Quick Pivot without a program: bound, seed-scoped context
+            sc = scope or (pol.scope if pol else None)
+            campaign = research.ephemeral_campaign(
+                seed, sc, rate=rate, max_requests=max_requests)
+            print(f"[argus] no program given — created seed-scoped campaign {campaign.id} "
+                  f"for active work (fail-closed outside {seed!r})", file=sys.stderr)
+        orch = research.run_active(campaign, g, tiers=tiers, ports=ports, cve=cve, orch=orch)
+        p = orch.progress()
+        print(f"[argus] orchestrated active mapping: {p['completed']} task(s) executed, "
+              f"{p['denied']} denied, {p['approval_required']} need approval "
+              f"(campaign {campaign.id})", file=sys.stderr)
     result = investigate(g)   # discovery -> reasoning: the one result object
     suppressed = []
     if pol:   # program policy: suppress findings it declared non-reportable / out of scope
@@ -638,15 +635,19 @@ def _run(argv=None):
             print("[argus] dry run — add --probe / --probe-paths / --scan to execute the queue", file=sys.stderr)
             return 0
 
-        # One shared budget for the whole run: apply the policy ONCE, override the
-        # cap/rate from the CLI if given, and never reconfigure between hosts.
+        # The program IS one campaign: frozen policy, one durable task table, ONE shared
+        # orchestrator so rate + request budget are shared across every host (not reset
+        # per host). CLI --rate/--max-requests override the program's own caps.
+        from . import campaign as cmod, orchestrator as omod
+        camp = cmod.create(Path(args.file).read_text(), name=args.file)
         if args.max_requests is not None:
-            pol.max_requests = args.max_requests
+            camp.policy.max_requests = args.max_requests
         if args.rate is not None:
-            pol.rate_per_sec = args.rate
-        pol.apply()
-        for h in pol.unfilled_headers():
+            camp.policy.rate_per_sec = args.rate
+        orch = omod.Orchestrator(camp)
+        for h in camp.policy.unfilled_headers():
             print(f"[argus] WARNING: required header still a placeholder — {h}", file=sys.stderr)
+        print(f"[argus] campaign {camp.id} — active work is orchestrator-gated", file=sys.stderr)
         try:
             ports = providers.parse_ports(args.ports) if (args.scan and args.ports) else None
         except ValueError as e:
@@ -657,7 +658,8 @@ def _run(argv=None):
 
         runs, failed = [], []
         for a in queue:
-            if providers.budget_exhausted():
+            th = orch._exec_context().throttle
+            if th.remaining is not None and th.remaining <= 0:
                 print(f"[argus] shared request budget exhausted — stopping before {a.pattern}", file=sys.stderr)
                 break
             print(f"\n[argus] ── {a.pattern}  ({('tier' + str(a.tier)) if a.tier else 'tier-'} {a.action}) ──",
@@ -665,7 +667,8 @@ def _run(argv=None):
             try:
                 g, result, _ = run_one(a.pattern, pol, budget, on_step=_progress,
                                        probe=args.probe, probe_paths=args.probe_paths,
-                                       scan=args.scan, ports=ports, cve=args.cve, program=a.pattern)
+                                       scan=args.scan, ports=ports, cve=args.cve,
+                                       program=a.pattern, campaign=camp, orch=orch)
             except Exception as e:   # one bad host must not kill the program run
                 print(f"[argus] {a.pattern} failed: {e} — continuing", file=sys.stderr)
                 failed.append((a.pattern, str(e)))
@@ -698,35 +701,31 @@ def _run(argv=None):
         return 0
 
     if args.cmd == "pivot":
-        # Engagement policy, set before any provider runs. Always reset both, so a
-        # menu-driven second run never inherits the first run's scope/rate.
-        pol = None
+        # Engagement context for ACTIVE work (orchestrator-gated). --policy is a full
+        # program (one campaign); --scope is an allowlist (seed-scoped campaign honouring
+        # it); bare Quick Pivot scopes to the seed. Passive discovery needs none of this.
+        pol, campaign, scope = None, None, None
+        providers.reset_engagement()   # a menu-driven second run inherits no prior globals
         if args.policy:
             try:
-                pol = policy.compile(Path(args.policy).read_text())
+                prog_text = Path(args.policy).read_text()
             except OSError as e:
                 print(f"error: cannot read policy file {args.policy!r}: {e}", file=sys.stderr)
                 return 2
-            pol.apply()   # scope + rate, from the compiled program
-            print(f"[argus] engagement policy compiled from {args.policy!r}", file=sys.stderr)
+            pol = policy.compile(prog_text)
+            from . import campaign as cmod
+            campaign = cmod.create(prog_text, name=args.policy)
+            print(f"[argus] engagement policy compiled from {args.policy!r} — campaign {campaign.id}",
+                  file=sys.stderr)
             for ln in pol.summary().splitlines():
                 print(f"        {ln}", file=sys.stderr)
         elif args.scope:
             try:
-                providers.set_scope(scope_mod.load(args.scope))
+                scope = scope_mod.load(args.scope)
             except ValueError as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 2
             print(f"[argus] scope loaded from {args.scope!r} — active probes limited to in-scope hosts", file=sys.stderr)
-        else:
-            providers.set_scope(None)
-        if not pol:
-            providers.set_policy(None)   # disarm a prior --policy run's gate (stale policy would
-                                         # otherwise govern _permitted instead of this run's scope)
-            providers.set_rate(args.rate, args.max_requests)
-            providers.set_headers()   # clear ID headers a prior --policy run installed —
-                                      # same reset discipline as scope/rate, or program A's
-                                      # identity header leaks onto program B's targets
         try:
             ports = providers.parse_ports(args.ports) if (args.scan and args.ports) else None
         except ValueError as e:
@@ -737,7 +736,9 @@ def _run(argv=None):
                         expand_subdomains=args.deep)
         g, result, _ = run_one(args.seed, pol, budget, on_step=_progress,
                                probe=args.probe, probe_paths=args.probe_paths,
-                               scan=args.scan, ports=ports, cve=args.cve, program=args.seed)
+                               scan=args.scan, ports=ports, cve=args.cve, program=args.seed,
+                               campaign=campaign, scope=scope,
+                               rate=args.rate, max_requests=args.max_requests)
         if past:  # investigation memory — "I've seen this before"
             print("[argus] seen before —", file=sys.stderr)
             for line in store.memory_block(past, g).splitlines():

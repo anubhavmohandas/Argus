@@ -160,7 +160,18 @@ class Orchestrator:
         self.workers: dict[str, callable] = dict(_DEFAULT_WORKERS)
         self._started_at = ""                  # set on first proposal
         self._last_completed = ""              # id of the last EVALUATED task
+        self._ctx = None                       # campaign ExecutionContext, built once (see _exec_context)
         self._load()                           # durable: adopt this campaign's persisted queue
+
+    def _exec_context(self):
+        """This campaign's bound ExecutionContext, built ONCE and reused across every
+        step. Caching it is what makes rate + request budget SHARED across all tasks this
+        orchestrator runs (the program command's one-cap-for-the-whole-run); rebuilding
+        it per step would hand each task a fresh budget. A new process (restart) starts a
+        fresh context — budget is a per-run politeness cap, not a durable ledger."""
+        if self._ctx is None:
+            self._ctx = self.c.policy.execution_context(self.c.id)
+        return self._ctx
 
     # --- durability: the task table lives on disk, not just in this process ---
     def _load(self) -> None:
@@ -398,7 +409,7 @@ class Orchestrator:
             # Bind THIS campaign's engagement context for the span of the worker, so its
             # outbound requests (and its fan-out threads, via providers._CtxPool) use this
             # campaign's scope/rate/budget/headers — never another campaign's process state.
-            with providers.bound_context(self.c.policy.execution_context(self.c.id)):
+            with providers.bound_context(self._exec_context()):
                 result = worker(t, self.c)
         except Exception as e:                  # noqa: BLE001 — a worker fault must not kill the loop
             retry = t.attempts < t.max_attempts
