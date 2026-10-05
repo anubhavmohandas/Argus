@@ -88,6 +88,7 @@ class CampaignRunCoordinator:
         self._paused = False
         self._stopping = False
         self._planner = None                   # optional callable(self) run once at run start
+        self._on_complete = None                # optional callable(self) run when the drain completes
         self._detail = ""
         self._started_at = ""
         self._state = self._recover_state()
@@ -152,11 +153,13 @@ class CampaignRunCoordinator:
                 "started_at": started, "detail": self._detail, "updated_at": _now()}
 
     # --- command surface (called from HTTP/CLI threads) -------------------
-    def start(self, *, planner=None, wait: float = 0.0) -> dict:
+    def start(self, *, planner=None, on_complete=None, wait: float = 0.0) -> dict:
         """Begin (or resume ownership of) a run. Idempotent: a second concurrent start
         finds the loop already alive and returns the live snapshot — one owner, never a
         second loop. `planner(self)` (optional) proposes work on the loop thread before
-        the drain begins (Phase 2's background pivot). Returns quickly."""
+        the drain begins (the background pivot); `on_complete(self)` (optional) runs on the
+        same thread once the drain finishes (passive analysis / projection). Returns
+        quickly — SSE carries the rest."""
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return self.snapshot_locked()
@@ -164,6 +167,7 @@ class CampaignRunCoordinator:
             self._paused = False
             self._stopping = False
             self._planner = planner
+            self._on_complete = on_complete
             self._started_at = _now()
             # STARTING is reachable from every resting state in the table. Persist +
             # audit it BEFORE the loop thread starts, so STARTING is always ordered ahead
@@ -258,6 +262,9 @@ class CampaignRunCoordinator:
                     self._wake.wait(timeout=1.0)  # woken by an approve/deny command
                     self._wake.clear()
                     continue
+                if self._on_complete is not None:
+                    self._on_complete(self)       # passive analysis / projection, serialized here
+                    self._on_complete = None      # run once per run
                 self._finish(run_id, "COMPLETE")
                 return
         except BaseException as e:              # noqa: BLE001 — a loop fault must be recorded, not silent

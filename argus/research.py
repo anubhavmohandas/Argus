@@ -122,17 +122,11 @@ def _make_worker(graph):
     return worker
 
 
-def run_active(campaign, graph, *, tiers: set[str], ports=None, cve: bool = False,
-               orch: Orchestrator | None = None) -> Orchestrator:
-    """Route the graph's active enrichment through the orchestrator. Builds one bounded
-    Task per (probeable host, technique), proposes each (can_test parks/denies out-of-
-    scope or forbidden ones — their worker never runs), drains the ready queue, then runs
-    the passive analysis enrichers directly on the graph. Returns the Orchestrator so the
-    caller can read the durable task table / progress.
-
-    Pass `orch` to reuse ONE orchestrator across several graphs (the `program` command,
-    so rate + request budget are shared across every host, not reset per host)."""
-    orch = orch or Orchestrator(campaign)
+def _register_and_propose(orch: Orchestrator, campaign, graph, tiers: set[str], ports) -> None:
+    """Register the enrichment worker and propose one bounded Task per (probeable host,
+    technique). Proposal runs can_test immediately, so out-of-scope / forbidden tasks park
+    or deny here; nothing executes yet. Shared by the synchronous run_active and the
+    coordinator-driven background pivot so there is exactly one proposal path."""
     worker = _make_worker(graph)
     bundles = _bundles(tiers)
     for tech in bundles:
@@ -145,12 +139,60 @@ def run_active(campaign, graph, *, tiers: set[str], ports=None, cve: bool = Fals
                 hypothesis=f"active {tech} of {ent.value}",
                 spec={"enrichers": names, "etype": ent.type,
                       "ports": ports if tech == "port_scan" else None}))
-    orch.run()
+
+
+def _run_analysis(graph, cve: bool) -> None:
+    """Run the passive analysis / public-record enrichers on the graph. These touch no
+    target (local catalog, graph-internal comparison, public resolver/API), so they run
+    directly — AFTER active probing, since enrich_kev/nvd read observed versions."""
     for name, needs_cve in _ANALYSIS:
         if needs_cve and not cve:
             continue
         getattr(providers, name)(graph)
+
+
+def run_active(campaign, graph, *, tiers: set[str], ports=None, cve: bool = False,
+               orch: Orchestrator | None = None) -> Orchestrator:
+    """Route the graph's active enrichment through the orchestrator. Builds one bounded
+    Task per (probeable host, technique), proposes each (can_test parks/denies out-of-
+    scope or forbidden ones — their worker never runs), drains the ready queue, then runs
+    the passive analysis enrichers directly on the graph. Returns the Orchestrator so the
+    caller can read the durable task table / progress.
+
+    Pass `orch` to reuse ONE orchestrator across several graphs (the `program` command,
+    so rate + request budget are shared across every host, not reset per host)."""
+    orch = orch or Orchestrator(campaign)
+    _register_and_propose(orch, campaign, graph, tiers, ports)
+    orch.run()
+    _run_analysis(graph, cve)
     return orch
+
+
+def background_pivot(seed: str, *, budget=None, tiers: set[str], ports=None, cve: bool = False):
+    """Return (planner, on_complete) to drive a background Quick Pivot through a
+    CampaignRunCoordinator. The planner runs passive discovery and proposes the active
+    Tasks ON the coordinator's loop thread (serialized with every operator command); the
+    coordinator then drains them step by step, so pause/stop are honored mid-pivot. When
+    the drain completes, on_complete runs the passive analysis enrichers on the same graph.
+
+    The graph is captured in the closure so the coordinator stays domain-agnostic — it
+    orchestrates tasks and knows nothing about pivot graphs."""
+    graph_box: dict = {}
+
+    def planner(co) -> None:
+        import sys
+        g = pivot_mod.pivot(seed, budget)
+        graph_box["graph"] = g
+        _register_and_propose(co.orch, co.c, g, tiers, ports)
+        print(f"[argus] background pivot {seed!r}: proposed {len(co.orch.tasks)} task(s) "
+              f"in campaign {co.c.id}", file=sys.stderr)
+
+    def on_complete(co) -> None:
+        g = graph_box.get("graph")
+        if g is not None:
+            _run_analysis(g, cve)
+
+    return planner, on_complete
 
 
 def ephemeral_campaign(seed: str, scope=None, *, rate=None, max_requests=None) -> "campaign_mod.Campaign":

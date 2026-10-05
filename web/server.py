@@ -311,6 +311,68 @@ def _identity_mod():
     return identity_mod
 
 
+def _coordinator(c):
+    """This campaign's single run coordinator (one per id, process-wide). All execution
+    mutations route through it so the durable task table has exactly one writer."""
+    _domain()                                 # ensures REPO_ROOT on sys.path
+    from argus import run as run_mod
+    return run_mod.coordinator_for(c)
+
+
+# engagement level -> (probe, probe_paths, scan, cve) for the background pivot. Mirrors the
+# LEVELS flag map so the UI, the terminal, and the background run stay in lockstep. The UI
+# picks a level; it can never name a provider or technique directly.
+_PIVOT_TIERS: dict[str, tuple[bool, bool, bool, bool]] = {
+    "passive":     (False, False, False, False),
+    "active":      (True,  False, False, True),
+    "active-plus": (False, True,  False, True),
+    "full":        (False, True,  True,  True),
+}
+
+
+def _pivot_budget(body: dict):
+    """Build a bounded discovery Budget from operator-controlled integers, same ranges as
+    the CLI's --depth/--max/--deep. Out-of-range or non-integer input is a 400, not a clamp."""
+    from argus.pivot import Budget
+
+    def val(key: str, lo: int, hi: int, default: int) -> int:
+        v = body.get(key)
+        if v in (None, ""):
+            return default
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be an integer")
+        if not (lo <= v <= hi):
+            raise ValueError(f"{key} out of range [{lo},{hi}]")
+        return v
+
+    return Budget(max_depth=val("depth", 1, 5, 2),
+                  max_entities=val("max", 1, 500, 40),
+                  expand_subdomains=val("deep", 0, 50, 0))
+
+
+def _pivot_ports(body: dict) -> str | None:
+    ports = body.get("ports")
+    if not ports:
+        return None
+    s = str(ports)
+    if not all(ch.isdigit() or ch in ",-" for ch in s):
+        raise ValueError("ports spec invalid")
+    return s
+
+
+def _campaign_seed(c) -> str:
+    """A concrete host to seed background discovery from, taken from the campaign's own
+    scope — never an arbitrary target. A wildcard include (`*.acme.example`) seeds its apex
+    for DISCOVERY only; active probes are still gated by can_test against the real scope."""
+    for pat in c.policy.scope.include_patterns():
+        h = pat.strip().lstrip("*").lstrip(".").rstrip(".").lower()
+        if h and "/" not in h and " " not in h:
+            return h
+    return ""
+
+
 # --- structured campaign events (Phase 3) ---------------------------------
 # The event stream is built from the campaign's PERSISTED, append-only audit log
 # (campaign/audit.jsonl) — NOT from forwarded stderr. Each audit record maps to one or
@@ -331,6 +393,7 @@ _EVENT_MAP = {
     "identity_registered": "identity.registered",
     "differential_recorded": "experiment.completed",
     "differential_blocked": "policy.deny",
+    "run_recovered": "campaign.run.recovered",
 }
 _VERDICT_EVENT = {
     "ALLOW": "policy.allow", "ALLOW_WITH_LIMITS": "policy.limit",
@@ -345,6 +408,11 @@ def _structured_events(rec: dict, seq: int):
     approval requested), so the UI's queue + approval panels update from one record."""
     data = dict(rec, seq=seq)
     ev = rec.get("event", "")
+    if ev == "run_transition":
+        # the coordinator is the authority for run activity: one event per state, so the
+        # UI drives its execution rail from run state, NOT from "are there queued tasks".
+        yield f"campaign.run.{str(rec.get('state', '')).lower()}", data
+        return
     if ev == "policy_decision":
         verdict = rec.get("verdict", "")
         yield _VERDICT_EVENT.get(verdict, "policy.decision"), data
@@ -414,13 +482,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_policy()
         if path == "/api/campaigns":
             return self._post_create_campaign()
-        # /api/campaign/{id}/... remote-control endpoints — all IN-PROCESS domain calls,
-        # serialized so two writers never corrupt one campaign's durable task table.
+        # /api/campaign/{id}/... remote-control endpoints. Execution mutations (pivot,
+        # pause/resume/stop, task decisions) route through the per-campaign coordinator,
+        # which owns mutation ordering on its single thread — NO global lock around those,
+        # so one campaign's long run never blocks another campaign's HTTP writes. Identity
+        # registration touches campaign files outside the task table, so it keeps the lock.
         parts = path.strip("/").split("/")       # ['api','campaign','{id}', ...]
         if len(parts) >= 4 and parts[0] == "api" and parts[1] == "campaign":
-            cid, rest = parts[2], parts[3:]
-            with _WRITE_LOCK:
-                return self._post_campaign(cid, rest)
+            return self._post_campaign(parts[2], parts[3:])
         self._send_json({"error": "not found"}, code=404)
 
     def _post_policy(self):
@@ -467,7 +536,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _post_campaign(self, cid: str, rest: list[str]):
         """Dispatch /api/campaign/{id}/... POSTs. Every branch ends at a domain /
-        orchestrator method — never at a provider. cid is validated against the
+        coordinator method — never at a provider. cid is validated against the
         authoritative listing BEFORE any path is built from it (no traversal)."""
         campaign_mod, _ = _domain()
         if cid not in set(campaign_mod.listing()):
@@ -476,7 +545,12 @@ class Handler(BaseHTTPRequestHandler):
         c = campaign_mod.load(cid)
 
         if rest == ["identities"]:
-            return self._register_identity(c)
+            with _WRITE_LOCK:                     # not task-table work — keep the simple lock
+                return self._register_identity(c)
+        if rest == ["pivot"]:
+            return self._start_pivot(c)
+        if rest and rest[0] in ("pause", "resume", "stop") and len(rest) == 1:
+            return self._run_control(c, rest[0])
         # /tasks/{task}/{action}
         if len(rest) == 3 and rest[0] == "tasks" and rest[2] in ("approve", "deny", "cancel"):
             return self._task_decision(c, rest[1], rest[2])
@@ -508,23 +582,65 @@ class Handler(BaseHTTPRequestHandler):
 
     def _task_decision(self, c, task_id: str, action: str):
         """POST /api/campaign/{id}/tasks/{task}/{approve|deny|cancel} — human action on a
-        parked task, straight through the Orchestrator. approve() RE-RUNS can_test, so an
-        API approval can never walk a scope/forbidden DENY back to the queue."""
-        from argus.orchestrator import Orchestrator
-        orch = Orchestrator(c)                       # adopts this campaign's durable task table
-        if task_id not in orch.tasks:
+        parked task, routed through the campaign's coordinator so it is serialized with any
+        live run (never a second Orchestrator racing the task table). approve() RE-RUNS
+        can_test, so an API approval can never walk a scope/forbidden DENY back to the
+        queue — the coordinator does not weaken that invariant."""
+        co = _coordinator(c)
+        if task_id not in co.orch.tasks:
             self._send_json({"error": f"no task {task_id!r} in campaign"}, code=404)
             return
         body = self._json_body() or {}
         by = str(body.get("by") or "web-operator").strip() or "web-operator"
         note = str(body.get("note") or "")
-        fn = {"approve": orch.approve, "deny": orch.deny, "cancel": orch.cancel}[action]
+        fn = {"approve": co.approve, "deny": co.deny, "cancel": co.cancel}[action]
         try:
-            t = fn(task_id, by, note)
-        except ValueError as e:                      # wrong state, or policy re-check denied
+            t = fn(task_id, by, note)                 # applied on the coordinator's single thread
+        except ValueError as e:                       # wrong state, or policy re-check denied
             self._send_json({"error": str(e)}, code=409)
             return
-        self._send_json({"task": t.to_record()})
+        self._send_json({"task": t.to_record(), "run": co.snapshot()})
+
+    def _start_pivot(self, c):
+        """POST /api/campaign/{id}/pivot — start a REAL background research run bound to
+        this campaign. The body carries only bounded, operator-controlled configuration
+        (engagement level + budgets + ports); it can NEVER name a provider or function.
+        UI intent is translated into the known research planner. Returns immediately with
+        the run snapshot — SSE (/events) carries discovery, tasks, and progress."""
+        body = self._json_body() or {}
+        level = str(body.get("level") or "passive")
+        if level not in _PIVOT_TIERS:
+            self._send_json({"error": f"unknown engagement level: {level!r}"}, code=400)
+            return
+        try:
+            budget = _pivot_budget(body)
+            ports = _pivot_ports(body)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, code=400)
+            return
+        # the seed is the campaign's own scope, not an arbitrary target: derive it from the
+        # program so a background pivot cannot be aimed outside the engagement.
+        seed = _campaign_seed(c)
+        if not seed:
+            self._send_json({"error": "campaign has no concrete in-scope seed to pivot from"},
+                            code=409)
+            return
+        from argus import research
+        probe, probe_paths, scan, cve = _PIVOT_TIERS[level]
+        tiers = research.tiers_for(probe, probe_paths, scan)
+        planner, on_complete = research.background_pivot(
+            seed, budget=budget, tiers=tiers, ports=ports, cve=cve)
+        co = _coordinator(c)
+        snap = co.start(planner=planner, on_complete=on_complete)
+        self._send_json({"run": snap, "seed": seed, "level": level}, code=202)
+
+    def _run_control(self, c, action: str):
+        """POST /api/campaign/{id}/{pause|resume|stop} — thin controller over the
+        coordinator. Returns the run snapshot; the operation itself is applied on the
+        coordinator's single thread, so it never races a live run."""
+        co = _coordinator(c)
+        snap = {"pause": co.pause, "resume": co.resume, "stop": co.stop}[action]()
+        self._send_json({"run": snap})
 
     def do_GET(self):
         parsed = urlparse(self.path)
