@@ -90,6 +90,94 @@ export interface Dossier {
 
 export type RunState = "idle" | "running" | "done" | "error";
 
+// ---- campaign control plane (the orchestrator read/write model) ----
+// Mirrors the server read model (web/server.py _campaign_detail) and the durable
+// Task/Approval records (argus/orchestrator.py). The UI never invents a task state —
+// these are exactly the orchestrator's closed vocabularies.
+export type TaskState =
+  | "CREATED" | "POLICY_CHECKED" | "DENIED" | "APPROVAL_REQUIRED"
+  | "QUEUED" | "RUNNING" | "RETRY_SCHEDULED" | "INTERRUPTED"
+  | "COMPLETED" | "FAILED" | "EVALUATED" | "PAUSED" | "CANCELLED";
+
+export interface Task {
+  id: string;
+  technique: string;
+  host: string;
+  hypothesis: string;
+  state: TaskState;
+  verdict: string;
+  verdict_reason: string;
+  experiment_id: string;
+  attempts: number;
+  created_at: string;
+  updated_at: string;
+  [k: string]: unknown;
+}
+export interface Approval {
+  id: string;
+  task_id: string;
+  reason: string;
+  policy_reason: string;
+  decision: string; // "" = pending | APPROVE_ONCE | DENY | CANCEL
+  requested_at: string;
+  resolved_at: string;
+  resolved_by: string;
+  note: string;
+}
+// The orchestrator's work-unit snapshot (argus/orchestrator.py progress()). `percentage`
+// is VERIFIED work (completed/planned), never time-based; `state` drives the UI heartbeat.
+export interface Progress {
+  campaign_id: string;
+  source: string;
+  state: "RUNNING" | "WAITING" | "BLOCKED" | "COMPLETE" | "IDLE";
+  planned: number;
+  completed: number;
+  running: number;
+  queued: number;
+  blocked: number;
+  approval_required: number;
+  denied: number;
+  failed: number;
+  cancelled: number;
+  queue_depth: number;
+  percentage: number;
+  current_task: string;
+  current_technique: string;
+  last_completed: string;
+}
+export interface CampaignSummary {
+  id: string;
+  created_at: string;
+  progress: Progress;
+}
+export interface CampaignIdentity {
+  name: string;
+  role: string;
+  researcher_owned: boolean;
+  tenant?: string;
+  has_credential: boolean;
+}
+export interface CampaignDetail {
+  id: string;
+  created_at: string;
+  program_text: string;
+  policy: Policy;
+  progress: Progress;
+  experiments: Record<string, unknown>[];
+  observations: Record<string, unknown>[];
+  findings: Record<string, unknown>[];
+  tasks: Task[];
+  approvals: Approval[];
+  identities: CampaignIdentity[];
+  audit: Record<string, unknown>[];
+}
+// One structured SSE event (web/server.py _structured_events). `event` is the typed
+// name; `data` carries the audit record plus its `seq` for ?since= resume.
+export interface CampaignEvent {
+  event: string;
+  data: Record<string, unknown> & { seq?: number };
+}
+
 // ---- engagement policy (compiled from a pasted program page) ----
 export interface PolicyAsset {
   pattern: string;

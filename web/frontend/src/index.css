@@ -40,3 +40,24 @@ body {
 .pulse-dot {
   animation: pulse-dot 1.1s ease-in-out infinite;
 }
+
+/* Energy pulse that travels through the COMPLETED section of a progress bar while a
+   campaign is RUNNING. It communicates "still working" WITHOUT advancing the
+   percentage — the width is factual (completed/planned); only this sheen moves. */
+@keyframes energy-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.energy-sweep {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(94, 234, 212, 0) 20%,
+    rgba(94, 234, 212, 0.55) 50%,
+    rgba(94, 234, 212, 0) 80%,
+    transparent 100%
+  );
+  animation: energy-sweep 1.6s ease-in-out infinite;
+}

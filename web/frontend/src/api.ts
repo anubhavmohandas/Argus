@@ -185,6 +185,98 @@ export async function health(): Promise<{
   return r.json();
 }
 
+// ---- campaign control plane (orchestrator remote control) ----
+import type {
+  CampaignDetail,
+  CampaignEvent,
+  CampaignSummary,
+  Task,
+} from "./types";
+
+async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
+  const r = await fetch(url, init);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((data as { error?: string }).error || `${r.status} ${r.statusText}`);
+  return data as T;
+}
+
+export function listCampaigns(): Promise<{ campaigns: CampaignSummary[] }> {
+  return jsonFetch("/api/campaigns");
+}
+
+export function getCampaign(id: string): Promise<CampaignDetail> {
+  return jsonFetch(`/api/campaign?id=${encodeURIComponent(id)}`);
+}
+
+export function createCampaign(programText: string, name = ""): Promise<{ id: string }> {
+  return jsonFetch("/api/campaigns", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ program_text: programText, name }),
+  });
+}
+
+export function registerIdentity(
+  cid: string,
+  ident: { name: string; role?: string; researcher_owned?: boolean; credential_ref?: string; tenant?: string }
+): Promise<{ name: string }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/identities`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(ident),
+  });
+}
+
+/** Approve / deny / cancel a parked task — straight through the orchestrator, which
+ * re-runs can_test on approve (a UI approval can never override a scope/forbidden DENY). */
+export function decideTask(
+  cid: string,
+  taskId: string,
+  action: "approve" | "deny" | "cancel",
+  by = "web-operator",
+  note = ""
+): Promise<{ task: Task }> {
+  return jsonFetch(
+    `/api/campaign/${encodeURIComponent(cid)}/tasks/${encodeURIComponent(taskId)}/${action}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ by, note }),
+    }
+  );
+}
+
+/** Subscribe to a campaign's structured event stream (replay from the durable audit
+ * log, then live tail). Returns an unsubscribe function. The named events match
+ * web/server.py's vocabulary; `onEvent` also receives every event generically so a
+ * consumer can refresh on any change without enumerating names. */
+export function subscribeCampaign(
+  cid: string,
+  onEvent: (ev: CampaignEvent) => void,
+  since?: number
+): () => void {
+  const q = since != null ? `?since=${since}` : "";
+  const es = new EventSource(`/api/campaign/${encodeURIComponent(cid)}/events${q}`);
+  const NAMES = [
+    "campaign.created", "campaign.progress",
+    "task.proposed", "task.queued", "task.retry", "task.completed",
+    "task.cancelled", "task.failed",
+    "policy.allow", "policy.limit", "policy.deny", "policy.approval_required",
+    "approval.requested", "approval.approved", "approval.denied",
+    "experiment.created", "experiment.completed",
+    "finding.promoted", "finding.transition", "identity.registered",
+  ];
+  const handle = (name: string) => (e: Event) => {
+    try {
+      onEvent({ event: name, data: JSON.parse((e as MessageEvent).data) });
+    } catch {
+      /* ignore malformed frame */
+    }
+  };
+  for (const n of NAMES) es.addEventListener(n, handle(n));
+  return () => es.close();
+}
+
 export interface ModuleCallbacks {
   onStatus?: (line: string) => void;
   onResult?: (findings: Finding[]) => void;
