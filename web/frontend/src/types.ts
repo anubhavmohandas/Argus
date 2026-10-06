@@ -184,6 +184,53 @@ export interface CampaignDetail {
   identities: CampaignIdentity[];
   audit: Record<string, unknown>[];
 }
+// ---- observed application surface (argus/traffic.py) ----
+// An Endpoint is the INTERPRETATION of captured requests to one normalized route; it
+// carries parameter NAMES and references, never raw values or secrets. A CaptureRecord is
+// the raw request EVIDENCE, already redacted at capture time.
+export interface Endpoint {
+  id: string;
+  method: string;
+  scheme: string;
+  host: string;
+  path_template: string;
+  query_params: string[];
+  body_params: string[];
+  content_types: string[];
+  identities: string[];
+  session_ids: string[];
+  auth: "required" | "none" | "unknown";
+  response_classes: string[];
+  sample_capture_ids: string[];
+  obs_count: number;
+  created_at: string;
+  last_seen: string;
+}
+export interface CaptureRecord {
+  id: string;
+  method: string;
+  host: string;
+  path: string;
+  url: string; // redacted
+  headers: Record<string, string>; // redacted
+  body_excerpt: string;
+  identity: string;
+  session_id: string;
+  response_status: number | null;
+  source: string;
+  captured_at: string;
+}
+export interface TrafficSession {
+  id: string;
+  identity: string;
+  base_origin: string;
+  auth_mechanism: string;
+  status: string;
+  source: string;
+  last_seen: string;
+  has_credential: boolean;
+}
+
 // One structured SSE event (web/server.py _structured_events). `event` is the typed
 // name; `data` carries the audit record plus its `seq` for ?since= resume.
 export interface CampaignEvent {

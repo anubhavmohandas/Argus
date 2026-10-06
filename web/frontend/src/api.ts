@@ -190,8 +190,11 @@ import type {
   CampaignDetail,
   CampaignEvent,
   CampaignSummary,
+  CaptureRecord,
+  Endpoint,
   RunSnapshot,
   Task,
+  TrafficSession,
 } from "./types";
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
@@ -337,6 +340,51 @@ export function subscribeCampaign(
   };
   for (const n of NAMES) es.addEventListener(n, handle(n));
   return () => es.close();
+}
+
+// ---- observed application surface (traffic knowledge) ----
+
+/** The observed endpoint catalog + sessions for a campaign. Names and references only —
+ * the read model never carries a captured secret. */
+export function getEndpoints(cid: string): Promise<{ endpoints: Endpoint[]; sessions: TrafficSession[] }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/endpoints`);
+}
+
+/** One endpoint plus its captures (the inspector evidence) — captures are redacted. */
+export function getEndpoint(cid: string, epId: string): Promise<{ endpoint: Endpoint; captures: CaptureRecord[] }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/endpoints?ep=${encodeURIComponent(epId)}`);
+}
+
+/** Declare a researcher-controlled session. credential_ref is an ENV VAR NAME — a pasted
+ * secret is rejected by the server at the boundary. */
+export function registerSession(
+  cid: string,
+  s: { identity?: string; base_origin?: string; auth_mechanism?: string; credential_ref?: string; source?: string }
+): Promise<{ id: string; has_credential: boolean }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/sessions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(s),
+  });
+}
+
+/** Ingest researcher-captured traffic: a browser HAR export, or one structured request.
+ * Secrets are redacted server-side before anything is persisted. Returns the touched
+ * endpoints so the surface can refresh. */
+export function ingestTraffic(
+  cid: string,
+  payload: {
+    identity?: string;
+    session_id?: string;
+    har?: unknown;
+    request?: { method?: string; url: string; headers?: Record<string, string>; body?: string; response?: { status?: number } };
+  }
+): Promise<{ ingested: number; endpoints: Endpoint[] }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/traffic`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 export interface ModuleCallbacks {

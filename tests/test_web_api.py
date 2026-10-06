@@ -230,6 +230,51 @@ def test_stream_refuses_active_engagement(api):
         server._build_argv("api.acme.example", "active", {})
 
 
+def test_traffic_ingest_and_endpoint_catalog_over_http(api):
+    cid = _campaign(api)
+    # a session referenced by env-var name; the credential value is never echoed back
+    code, s = _req(api, f"/api/campaign/{cid}/sessions", "POST",
+                   {"identity": "user_a", "base_origin": "https://api.acme.example",
+                    "credential_ref": "ACME_USER_A_TOKEN"})
+    assert code == 201 and s["has_credential"] is True and "credential_ref" not in s
+    sid = s["id"]
+
+    # ingest a single captured request carrying secrets — they must not come back
+    code, body = _req(api, f"/api/campaign/{cid}/traffic", "POST", {
+        "identity": "user_a", "session_id": sid,
+        "request": {"method": "GET",
+                    "url": "https://api.acme.example/api/orders/123?token=LEAKME&page=1",
+                    "headers": {"Authorization": "Bearer LEAKME"},
+                    "response": {"status": 200}}})
+    assert code == 201, body
+    assert "LEAKME" not in json.dumps(body)        # the catalog carries names, never secrets
+    ep = body["endpoints"][0]
+    assert ep["path_template"] == "/api/orders/{id}" and "page" in ep["query_params"]
+
+    # the catalog + sessions read model
+    code, cat = _req(api, f"/api/campaign/{cid}/endpoints")
+    assert code == 200 and len(cat["endpoints"]) == 1
+    assert cat["sessions"][0]["id"] == sid and "credential_ref" not in cat["sessions"][0]
+
+    # the inspector: one endpoint + its captures (evidence), still secret-free
+    code, ins = _req(api, f"/api/campaign/{cid}/endpoints?ep={ep['id']}")
+    assert code == 200 and ins["endpoint"]["id"] == ep["id"]
+    assert len(ins["captures"]) == 1
+    assert "LEAKME" not in json.dumps(ins) and "<redacted>" in json.dumps(ins)
+
+
+def test_traffic_ingest_rejects_bad_bodies(api):
+    cid = _campaign(api)
+    assert _req(api, f"/api/campaign/{cid}/traffic", "POST", {})[0] == 400          # no har/request
+    assert _req(api, f"/api/campaign/{cid}/traffic", "POST",
+                {"request": {"method": "GET"}})[0] == 400                            # missing url
+    assert _req(api, f"/api/campaign/{cid}/traffic", "POST",
+                {"session_id": "sess-nope", "request": {"url": "https://api.acme.example/x"}}
+                )[0] == 400                                                          # unknown session
+    assert _req(api, f"/api/campaign/{cid}/sessions", "POST",
+                {"credential_ref": "not a var name"})[0] == 400                      # pasted secret
+
+
 def test_write_api_input_validation(api):
     cid = _campaign(api)
     # malformed JSON

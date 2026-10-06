@@ -555,6 +555,12 @@ class Handler(BaseHTTPRequestHandler):
         if rest == ["identities"]:
             with _WRITE_LOCK:                     # not task-table work — keep the simple lock
                 return self._register_identity(c)
+        if rest == ["sessions"]:
+            with _WRITE_LOCK:
+                return self._register_session(c)
+        if rest == ["traffic"]:
+            with _WRITE_LOCK:                     # capture upserts endpoint files — serialize
+                return self._ingest_traffic(c)
         if rest == ["pivot"]:
             return self._start_pivot(c)
         if rest and rest[0] in ("pause", "resume", "stop") and len(rest) == 1:
@@ -590,6 +596,69 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"name": ident.name, "role": ident.role,
                          "researcher_owned": ident.researcher_owned,
                          "has_credential": bool(ident.credential_ref)}, code=201)
+
+    def _register_session(self, c):
+        """POST /api/campaign/{id}/sessions — declare a researcher-controlled authenticated
+        context. Session.__post_init__ rejects a pasted secret as credential_ref (it must be
+        an env-var NAME), and a bad status/source, at the boundary."""
+        body = self._json_body()
+        if body is None:
+            return
+        from argus import session as session_mod
+        try:
+            s = session_mod.register(c, session_mod.Session(
+                identity=str(body.get("identity") or ""),
+                base_origin=str(body.get("base_origin") or ""),
+                auth_mechanism=str(body.get("auth_mechanism") or ""),
+                credential_ref=str(body.get("credential_ref") or ""),
+                source=str(body.get("source") or "manual")))
+        except ValueError as e:
+            self._send_json({"error": str(e)}, code=400)
+            return
+        # never echo the credential_ref value back; just confirm the reference exists
+        self._send_json({"id": s.id, "identity": s.identity, "base_origin": s.base_origin,
+                         "auth_mechanism": s.auth_mechanism,
+                         "has_credential": bool(s.credential_ref), "source": s.source}, code=201)
+
+    def _ingest_traffic(self, c):
+        """POST /api/campaign/{id}/traffic — ingest researcher-captured traffic. Body is
+        either {"har": {...}} (a browser export) or {"request": {method,url,headers,body,
+        response}} (a single pasted/structured request), plus optional identity/session_id.
+        Secrets are redacted in the domain layer BEFORE anything is persisted. Returns the
+        endpoints touched so the UI can refresh its surface."""
+        body = self._json_body(cap=8_000_000)     # a HAR can be large; still bounded
+        if body is None:
+            return
+        from argus import session as session_mod, traffic
+        identity = str(body.get("identity") or "")
+        session_id = str(body.get("session_id") or "")
+        if session_id and session_mod.get(c, session_id) is None:
+            self._send_json({"error": f"unknown session {session_id!r}"}, code=400)
+            return
+        try:
+            if isinstance(body.get("har"), dict):
+                eps = traffic.import_har(c, body["har"], identity=identity,
+                                         session_id=session_id, source="har")
+                touched = len(eps)
+            elif isinstance(body.get("request"), dict):
+                req = body["request"]
+                url = str(req.get("url") or "")
+                if not url:
+                    self._send_json({"error": "request.url is required"}, code=400)
+                    return
+                traffic.capture(
+                    c, method=str(req.get("method") or "GET"), url=url,
+                    headers=dict(req.get("headers") or {}), body=str(req.get("body") or ""),
+                    identity=identity, session_id=session_id,
+                    response=dict(req.get("response") or {}), source=str(req.get("source") or "paste"))
+                touched = 1
+            else:
+                self._send_json({"error": "body must carry 'har' or 'request'"}, code=400)
+                return
+        except (ValueError, TypeError) as e:
+            self._send_json({"error": f"could not ingest traffic: {e}"}, code=400)
+            return
+        self._send_json({"ingested": touched, "endpoints": traffic.endpoints(c)}, code=201)
 
     def _task_decision(self, c, task_id: str, action: str):
         """POST /api/campaign/{id}/tasks/{task}/{approve|deny|cancel} — human action on a
@@ -779,6 +848,11 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "surface":
             return self._campaign_surface(parts[2])
 
+        # observed application surface: /api/campaign/{id}/endpoints — the durable endpoint
+        # catalog + sessions. ?ep={id} returns one endpoint with its evidence (captures).
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "endpoints":
+            return self._campaign_endpoints(parts[2], parse_qs(parsed.query))
+
         # otherwise: static frontend
         self._serve_static(path)
 
@@ -793,6 +867,34 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(campaign_mod.load(cid).surface())
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not load surface: {e}"}, code=500)
+
+    def _campaign_endpoints(self, cid: str, qs: dict):
+        """GET /api/campaign/{id}/endpoints — the observed endpoint catalog + sessions.
+        ?ep={id} returns one endpoint and its captures (the inspector). cid validated
+        against the listing before any path is built (no traversal)."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import session as session_mod, traffic
+        c = campaign_mod.load(cid)
+        ep_id = (qs.get("ep", [""])[0] or "").strip()
+        try:
+            if ep_id:
+                ep = traffic.endpoint(c, ep_id)
+                if ep is None:
+                    self._send_json({"error": f"no endpoint {ep_id!r}"}, code=404)
+                    return
+                self._send_json({"endpoint": ep, "captures": traffic.captures_for(c, ep_id)})
+                return
+            sessions = [{"id": s.id, "identity": s.identity, "base_origin": s.base_origin,
+                         "auth_mechanism": s.auth_mechanism, "status": s.status,
+                         "source": s.source, "last_seen": s.last_seen,
+                         "has_credential": bool(s.credential_ref)}   # never the ref value
+                        for s in session_mod.sessions(c)]
+            self._send_json({"endpoints": traffic.endpoints(c), "sessions": sessions})
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not load endpoints: {e}"}, code=500)
 
     def _campaign_events(self, cid: str, qs: dict):
         """SSE stream of one campaign's structured events, replayed from its durable audit
