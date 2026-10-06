@@ -192,6 +192,30 @@ def test_sse_unknown_campaign_404(api):
         assert e.code == 404
 
 
+def test_surface_route_serves_the_durable_projection(api):
+    from argus import campaign as cmod
+    cid = _campaign(api)
+    # a fresh campaign has an honest empty surface, not a fabricated one
+    code, body = _req(api, f"/api/campaign/{cid}/surface")
+    assert code == 200
+    assert body["graph"]["nodes"] == [] and body["graph"]["edges"] == []
+    # once a surface is persisted (as the background pivot does), the route serves it in
+    # the engine's {graph, investigation} shape the UI's normalize() already consumes
+    cmod.load(cid).save_surface({
+        "graph": {"nodes": [{"type": "domain", "value": "api.acme.example", "depth": 0,
+                             "via": "seed", "evidence": {"enrich": True}, "observed": {}}],
+                  "edges": [], "findings": []},
+        "investigation": {"conclusions": []}})
+    code, body = _req(api, f"/api/campaign/{cid}/surface")
+    assert code == 200
+    assert body["graph"]["nodes"][0]["value"] == "api.acme.example"
+    assert body["graph"]["nodes"][0]["evidence"]["enrich"] is True
+
+
+def test_surface_route_unknown_campaign_404(api):
+    assert _req(api, "/api/campaign/nope-000/surface")[0] == 404
+
+
 def test_write_api_input_validation(api):
     cid = _campaign(api)
     # malformed JSON

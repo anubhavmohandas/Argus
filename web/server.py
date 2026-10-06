@@ -758,8 +758,27 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "events":
             return self._campaign_events(parts[2], parse_qs(parsed.query))
 
+        # durable graph projection: /api/campaign/{id}/surface — the engine's
+        # {graph, investigation} shape, so the UI's normalize() renders a live campaign
+        # exactly as it renders a CLI pivot. Reads the durable projection, never a run's
+        # in-memory graph; a disconnect or restart cannot lose it.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "surface":
+            return self._campaign_surface(parts[2])
+
         # otherwise: static frontend
         self._serve_static(path)
+
+    def _campaign_surface(self, cid: str):
+        """GET /api/campaign/{id}/surface — the durable graph projection. cid is validated
+        against the authoritative listing before any path is built from it (no traversal)."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        try:
+            self._send_json(campaign_mod.load(cid).surface())
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not load surface: {e}"}, code=500)
 
     def _campaign_events(self, cid: str, qs: dict):
         """SSE stream of one campaign's structured events, replayed from its durable audit

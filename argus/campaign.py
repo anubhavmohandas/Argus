@@ -210,6 +210,28 @@ class Campaign:
             "started_at": self.created_at, "updated_at": _now(),
         }
 
+    # --- surface: the durable graph projection the UI reconstructs from -----
+    # A pivot's entity graph (nodes/edges from passive discovery + the evidence
+    # active probes project into each node) is the INDEX over the investigation.
+    # Observations remain the immutable evidence of record; this is a projection
+    # of them, rewritten as knowledge grows — so the graph never exists only inside
+    # an in-memory planner closure that dies with the run thread. Shape is exactly
+    # the engine's `{graph, investigation}` JSON (pivot.Graph.to_dict + investigate),
+    # so the same frontend `normalize()` consumes a live campaign and a CLI run alike.
+    def save_surface(self, snapshot: dict) -> None:
+        _write_private(self.dir / "surface.json", snapshot)
+
+    def surface(self) -> dict:
+        """The durable graph projection, or an empty surface when a campaign has not
+        pivoted yet. Honest about absence — the UI shows an empty graph, not a fake one."""
+        p = self.dir / "surface.json"
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except (OSError, ValueError):
+                pass
+        return {"graph": {"nodes": [], "edges": [], "findings": []}, "investigation": {}}
+
     def _persist(self) -> None:
         _write_private(self.dir / "campaign.json",
                        {"id": self.id, "program_text": self.program_text,

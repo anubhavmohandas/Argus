@@ -91,12 +91,16 @@ def _bundles(tiers: set[str]) -> dict[str, list[str]]:
     return out
 
 
-def _make_worker(graph):
+def _make_worker(graph, on_step=None):
     """A worker closed over the live discovery graph. Looks up the task's host node,
     runs the technique's enrichers on a one-node graph (reusing the providers' probe +
     merge), and returns the evidence/observed DELTA as the durable Observation. The
     enricher mutates the live node in place — that is the graph projection; the
-    Observation is the independent evidence of record."""
+    Observation is the independent evidence of record.
+
+    `on_step(graph)` (optional) fires AFTER each enrichment so a caller can persist the
+    projection as it grows (the background pivot's durable surface). The synchronous CLI
+    path passes none — its graph is serialized once at the end."""
     def worker(task: Task, campaign):
         spec = task.spec or {}
         names = spec.get("enrichers", [])
@@ -118,16 +122,19 @@ def _make_worker(graph):
         obs_delta = {k: v for k, v in node.observed.items() if before_obs.get(k) != v}
         obs = {"request": {"method": "", "url": f"https://{task.host}/", "headers": {}, "body": ""},
                "response": {"evidence": ev_delta, "observed": obs_delta}}
+        if on_step is not None:
+            on_step(graph)                  # persist the projection as it grows
         return obs, ""    # ARGUS collects; classification (reasoning) is NYX's job
     return worker
 
 
-def _register_and_propose(orch: Orchestrator, campaign, graph, tiers: set[str], ports) -> None:
+def _register_and_propose(orch: Orchestrator, campaign, graph, tiers: set[str], ports,
+                          on_step=None) -> None:
     """Register the enrichment worker and propose one bounded Task per (probeable host,
     technique). Proposal runs can_test immediately, so out-of-scope / forbidden tasks park
     or deny here; nothing executes yet. Shared by the synchronous run_active and the
     coordinator-driven background pivot so there is exactly one proposal path."""
-    worker = _make_worker(graph)
+    worker = _make_worker(graph, on_step=on_step)
     bundles = _bundles(tiers)
     for tech in bundles:
         orch.register_worker(tech, worker)
@@ -176,21 +183,34 @@ def background_pivot(seed: str, *, budget=None, tiers: set[str], ports=None, cve
     the drain completes, on_complete runs the passive analysis enrichers on the same graph.
 
     The graph is captured in the closure so the coordinator stays domain-agnostic — it
-    orchestrates tasks and knows nothing about pivot graphs."""
+    orchestrates tasks and knows nothing about pivot graphs. But the closure is NOT the
+    only copy: the planner persists the base graph the moment discovery finishes, each
+    active step re-persists the growing projection, and on_complete writes the final
+    dossier (with investigation conclusions). So a surface survives the run thread, a
+    restart, and a browser disconnect — the durable projection, never an ephemeral one."""
     graph_box: dict = {}
 
     def planner(co) -> None:
         import sys
         g = pivot_mod.pivot(seed, budget)
         graph_box["graph"] = g
-        _register_and_propose(co.orch, co.c, g, tiers, ports)
+        # base graph durable immediately — nodes/edges exist before any active work runs,
+        # so a disconnect or restart right after discovery still leaves a usable surface.
+        co.c.save_surface({"graph": g.to_dict(), "investigation": {}})
+        _register_and_propose(
+            co.orch, co.c, g, tiers, ports,
+            on_step=lambda gr: co.c.save_surface({"graph": gr.to_dict(), "investigation": {}}))
         print(f"[argus] background pivot {seed!r}: proposed {len(co.orch.tasks)} task(s) "
               f"in campaign {co.c.id}", file=sys.stderr)
 
     def on_complete(co) -> None:
         g = graph_box.get("graph")
-        if g is not None:
-            _run_analysis(g, cve)
+        if g is None:
+            return
+        _run_analysis(g, cve)
+        from .engine import investigate   # lazy: discovery -> reasoning, the one result object
+        result = investigate(g)
+        co.c.save_surface({"graph": g.to_dict(), "investigation": result.to_dict()})
 
     return planner, on_complete
 
