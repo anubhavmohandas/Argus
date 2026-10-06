@@ -216,6 +216,20 @@ def test_surface_route_unknown_campaign_404(api):
     assert _req(api, "/api/campaign/nope-000/surface")[0] == 404
 
 
+def test_stream_refuses_active_engagement(api):
+    """The legacy /api/stream path is passive-only now — active engagement must go through
+    the coordinator-owned campaign, so there is no hidden second web-active engine."""
+    for level in ("active", "active-plus", "full"):
+        code, body = _req(api, f"/api/stream?seed=api.acme.example&level={level}")
+        assert code == 400, (level, body)
+        assert "campaign" in body["error"]
+    # passive remains a legitimate path — the argv builder still accepts it (asserted
+    # offline, so the test touches nothing), active is refused at the same chokepoint.
+    assert server._build_argv("api.acme.example", "passive", {})[3:5] == ["pivot", "api.acme.example"]
+    with pytest.raises(ValueError, match="campaign"):
+        server._build_argv("api.acme.example", "active", {})
+
+
 def test_write_api_input_validation(api):
     cid = _campaign(api)
     # malformed JSON

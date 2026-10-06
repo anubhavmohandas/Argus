@@ -95,6 +95,13 @@ def _sanitize_seed(seed: str) -> str:
 def _build_argv(seed: str, level: str, opts: dict) -> list[str]:
     if level not in LEVELS:
         raise ValueError(f"unknown engagement level: {level!r}")
+    # /api/stream is the PASSIVE public-discovery path only. Active engagement must run as
+    # a campaign through the coordinator (POST /api/campaign/{id}/pivot) so it is durable,
+    # controllable, and approval-gated — there is no second web-active execution engine.
+    # Defence-in-depth: the GET handler already rejects this; this is the last chokepoint.
+    if level != "passive":
+        raise ValueError("active engagement must run as a campaign "
+                         "(POST /api/campaign/{id}/pivot); /api/stream is passive only")
     argv = [sys.executable, "-m", "argus", "pivot", seed, "--json", *LEVELS[level]]
 
     def _int_flag(name: str, key: str, lo: int, hi: int):
@@ -694,6 +701,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, code=400)
                 return
             level = qs.get("level", ["passive"])[0]
+            # passive discovery only — active engagement is a coordinator-owned campaign.
+            # Reject before the SSE headers so the client gets a clean 400, not a stream.
+            if level != "passive":
+                self._send_json({"error": "active engagement must run as a campaign "
+                                 "(POST /api/campaign/{id}/pivot); /api/stream is passive only"},
+                                code=400)
+                return
             opts = {
                 "depth": qs.get("depth", [None])[0],
                 "max": qs.get("max", [None])[0],
