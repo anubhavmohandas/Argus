@@ -1,5 +1,6 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  CampaignDetail,
   CampaignRunState,
   Dossier,
   EngagementLevel,
@@ -8,7 +9,15 @@ import type {
   RunState,
   Task,
 } from "./types";
-import { controlRun, runPivot } from "./api";
+import {
+  controlRun,
+  createCampaign,
+  getCampaign,
+  getCampaignSurface,
+  runPivot,
+  startPivot,
+  subscribeCampaign,
+} from "./api";
 import SeedBar from "./components/SeedBar";
 import type { PivotOptions } from "./components/SeedBar";
 import RunProgress from "./components/RunProgress";
@@ -20,6 +29,7 @@ import SecretRecon from "./components/SecretRecon";
 import ModuleRunner from "./components/ModuleRunner";
 import ProgramScope from "./components/ProgramScope";
 import CampaignWorkstation from "./components/CampaignWorkstation";
+import CampaignProgress from "./components/CampaignProgress";
 import { downloadReport } from "./lib";
 
 // The ARGUS workstation shell. Quick Pivot is preserved verbatim as the Command
@@ -39,6 +49,13 @@ export default function App() {
   const [railProgress, setRailProgress] = useState<{ cid: string; p: Progress } | null>(null);
   const [railRun, setRailRun] = useState<{ cid: string; runState: CampaignRunState } | null>(null);
   const [inspectTask, setInspectTask] = useState<Task | null>(null);
+  // the campaign the workstation should preselect — set when Quick Pivot hands off an
+  // active run's approvals ("Review approvals") so the operator lands on the right one.
+  const [selectedCid, setSelectedCid] = useState<string | null>(null);
+  const openCampaign = useCallback((cid: string) => {
+    setSelectedCid(cid);
+    setView("campaigns");
+  }, []);
 
   // stable identity — the workstation keys its SSE subscription off this callback, so a
   // new identity each render would thrash the EventSource connection.
@@ -58,9 +75,10 @@ export default function App() {
         <LeftNav view={view} setView={setView} />
         <main className="flex-1 overflow-auto">
           <div className="max-w-[1400px] w-full mx-auto px-5 py-5">
-            {view === "command" && <CommandCenter />}
+            {view === "command" && <CommandCenter onOpenCampaign={openCampaign} />}
             {view === "campaigns" && (
               <CampaignWorkstation
+                initialCid={selectedCid}
                 onSelectTask={setInspectTask}
                 onProgress={onProgress}
                 onRunState={onRunState}
@@ -256,8 +274,19 @@ function Capabilities() {
   );
 }
 
-// --- Command Center: Quick Pivot, preserved exactly as the original screen ---
-function CommandCenter() {
+// Active engagement levels run through the campaign coordinator (durable, controllable,
+// restart-resilient); passive stays the lightweight public-discovery path. Same paste →
+// mode → Pivot UX underneath both.
+const ACTIVE_LEVELS = new Set<EngagementLevel>(["active", "active-plus", "full"]);
+const LIVE_RUN = new Set<CampaignRunState>([
+  "STARTING", "RUNNING", "PAUSING", "PAUSED", "WAITING_APPROVAL", "STOPPING",
+]);
+
+// --- Command Center: Quick Pivot. Passive = direct lightweight discovery. Active =
+// create an ephemeral seed-scoped campaign, start a coordinator-owned background run, and
+// ATTACH this screen to it (structured SSE + durable surface) — the browser is an
+// observer/controller, never the owner of the run's lifetime. ---
+function CommandCenter({ onOpenCampaign }: { onOpenCampaign: (cid: string) => void }) {
   const [state, setState] = useState<RunState>("idle");
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -265,33 +294,109 @@ function CommandCenter() {
   const [selected, setSelected] = useState<GraphNode | null>(null);
   const [meta, setMeta] = useState<{ seed: string; level: string } | null>(null);
   const [seed, setSeed] = useState("");
-  const abortRef = useRef<(() => void) | null>(null);
+  // active attachment: the ephemeral campaign this screen created + its live state.
+  const [live, setLive] = useState<{ cid: string; level: EngagementLevel } | null>(null);
+  const [runState, setRunState] = useState<CampaignRunState | null>(null);
+  const [detail, setDetail] = useState<CampaignDetail | null>(null);
+  const abortRef = useRef<(() => void) | null>(null);   // passive ES abort OR active SSE unsub
+  const refetchTimer = useRef<number | null>(null);
+  const liveRef = useRef<string | null>(null);          // current active cid — ignore stale callbacks
 
-  const onRun = useCallback((seed: string, level: EngagementLevel, opts: PivotOptions) => {
+  const teardown = useCallback(() => {
+    abortRef.current?.();
+    abortRef.current = null;
+    if (refetchTimer.current) window.clearTimeout(refetchTimer.current);
+    refetchTimer.current = null;
+  }, []);
+  useEffect(() => teardown, [teardown]);                // close the stream on unmount
+
+  // API is the source of truth for WHAT is true; SSE only tells us WHEN to refresh. Rebuild
+  // the dossier from the durable surface + the detail (tasks/approvals/progress) on every
+  // event — no client-side event reducer, so a reconnect that replays the backlog is safe.
+  const refreshLive = useCallback((cid: string) => {
+    Promise.all([getCampaign(cid), getCampaignSurface(cid)])
+      .then(([d, dos]) => {
+        if (liveRef.current !== cid) return;            // a newer pivot superseded this one
+        setDetail(d);
+        setDossier(dos);
+      })
+      .catch(() => { /* transient (e.g. mid-write) — the next event refreshes */ });
+  }, []);
+
+  const onLiveEvent = useCallback((cid: string, ev: { event: string }) => {
+    if (liveRef.current !== cid) return;
+    if (ev.event.startsWith("campaign.run.")) {
+      const rs = ev.event.slice("campaign.run.".length).toUpperCase();
+      if (rs !== "RECOVERED") {
+        setRunState(rs as CampaignRunState);
+        // a disconnect is NOT a stop: only the coordinator's own terminal states settle us.
+        if (rs === "COMPLETE" || rs === "STOPPED") setState("done");
+        else if (rs === "FAILED") { setState("error"); setError("run failed"); }
+        else setState("running");
+      }
+    }
+    if (refetchTimer.current) window.clearTimeout(refetchTimer.current);
+    refetchTimer.current = window.setTimeout(() => refreshLive(cid), 250);  // debounce bursts
+  }, [refreshLive]);
+
+  const onRun = useCallback((seedArg: string, level: EngagementLevel, opts: PivotOptions) => {
+    teardown();
+    liveRef.current = null;
     setState("running");
     setLog([]);
     setError(null);
     setDossier(null);
     setSelected(null);
-    setSeed(seed);
-    setMeta({ seed, level });
+    setSeed(seedArg);
+    setMeta({ seed: seedArg, level });
+    setLive(null);
+    setRunState(null);
+    setDetail(null);
 
-    abortRef.current = runPivot(seed, level, opts, {
-      onStatus: (line) => setLog((l) => [...l, line]),
-      onResult: (d) => setDossier(d),
-      onError: (m) => {
-        setError(m);
+    if (!ACTIVE_LEVELS.has(level)) {
+      // PASSIVE — fast public discovery, straight to a dossier. Unchanged.
+      abortRef.current = runPivot(seedArg, level, opts, {
+        onStatus: (l) => setLog((prev) => [...prev, l]),
+        onResult: (d) => setDossier(d),
+        onError: (m) => { setError(m); setState("error"); },
+        onDone: () => setState((s) => (s === "error" ? s : "done")),
+      });
+      return;
+    }
+
+    // ACTIVE — ephemeral seed-scoped campaign (frozen fail-closed policy), coordinator-owned
+    // background run, then attach. Paste-and-go velocity: the operator never leaves this screen.
+    (async () => {
+      try {
+        const { id } = await createCampaign(`In scope:\n${seedArg}\n`, seedArg);
+        await startPivot(id, level, opts);
+        liveRef.current = id;
+        setLive({ cid: id, level });
+        refreshLive(id);
+        abortRef.current = subscribeCampaign(id, (ev) => onLiveEvent(id, ev));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
         setState("error");
-      },
-      onDone: () => setState((s) => (s === "error" ? s : "done")),
-    });
-  }, []);
+      }
+    })();
+  }, [teardown, refreshLive, onLiveEvent]);
 
   const onStop = useCallback(() => {
-    abortRef.current?.();
+    const cid = liveRef.current;
+    if (cid) {
+      // ACTIVE: STOP THE RUN through the coordinator — not merely close the browser stream.
+      // Closing the EventSource would leave the run executing on the server. STOPPING /
+      // STOPPED arrive back over SSE and settle the UI.
+      controlRun(cid, "stop").catch((e) => setError(String(e)));
+      setLog((l) => [...l, "[web] stop requested — coordinator stopping the run"]);
+      return;
+    }
+    teardown();
     setState((s) => (s === "running" ? "idle" : s));
     setLog((l) => [...l, "[web] stopped by operator"]);
-  }, []);
+  }, [teardown]);
+
+  const progress = detail?.progress ?? null;
 
   return (
     <div className="flex flex-col gap-5">
@@ -301,10 +406,21 @@ function CommandCenter() {
         <div className="text-xs font-mono text-mute">
           seed <span className="text-accent">{meta.seed}</span> · level{" "}
           <span className="text-ink">{meta.level}</span>
+          {live && <span className="text-mute/70"> · campaign {live.cid}</span>}
         </div>
       )}
 
-      <RunProgress state={state} log={log} error={error} />
+      {live ? (
+        <QuickPivotLive
+          cid={live.cid}
+          level={live.level}
+          runState={runState}
+          progress={progress}
+          onOpenCampaign={onOpenCampaign}
+        />
+      ) : (
+        <RunProgress state={state} log={log} error={error} />
+      )}
       <ProgramScope />
       <SecretRecon seed={seed} />
       <ModuleRunner />
@@ -335,6 +451,60 @@ function CommandCenter() {
             </div>
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+// The live investigation block under the SeedBar while an active Quick Pivot runs. Shows
+// the campaign/run context + the FACTUAL work-unit progress (reusing CampaignProgress, so
+// the percentage is verified work, never elapsed time) + a compact approvals hand-off.
+function QuickPivotLive({
+  cid,
+  level,
+  runState,
+  progress,
+  onOpenCampaign,
+}: {
+  cid: string;
+  level: EngagementLevel;
+  runState: CampaignRunState | null;
+  progress: Progress | null;
+  onOpenCampaign: (cid: string) => void;
+}) {
+  const rs = runState ?? "STARTING";
+  const active = LIVE_RUN.has(rs);
+  const running = rs === "RUNNING" || rs === "STARTING";
+  const label = rs.toLowerCase().replace(/_/g, " ");
+  const approvals = progress?.approval_required ?? 0;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="bg-panel border border-edge rounded-lg px-4 py-3 flex items-center gap-3 text-xs font-mono">
+        <span className={`inline-block w-2 h-2 rounded-full ${active ? "bg-accent" : "bg-mute"} ${running ? "pulse-dot" : ""}`} />
+        <span className={active ? "text-accent" : "text-mute"}>{label}</span>
+        <span className="text-mute/60">·</span>
+        <span className="text-ink truncate">Campaign {cid}</span>
+        <span className="ml-auto px-2 py-0.5 rounded border border-edge text-mute uppercase tracking-wide">
+          {level}
+        </span>
+      </div>
+
+      {/* factual live progress + current execution + queue/approvals/denied/failed counts */}
+      {progress && <CampaignProgress p={progress} />}
+
+      {approvals > 0 && (
+        <div className="bg-panel border border-medium/40 rounded-lg px-4 py-3 flex items-center gap-3 text-xs font-mono">
+          <span className="text-medium">
+            {approvals} {approvals === 1 ? "action requires" : "actions require"} authorization
+          </span>
+          <button
+            onClick={() => onOpenCampaign(cid)}
+            className="ml-auto text-medium border border-medium/40 rounded px-3 py-1 hover:bg-medium/15"
+          >
+            Review approvals
+          </button>
+        </div>
       )}
     </div>
   );

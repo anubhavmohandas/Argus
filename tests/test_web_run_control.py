@@ -146,6 +146,64 @@ def test_run_control_on_idle_campaign_is_safe(api):
     assert code == 200 and body["run"]["campaign_id"] == cid
 
 
+def _offline_pivot(monkeypatch):
+    """Stub discovery + every per-host enricher so the REAL research.background_pivot runs
+    with no network: a two-node, one-edge graph and evidence-stamping probes."""
+    from argus import providers, research
+    from argus.pivot import Entity, Graph
+
+    def fake_pivot(seed, budget=None):
+        g = Graph()
+        root = Entity("domain", "api.acme.example", 0)
+        child = Entity("ip", "198.51.100.7", 1)
+        g.add(root)
+        g.add(child, parent=root, rel="resolves_to")
+        return g
+    monkeypatch.setattr(research.pivot_mod, "pivot", fake_pivot)
+
+    def rec(name):
+        def enr(g, **kw):
+            for e in g.nodes.values():
+                e.evidence[name] = True
+            return len(g.nodes)
+        return enr
+    for n, _, _ in research._UNITS:
+        monkeypatch.setattr(providers, n, rec(n))
+    for n, _ in research._ANALYSIS:
+        monkeypatch.setattr(providers, n, lambda g, **kw: 0)
+
+
+def test_active_quick_pivot_serves_a_durable_surface_over_http(api, monkeypatch):
+    """The full active Quick Pivot vertical through the real planner: start a background
+    run (no SSE client attached — a 'disconnected browser'), and once it completes the
+    durable surface is served over the API with entities, the passive-discovery edge, and
+    the evidence active probes projected onto the node. No subprocess /api/stream path."""
+    _offline_pivot(monkeypatch)
+    cid = _campaign(api)
+    code, body = _req(api, f"/api/campaign/{cid}/pivot", "POST", {"level": "active"})
+    assert code == 202, body                         # returns immediately
+    co = _coordinator(cid)
+    assert _wait(lambda: co.snapshot()["run_state"] == "COMPLETE")   # continued with no browser
+
+    code, surface = _req(api, f"/api/campaign/{cid}/surface")
+    assert code == 200
+    nodes = {n["value"]: n for n in surface["graph"]["nodes"]}
+    assert "api.acme.example" in nodes and "198.51.100.7" in nodes
+    assert {"src": "domain:api.acme.example", "rel": "resolves_to",
+            "dst": "ip:198.51.100.7"} in surface["graph"]["edges"]
+    assert nodes["api.acme.example"]["evidence"].get("enrich") is True
+    assert "conclusions" in surface["investigation"]  # completion ran the rule engine
+
+
+def test_two_active_quick_pivots_are_independent_campaigns(api):
+    """Each active Quick Pivot creates its own ephemeral campaign — distinct ids, distinct
+    coordinators — so two investigations never share one run's state."""
+    a = _campaign(api, "In scope:\na.acme.example\n")
+    b = _campaign(api, "In scope:\nb.acme.example\n")
+    assert a != b
+    assert _coordinator(a) is not _coordinator(b)
+
+
 # --- reproduce endpoint validation ---------------------------------------
 def test_reproduce_unknown_finding_409(api):
     cid = _campaign(api)

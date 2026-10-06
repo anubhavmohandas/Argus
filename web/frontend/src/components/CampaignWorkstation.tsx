@@ -41,16 +41,18 @@ function hhmm(iso: string): string {
 }
 
 export default function CampaignWorkstation({
+  initialCid,
   onSelectTask,
   onProgress,
   onRunState,
 }: {
+  initialCid?: string | null;
   onSelectTask?: (t: Task | null) => void;
   onProgress?: (cid: string, p: Progress) => void;
   onRunState?: (cid: string, run: CampaignRunState) => void;
 }) {
   const [campaigns, setCampaigns] = useState<CampaignSummary[]>([]);
-  const [cid, setCid] = useState<string | null>(null);
+  const [cid, setCid] = useState<string | null>(initialCid ?? null);
   const [detail, setDetail] = useState<CampaignDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -68,6 +70,11 @@ export default function CampaignWorkstation({
   useEffect(() => {
     refreshList();
   }, [refreshList]);
+
+  // follow a preselect handed in from Quick Pivot's "Review approvals" hand-off.
+  useEffect(() => {
+    if (initialCid) setCid(initialCid);
+  }, [initialCid]);
 
   const loadDetail = useCallback((id: string) => {
     getCampaign(id)

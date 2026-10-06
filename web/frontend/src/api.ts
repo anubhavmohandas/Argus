@@ -209,6 +209,15 @@ export function getCampaign(id: string): Promise<CampaignDetail> {
   return jsonFetch(`/api/campaign?id=${encodeURIComponent(id)}`);
 }
 
+/** Fetch a campaign's durable graph projection and normalize it into the UI Dossier —
+ * the SAME shape a Quick Pivot or CLI run produces, so one set of visual components
+ * renders a live campaign and a passive run alike. The server reads the persisted
+ * projection, never a run's in-memory graph, so a disconnect/restart can't lose it. */
+export async function getCampaignSurface(id: string): Promise<Dossier> {
+  const raw = await jsonFetch<RawResult>(`/api/campaign/${encodeURIComponent(id)}/surface`);
+  return normalize(raw);
+}
+
 export function createCampaign(programText: string, name = ""): Promise<{ id: string }> {
   return jsonFetch("/api/campaigns", {
     method: "POST",
