@@ -231,6 +231,79 @@ export interface TrafficSession {
   has_credential: boolean;
 }
 
+// ---- identity x endpoint research matrix (argus/matrix.py) ----
+// A deterministic projection over captured traffic. A cell is OBSERVED or absent
+// (unobserved) — NEVER "denied"/"vulnerable". Absence is a research opportunity.
+export interface MatrixIdentityCol {
+  name: string;
+  role: string;
+  tenant: string;
+  researcher_owned: boolean;
+  declared: boolean;
+  is_anonymous: boolean;
+  endpoints_observed: number;
+  first_seen: string;
+  last_seen: string;
+}
+export interface MatrixEndpointRow {
+  id: string;
+  method: string;
+  host: string;
+  path_template: string;
+  auth: "required" | "none" | "unknown";
+  obs_count: number;
+  query_params: string[];
+  body_params: string[];
+  response_classes: string[];
+  last_seen: string;
+  identities_observed: string[];
+  anonymous_observed: boolean;
+  authenticated_observed: boolean;
+}
+// Only OBSERVED cells are sent; a missing (endpoint, identity) pair renders unobserved.
+export interface MatrixCell {
+  endpoint_id: string;
+  identity: string;
+  observed: boolean;
+  request_count: number;
+  first_seen: string;
+  last_seen: string;
+  sessions: string[];
+  response_status_classes: string[];
+  sample_capture_refs: string[];
+}
+export interface MatrixSummary {
+  endpoints: number;
+  identities: number;
+  possible_cells: number;
+  observed_cells: number;
+  unobserved_cells: number;
+  multi_identity_endpoints: number;
+  single_identity_endpoints: number;
+  anonymous_only_endpoints: number;
+  authenticated_only_endpoints: number;
+  endpoints_no_authenticated_observation: number;
+  research_coverage_pct: number;
+  coverage_denominator: string;
+}
+export interface MatrixGap {
+  endpoint_id: string;
+  method: string;
+  path_template: string;
+  gap_type: string;
+  observed_identities: string[];
+  reason: string;
+  status: string;
+}
+export interface Matrix {
+  campaign_id: string;
+  identities: MatrixIdentityCol[];
+  endpoints: MatrixEndpointRow[];
+  cells: MatrixCell[];
+  summary: MatrixSummary;
+  gaps: MatrixGap[];
+}
+
 // One structured SSE event (web/server.py _structured_events). `event` is the typed
 // name; `data` carries the audit record plus its `seq` for ?since= resume.
 export interface CampaignEvent {

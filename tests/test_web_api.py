@@ -290,3 +290,34 @@ def test_write_api_input_validation(api):
     # unknown campaign / task
     assert _req(api, "/api/campaign/nope-000/identities", "POST", {"name": "a"})[0] == 404
     assert _req(api, f"/api/campaign/{cid}/tasks/task-xxx/approve", "POST", {})[0] == 404
+
+
+def test_matrix_route_projects_traffic_without_secrets(api):
+    """GET /api/campaign/{id}/matrix returns the identity x endpoint read model built from
+    captured traffic — observed vs unobserved coverage, and NEVER a captured secret."""
+    cid = _campaign(api)
+    from argus import campaign as cmod, identity as imod, traffic
+    c = cmod.load(cid)
+    imod.register(c, imod.Identity(name="user_a", role="customer", researcher_owned=True))
+    imod.register(c, imod.Identity(name="user_b", role="customer", researcher_owned=True))
+    traffic.capture(c, method="GET", url="https://api.acme.example/api/orders/1",
+                    headers={"Authorization": "Bearer supersecrettoken"}, identity="user_a",
+                    response={"status": 200})
+    traffic.capture(c, method="GET", url="https://api.acme.example/api/orders/2",
+                    headers={"Cookie": "session=topsecret"}, identity="user_b",
+                    response={"status": 403})
+
+    code, body = _req(api, f"/api/campaign/{cid}/matrix")
+    assert code == 200, body
+    assert body["campaign_id"] == cid
+    assert {col["name"] for col in body["identities"]} >= {"user_a", "user_b"}
+    ep = next(r for r in body["endpoints"] if r["path_template"] == "/api/orders/{id}")
+    assert set(ep["identities_observed"]) == {"user_a", "user_b"}
+    # the secret never reaches the projection
+    blob = json.dumps(body)
+    assert "supersecrettoken" not in blob and "topsecret" not in blob
+
+
+def test_matrix_route_unknown_campaign_is_404(api):
+    code, body = _req(api, "/api/campaign/no-such-campaign-xyz/matrix")
+    assert code == 404, body

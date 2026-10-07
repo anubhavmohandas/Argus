@@ -31,18 +31,22 @@ import ProgramScope from "./components/ProgramScope";
 import CampaignWorkstation from "./components/CampaignWorkstation";
 import CampaignProgress from "./components/CampaignProgress";
 import EndpointsSurface from "./components/EndpointsSurface";
+import AuthorizationMap from "./components/AuthorizationMap";
 import { downloadReport } from "./lib";
 
 // The ARGUS workstation shell. Quick Pivot is preserved verbatim as the Command
 // Center; the campaign control plane (orchestrated active work, approvals, live
 // progress) is a second surface. Same graphite/aqua DNA, nothing redesigned.
 
-type View = "command" | "campaigns" | "endpoints" | "capabilities";
+type View = "command" | "campaigns" | "endpoints" | "authmap" | "capabilities";
 
 const NAV: { group: string; items: { id: View; label: string }[] }[] = [
   { group: "Command", items: [{ id: "command", label: "Quick Pivot" }] },
   { group: "Control", items: [{ id: "campaigns", label: "Campaigns" }] },
-  { group: "Surface", items: [{ id: "endpoints", label: "Endpoints" }] },
+  { group: "Surface", items: [
+    { id: "endpoints", label: "Endpoints" },
+    { id: "authmap", label: "Authorization Map" },
+  ] },
   { group: "System", items: [{ id: "capabilities", label: "Capabilities" }] },
 ];
 
@@ -87,6 +91,7 @@ export default function App() {
               />
             )}
             {view === "endpoints" && <EndpointsSurface />}
+            {view === "authmap" && <AuthorizationMap />}
             {view === "capabilities" && <Capabilities />}
           </div>
         </main>

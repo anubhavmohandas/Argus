@@ -853,6 +853,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "endpoints":
             return self._campaign_endpoints(parts[2], parse_qs(parsed.query))
 
+        # identity x endpoint research matrix: /api/campaign/{id}/matrix — a deterministic
+        # read model over the campaign's captured traffic. Observed vs unobserved coverage,
+        # NEVER a security verdict; the UI renders truth from this, not from raw captures.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "matrix":
+            return self._campaign_matrix(parts[2])
+
         # otherwise: static frontend
         self._serve_static(path)
 
@@ -895,6 +901,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"endpoints": traffic.endpoints(c), "sessions": sessions})
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not load endpoints: {e}"}, code=500)
+
+    def _campaign_matrix(self, cid: str):
+        """GET /api/campaign/{id}/matrix — the identity x endpoint research matrix, derived
+        from captured traffic. cid validated against the listing before any path is built
+        (no traversal). Read-only: building the matrix touches no target and stores nothing."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import matrix
+        try:
+            self._send_json(matrix.build(campaign_mod.load(cid)))
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not build matrix: {e}"}, code=500)
 
     def _campaign_events(self, cid: str, qs: dict):
         """SSE stream of one campaign's structured events, replayed from its durable audit

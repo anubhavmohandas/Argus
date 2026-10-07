@@ -387,6 +387,13 @@ export function ingestTraffic(
   });
 }
 
+/** The identity x endpoint research matrix — a deterministic projection over captured
+ * traffic. Observed vs unobserved coverage, never a security verdict. The frontend renders
+ * matrix truth from this read model, never by re-deriving it from raw captures. */
+export function getMatrix(cid: string): Promise<import("./types").Matrix> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/matrix`);
+}
+
 export interface ModuleCallbacks {
   onStatus?: (line: string) => void;
   onResult?: (findings: Finding[]) => void;
