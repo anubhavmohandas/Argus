@@ -436,6 +436,27 @@ export function getPriority(cid: string): Promise<import("./types").PriorityResu
   return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/priority`);
 }
 
+/** An ExperimentProposal per ranked OPEN gap. A proposal is a PLAN — fetching it executes
+ * nothing. */
+export function getProposals(cid: string): Promise<{ campaign_id: string; proposals: import("./types").ExperimentProposal[] }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/proposals`);
+}
+
+/** Queue a gap's proposal: runs the plan through the EXISTING coordinator (one execution
+ * owner), which re-gates it via can_test and drives the existing differential runner. Returns
+ * the run snapshot + the proposal; the knowledge update arrives via the campaign event stream.
+ * 409 if a run is already active or the gap is not a derivable OPEN gap. */
+export function queueGap(
+  cid: string,
+  gapId: string
+): Promise<{ run: RunSnapshot; gap_id: string; proposal: import("./types").ExperimentProposal }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/gaps/${encodeURIComponent(gapId)}/queue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+}
+
 export interface ModuleCallbacks {
   onStatus?: (line: string) => void;
   onResult?: (findings: Finding[]) => void;

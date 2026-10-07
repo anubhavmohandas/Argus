@@ -375,6 +375,40 @@ export interface PriorityResult {
   campaign_id: string;
   ranked: ResearchGap[];
 }
+
+// ---- experiment proposals (argus/proposal.py) ----
+// A proposal is a PLAN, never an execution. Queuing it runs the plan through the EXISTING
+// coordinator (one execution owner); nothing in the frontend ever sends the test request.
+export interface ExperimentProposal {
+  proposal_id: string;
+  gap_id: string;
+  gap_type: string;
+  host: string;
+  endpoint: string;
+  method: string;
+  path: string;
+  hypothesis: string;
+  baseline_identity: string;
+  mutation_identity: string;
+  baseline_resource: string;
+  target_resource: string;
+  security_boundary: string[];
+  expected_secure_behavior: string;
+  reason: string;
+  policy_decision_preview: GapPolicyPreview;
+  request_count: number;
+  risk: string;
+  required_ownership_assertions: {
+    resource_type: string;
+    resource_value: string;
+    owner_identity: string;
+    researcher_controlled: boolean;
+  }[];
+  technique: string;
+  confidence: number | null;
+  priority_score?: number;
+  priority_rank?: number;
+}
 export interface Coverage {
   campaign_id: string;
   gaps: ResearchGap[];

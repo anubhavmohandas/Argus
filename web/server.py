@@ -574,6 +574,9 @@ class Handler(BaseHTTPRequestHandler):
         # /tasks/{task}/{action}
         if len(rest) == 3 and rest[0] == "tasks" and rest[2] in ("approve", "deny", "cancel"):
             return self._task_decision(c, rest[1], rest[2])
+        # /gaps/{gap}/queue — run a research gap's proposal through the coordinator
+        if len(rest) == 3 and rest[0] == "gaps" and rest[2] == "queue":
+            return self._queue_gap(c, rest[1])
         self._send_json({"error": "not found"}, code=404)
 
     def _register_identity(self, c):
@@ -774,6 +777,27 @@ class Handler(BaseHTTPRequestHandler):
         snap = co.start(planner=planner, on_complete=on_complete)
         self._send_json({"run": snap, "finding": finding_id, "trials": trials}, code=202)
 
+    def _queue_gap(self, c, gap_id: str):
+        """POST /api/campaign/{id}/gaps/{gap}/queue — run a ResearchGap's experiment proposal
+        through the SAME coordinator as a pivot (one execution owner). The proposal is a plan;
+        this hands its differential Task to the coordinator, which re-gates it via can_test and
+        drives the EXISTING differential runner. 202 with the run snapshot + the proposal; the
+        knowledge update (gap RESOLVED/TESTED + any FindingCandidate) arrives via SSE/reconcile.
+        409 if a run is already active (one owner) or the gap is not a derivable OPEN gap."""
+        co = _coordinator(c)
+        if co.is_active():
+            self._send_json({"error": "a run is already active; stop it before queueing a gap"},
+                            code=409)
+            return
+        from argus import proposal
+        try:
+            planner, on_complete, prop = proposal.background_queue(c, gap_id)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, code=409)
+            return
+        snap = co.start(planner=planner, on_complete=on_complete)
+        self._send_json({"run": snap, "gap_id": gap_id, "proposal": prop}, code=202)
+
     def _run_control(self, c, action: str):
         """POST /api/campaign/{id}/{pause|resume|stop} — thin controller over the
         coordinator. Returns the run snapshot; the operation itself is applied on the
@@ -907,6 +931,11 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] in ("priority", "intel"):
             return self._campaign_priority(parts[2], parts[3])
 
+        # experiment proposals: /api/campaign/{id}/proposals — a PLAN per ranked gap. A plan
+        # never executes; POST /gaps/{gap}/queue runs it through the coordinator.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "proposals":
+            return self._campaign_proposals(parts[2])
+
         # otherwise: static frontend
         self._serve_static(path)
 
@@ -1009,6 +1038,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"campaign_id": cid, "ranked": priority.rank(c)})
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not build {kind}: {e}"}, code=500)
+
+    def _campaign_proposals(self, cid: str):
+        """GET /api/campaign/{id}/proposals — an ExperimentProposal per ranked OPEN gap. A
+        proposal is a PLAN: building it sends no request. cid validated against the listing."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import proposal
+        try:
+            self._send_json({"campaign_id": cid, "proposals": proposal.proposals(campaign_mod.load(cid))})
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not build proposals: {e}"}, code=500)
 
     def _campaign_events(self, cid: str, qs: dict):
         """SSE stream of one campaign's structured events, replayed from its durable audit

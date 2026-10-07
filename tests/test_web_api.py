@@ -413,3 +413,59 @@ def test_priority_and_intel_routes(api):
     assert code == 200, body
     assert body["research_coverage"]["note"] == "research coverage, not a security score"
     assert body["highest_value_boundary"]["gap_id"] == body["highest_value_boundary"]["gap_id"]
+
+
+def test_proposals_route_and_queue_closes_the_loop(api, monkeypatch):
+    """GET /proposals plans an experiment per ranked gap (no execution); POST
+    /gaps/{gap}/queue runs it through the coordinator. The leaf differential worker is
+    stubbed so no HTTP leaves the box, but the orchestrator/coordinator path is the real one;
+    the loop closes: gap -> TESTED + a promoted FindingCandidate."""
+    import time
+    from argus import campaign as cmod, identity as imod, orchestrator, resource, run, traffic
+
+    run._reset_registry()                         # no coordinator singleton bleed across tests
+    cid = _campaign(api, program="In scope:\napi.acme.example\nRate: 2 requests/sec\n")
+    c = cmod.load(cid)
+    for name in ("customer_a", "customer_b"):
+        imod.register(c, imod.Identity(name=name, role="customer", tenant="t1", researcher_owned=True))
+    traffic.capture(c, method="POST", url="https://api.acme.example/api/orders/777/cancel",
+                    headers={"Authorization": "Bearer s"}, identity="customer_a",
+                    response={"status": 204})
+    resource.assert_ownership(c, resource.Ownership(
+        resource_type="order", resource_value="777", owner_identity="customer_a",
+        tenant="t1", researcher_controlled=True))
+
+    # a proposal is a PLAN — building it sends nothing
+    code, body = _req(api, f"/api/campaign/{cid}/proposals")
+    assert code == 200, body
+    prop = body["proposals"][0]
+    gap_id = prop["gap_id"]
+    assert prop["path"] == "/api/orders/777/cancel" and prop["mutation_identity"] == "customer_b"
+
+    # stub ONLY the leaf worker so the coordinator path stays real but offline
+    def fake_differential(task, campaign):
+        e = campaign.save_experiment(cmod.Experiment(
+            campaign_id=campaign.id, hypothesis=task.hypothesis, technique=task.technique,
+            host=task.host, verdict=task.verdict, verdict_reason=task.verdict_reason,
+            identity=task.identity, status="EVALUATED", classification="suspicious"))
+        return None, "suspicious", e.id
+    monkeypatch.setitem(orchestrator._DEFAULT_WORKERS, "differential_cross_account", fake_differential)
+
+    code, body = _req(api, f"/api/campaign/{cid}/gaps/{gap_id}/queue", "POST", {})
+    assert code == 202, body
+    assert body["gap_id"] == gap_id and body["proposal"]["gap_id"] == gap_id
+
+    # the loop runs on the coordinator thread; poll coverage until the gap transitions
+    deadline = time.time() + 5
+    status = None
+    while time.time() < deadline:
+        _, cov = _req(api, f"/api/campaign/{cid}/coverage")
+        g = next((x for x in cov["gaps"] if x.get("gap_id") == gap_id), None)
+        status = g["status"] if g else None
+        if status in ("TESTED", "RESOLVED"):
+            break
+        time.sleep(0.1)
+    assert status == "TESTED", status
+    # a suspicious result promoted a FindingCandidate through the existing pipeline
+    _, detail = _req(api, f"/api/campaign?id={cid}")
+    assert len(detail["findings"]) == 1
