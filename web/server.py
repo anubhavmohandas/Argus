@@ -896,6 +896,11 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "resources":
             return self._campaign_resources(parts[2])
 
+        # ownership-aware authorization coverage: /api/campaign/{id}/coverage — structured
+        # ResearchGaps (missing evidence, never findings) + a deterministic summary.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "coverage":
+            return self._campaign_coverage(parts[2])
+
         # otherwise: static frontend
         self._serve_static(path)
 
@@ -966,6 +971,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"campaign_id": cid, "resources": resource.resources(c)})
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not load resources: {e}"}, code=500)
+
+    def _campaign_coverage(self, cid: str):
+        """GET /api/campaign/{id}/coverage — ownership-aware ResearchGaps + summary. cid
+        validated against the listing (no traversal). Read-only: deriving gaps touches no
+        target and stores nothing."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import coverage
+        try:
+            self._send_json(coverage.build(campaign_mod.load(cid)))
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not build coverage: {e}"}, code=500)
 
     def _campaign_events(self, cid: str, qs: dict):
         """SSE stream of one campaign's structured events, replayed from its durable audit

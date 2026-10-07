@@ -330,6 +330,53 @@ export interface ResourceRow {
   owner_known: boolean;
 }
 
+// ---- ownership-aware authorization coverage (argus/coverage.py) ----
+// A ResearchGap is MISSING RESEARCH EVIDENCE, never a finding. It is derived
+// deterministically and carries the policy verdict a test WOULD get — it never executes.
+export interface GapPolicyPreview {
+  verdict: string;
+  reason: string;
+  limits: Record<string, unknown> | null;
+}
+export interface ResearchGap {
+  gap_id: string;
+  gap_type: string;
+  boundary?: string[];
+  endpoint_id?: string;
+  method?: string;
+  host?: string;
+  path_template?: string;
+  baseline_identity?: string;
+  mutation_identity?: string;
+  resource_type?: string;
+  resource_id?: string;
+  ownership_context?: {
+    owner: string;
+    tenant: string;
+    researcher_controlled: boolean;
+    ownership_status: string;
+  };
+  evidence?: { owner_observations: number; owner_capture_refs: string[] };
+  confidence?: number;
+  reason?: string;
+  policy_preview?: GapPolicyPreview;
+  estimated_requests?: number;
+  technique?: string;
+  status: string; // OPEN | PROPOSED | TESTED | RESOLVED | BLOCKED | DISMISSED
+  lifecycle?: Record<string, unknown>;
+  orphan?: boolean;
+}
+export interface Coverage {
+  campaign_id: string;
+  gaps: ResearchGap[];
+  summary: {
+    total_gaps: number;
+    open_gaps: number;
+    owner_nonowner_untested: number;
+    by_status: Record<string, number>;
+  };
+}
+
 // One structured SSE event (web/server.py _structured_events). `event` is the typed
 // name; `data` carries the audit record plus its `seq` for ?since= resume.
 export interface CampaignEvent {

@@ -424,6 +424,12 @@ export function assertOwnership(
   });
 }
 
+/** Ownership-aware authorization coverage — structured ResearchGaps (missing evidence,
+ * never findings) plus a deterministic summary. Read-only projection. */
+export function getCoverage(cid: string): Promise<import("./types").Coverage> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/coverage`);
+}
+
 export interface ModuleCallbacks {
   onStatus?: (line: string) => void;
   onResult?: (findings: Finding[]) => void;

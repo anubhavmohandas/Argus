@@ -361,3 +361,29 @@ def test_resources_route_and_ownership_assertion(api):
     code, body = _req(api, f"/api/campaign/{cid}/resources/ownership", "POST",
                       {"resource_type": "order", "resource_value": "", "ownership_status": "MAYBE"})
     assert code == 400, body
+
+
+def test_coverage_route_exposes_research_gaps(api):
+    """GET /api/campaign/{id}/coverage derives ownership-aware ResearchGaps from an owner's
+    observed action on a researcher-controlled object + an untested non-owner identity."""
+    cid = _campaign(api, program="In scope:\napi.acme.example\nRate: 2 requests/sec\n")
+    from argus import campaign as cmod, identity as imod, resource, traffic
+    c = cmod.load(cid)
+    imod.register(c, imod.Identity(name="customer_a", role="customer", tenant="t1", researcher_owned=True))
+    imod.register(c, imod.Identity(name="customer_b", role="customer", tenant="t1", researcher_owned=True))
+    traffic.capture(c, method="POST", url="https://api.acme.example/api/orders/777/cancel",
+                    headers={"Authorization": "Bearer s"}, identity="customer_a",
+                    response={"status": 204})
+    resource.assert_ownership(c, resource.Ownership(
+        resource_type="order", resource_value="777", owner_identity="customer_a",
+        tenant="t1", researcher_controlled=True))
+
+    code, body = _req(api, f"/api/campaign/{cid}/coverage")
+    assert code == 200, body
+    live = [g for g in body["gaps"] if not g.get("orphan")]
+    assert len(live) == 1
+    g = live[0]
+    assert g["gap_type"] == "OWNER_NONOWNER_UNTESTED"
+    assert g["mutation_identity"] == "customer_b"
+    assert g["policy_preview"]["verdict"] == "ALLOW_WITH_LIMITS"
+    assert body["summary"]["owner_nonowner_untested"] == 1
