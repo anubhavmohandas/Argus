@@ -561,6 +561,9 @@ class Handler(BaseHTTPRequestHandler):
         if rest == ["traffic"]:
             with _WRITE_LOCK:                     # capture upserts endpoint files — serialize
                 return self._ingest_traffic(c)
+        if rest == ["resources", "ownership"]:
+            with _WRITE_LOCK:                     # rewrites ownership.json — serialize
+                return self._assert_ownership(c)
         if rest == ["pivot"]:
             return self._start_pivot(c)
         if rest and rest[0] in ("pause", "resume", "stop") and len(rest) == 1:
@@ -659,6 +662,34 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": f"could not ingest traffic: {e}"}, code=400)
             return
         self._send_json({"ingested": touched, "endpoints": traffic.endpoints(c)}, code=201)
+
+    def _assert_ownership(self, c):
+        """POST /api/campaign/{id}/resources/ownership — declare an EXPLICIT ownership
+        assertion. Ownership.__post_init__ enforces the invariant at the boundary: an
+        INFERRED assertion can never be researcher-controlled, and a bad status/confidence/
+        empty value is a 400. researcher_controlled is trusted metadata, never inferred."""
+        body = self._json_body()
+        if body is None:
+            return
+        from argus import resource
+        try:
+            own = resource.assert_ownership(c, resource.Ownership(
+                resource_type=str(body.get("resource_type") or "").strip(),
+                resource_value=str(body.get("resource_value") or ""),
+                owner_identity=str(body.get("owner_identity") or ""),
+                tenant=str(body.get("tenant") or ""),
+                researcher_controlled=bool(body.get("researcher_controlled", False)),
+                ownership_status=str(body.get("ownership_status") or "CONFIRMED"),
+                confidence=float(body.get("confidence", 1.0)),
+                source=str(body.get("source") or "operator"),
+                note=str(body.get("note") or "")))
+        except (ValueError, TypeError) as e:
+            self._send_json({"error": str(e)}, code=400)
+            return
+        self._send_json({"id": own.id, "resource_type": own.resource_type,
+                         "resource_value": own.resource_value,
+                         "researcher_controlled": own.researcher_controlled,
+                         "ownership_status": own.ownership_status}, code=201)
 
     def _task_decision(self, c, task_id: str, action: str):
         """POST /api/campaign/{id}/tasks/{task}/{approve|deny|cancel} — human action on a
@@ -859,6 +890,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "matrix":
             return self._campaign_matrix(parts[2])
 
+        # resource / object knowledge: /api/campaign/{id}/resources — candidates mined from
+        # captured traffic, overlaid with explicit ownership assertions. Unknown owner is a
+        # normal state; researcher_controlled is only ever set by an explicit assertion.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "resources":
+            return self._campaign_resources(parts[2])
+
         # otherwise: static frontend
         self._serve_static(path)
 
@@ -915,6 +952,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(matrix.build(campaign_mod.load(cid)))
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not build matrix: {e}"}, code=500)
+
+    def _campaign_resources(self, cid: str):
+        """GET /api/campaign/{id}/resources — observed resource candidates overlaid with
+        ownership assertions. cid validated against the listing (no traversal). Read-only."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import resource
+        try:
+            c = campaign_mod.load(cid)
+            self._send_json({"campaign_id": cid, "resources": resource.resources(c)})
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not load resources: {e}"}, code=500)
 
     def _campaign_events(self, cid: str, qs: dict):
         """SSE stream of one campaign's structured events, replayed from its durable audit

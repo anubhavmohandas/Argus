@@ -321,3 +321,43 @@ def test_matrix_route_projects_traffic_without_secrets(api):
 def test_matrix_route_unknown_campaign_is_404(api):
     code, body = _req(api, "/api/campaign/no-such-campaign-xyz/matrix")
     assert code == 404, body
+
+
+def test_resources_route_and_ownership_assertion(api):
+    """GET /api/campaign/{id}/resources mines candidates; POST .../resources/ownership
+    declares explicit ownership. An INFERRED assertion is forced non-controlled; a bad
+    assertion is a 400. researcher_controlled is never inferred from traffic."""
+    cid = _campaign(api)
+    from argus import campaign as cmod, traffic
+    c = cmod.load(cid)
+    traffic.capture(c, method="GET", url="https://api.acme.example/api/orders/123",
+                    headers={"Authorization": "Bearer s"}, identity="customer_a",
+                    response={"status": 200})
+
+    code, body = _req(api, f"/api/campaign/{cid}/resources")
+    assert code == 200, body
+    row = next(r for r in body["resources"] if r["value"] == "123")
+    assert row["resource_type"] == "order" and row["researcher_controlled"] is False
+    assert row["ownership_status"] == ""                     # unknown is normal
+
+    # explicit confirmed controlled assertion
+    code, body = _req(api, f"/api/campaign/{cid}/resources/ownership", "POST",
+                      {"resource_type": "order", "resource_value": "123",
+                       "owner_identity": "customer_a", "tenant": "tenant_a",
+                       "researcher_controlled": True})
+    assert code == 201 and body["researcher_controlled"] is True
+    _, body = _req(api, f"/api/campaign/{cid}/resources")
+    row = next(r for r in body["resources"] if r["value"] == "123")
+    assert row["researcher_controlled"] and row["owner_identity"] == "customer_a"
+
+    # an INFERRED assertion can never be researcher-controlled, even if asked
+    code, body = _req(api, f"/api/campaign/{cid}/resources/ownership", "POST",
+                      {"resource_type": "order", "resource_value": "456",
+                       "researcher_controlled": True, "ownership_status": "INFERRED",
+                       "confidence": 0.7})
+    assert code == 201 and body["researcher_controlled"] is False
+
+    # a bad assertion is rejected at the boundary
+    code, body = _req(api, f"/api/campaign/{cid}/resources/ownership", "POST",
+                      {"resource_type": "order", "resource_value": "", "ownership_status": "MAYBE"})
+    assert code == 400, body

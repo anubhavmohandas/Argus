@@ -31,6 +31,7 @@ import ProgramScope from "./components/ProgramScope";
 import CampaignWorkstation from "./components/CampaignWorkstation";
 import CampaignProgress from "./components/CampaignProgress";
 import EndpointsSurface from "./components/EndpointsSurface";
+import ResourcesSurface from "./components/ResourcesSurface";
 import AuthorizationMap from "./components/AuthorizationMap";
 import { downloadReport } from "./lib";
 
@@ -38,13 +39,14 @@ import { downloadReport } from "./lib";
 // Center; the campaign control plane (orchestrated active work, approvals, live
 // progress) is a second surface. Same graphite/aqua DNA, nothing redesigned.
 
-type View = "command" | "campaigns" | "endpoints" | "authmap" | "capabilities";
+type View = "command" | "campaigns" | "endpoints" | "resources" | "authmap" | "capabilities";
 
 const NAV: { group: string; items: { id: View; label: string }[] }[] = [
   { group: "Command", items: [{ id: "command", label: "Quick Pivot" }] },
   { group: "Control", items: [{ id: "campaigns", label: "Campaigns" }] },
   { group: "Surface", items: [
     { id: "endpoints", label: "Endpoints" },
+    { id: "resources", label: "Resources" },
     { id: "authmap", label: "Authorization Map" },
   ] },
   { group: "System", items: [{ id: "capabilities", label: "Capabilities" }] },
@@ -91,6 +93,7 @@ export default function App() {
               />
             )}
             {view === "endpoints" && <EndpointsSurface />}
+            {view === "resources" && <ResourcesSurface />}
             {view === "authmap" && <AuthorizationMap />}
             {view === "capabilities" && <Capabilities />}
           </div>

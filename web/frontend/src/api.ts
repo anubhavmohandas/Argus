@@ -394,6 +394,36 @@ export function getMatrix(cid: string): Promise<import("./types").Matrix> {
   return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/matrix`);
 }
 
+/** Resource candidates mined from captured traffic, overlaid with ownership assertions.
+ * Read-only projection; unknown owner is a normal state, never a guess. */
+export function getResources(cid: string): Promise<{ campaign_id: string; resources: import("./types").ResourceRow[] }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/resources`);
+}
+
+/** Declare an EXPLICIT ownership assertion. The server enforces the invariant: an INFERRED
+ * assertion can never be researcher-controlled, and a bad status/confidence/empty value is
+ * a 400. researcher_controlled is trusted metadata, never inferred from traffic. */
+export function assertOwnership(
+  cid: string,
+  own: {
+    resource_type: string;
+    resource_value: string;
+    owner_identity?: string;
+    tenant?: string;
+    researcher_controlled?: boolean;
+    ownership_status?: "CONFIRMED" | "INFERRED";
+    confidence?: number;
+    source?: string;
+    note?: string;
+  }
+): Promise<{ id: string; researcher_controlled: boolean; ownership_status: string }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/resources/ownership`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(own),
+  });
+}
+
 export interface ModuleCallbacks {
   onStatus?: (line: string) => void;
   onResult?: (findings: Finding[]) => void;

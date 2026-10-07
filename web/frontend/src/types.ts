@@ -304,6 +304,32 @@ export interface Matrix {
   gaps: MatrixGap[];
 }
 
+// ---- resource / object knowledge (argus/resource.py) ----
+// A resource row = a candidate mined from captured traffic, overlaid with an explicit
+// ownership assertion when one exists. Unknown owner is a NORMAL state (ownership_status
+// ""), never a warning; researcher_controlled is only ever set by an explicit assertion.
+export interface ResourceRow {
+  resource_type: string;
+  value: string;
+  fields: string[];
+  sources: string[];
+  confidence: string; // "" | "low" | "medium" | "high"
+  endpoint_refs: string[];
+  capture_refs: string[];
+  observations: number;
+  first_seen: string;
+  last_seen: string;
+  observed: boolean;
+  owner_identity: string;
+  tenant: string;
+  researcher_controlled: boolean;
+  ownership_status: string; // "" = unknown | "CONFIRMED" | "INFERRED"
+  ownership_confidence: number | null;
+  ownership_source: string;
+  ownership_note: string;
+  owner_known: boolean;
+}
+
 // One structured SSE event (web/server.py _structured_events). `event` is the typed
 // name; `data` carries the audit record plus its `seq` for ?since= resume.
 export interface CampaignEvent {
