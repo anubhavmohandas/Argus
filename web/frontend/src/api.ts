@@ -430,6 +430,12 @@ export function getCoverage(cid: string): Promise<import("./types").Coverage> {
   return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/coverage`);
 }
 
+/** OPEN research gaps ranked highest-value-first by the deterministic priority engine.
+ * Research signal, never severity; each gap carries its score and per-factor breakdown. */
+export function getPriority(cid: string): Promise<import("./types").PriorityResult> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/priority`);
+}
+
 export interface ModuleCallbacks {
   onStatus?: (line: string) => void;
   onResult?: (findings: Finding[]) => void;

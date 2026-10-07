@@ -387,3 +387,29 @@ def test_coverage_route_exposes_research_gaps(api):
     assert g["mutation_identity"] == "customer_b"
     assert g["policy_preview"]["verdict"] == "ALLOW_WITH_LIMITS"
     assert body["summary"]["owner_nonowner_untested"] == 1
+
+
+def test_priority_and_intel_routes(api):
+    """GET /api/campaign/{id}/priority ranks OPEN gaps; /intel is the Command Center research
+    intelligence (coverage + the highest-value boundary) — derived state, not a security score."""
+    cid = _campaign(api, program="In scope:\napi.acme.example\nRate: 2 requests/sec\n")
+    from argus import campaign as cmod, identity as imod, resource, traffic
+    c = cmod.load(cid)
+    for name in ("customer_a", "customer_b"):
+        imod.register(c, imod.Identity(name=name, role="customer", tenant="t1", researcher_owned=True))
+    traffic.capture(c, method="POST", url="https://api.acme.example/api/refunds/5/approve",
+                    headers={"Authorization": "Bearer s"}, identity="customer_a",
+                    response={"status": 200})
+    resource.assert_ownership(c, resource.Ownership(
+        resource_type="refund", resource_value="5", owner_identity="customer_a",
+        tenant="t1", researcher_controlled=True))
+
+    code, body = _req(api, f"/api/campaign/{cid}/priority")
+    assert code == 200, body
+    assert body["ranked"] and body["ranked"][0]["priority_rank"] == 1
+    assert "priority_factors" in body["ranked"][0]
+
+    code, body = _req(api, f"/api/campaign/{cid}/intel")
+    assert code == 200, body
+    assert body["research_coverage"]["note"] == "research coverage, not a security score"
+    assert body["highest_value_boundary"]["gap_id"] == body["highest_value_boundary"]["gap_id"]

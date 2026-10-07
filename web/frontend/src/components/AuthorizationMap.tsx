@@ -8,7 +8,7 @@ import type {
   MatrixIdentityCol,
   ResearchGap,
 } from "../types";
-import { getCoverage, getMatrix, listCampaigns } from "../api";
+import { getCoverage, getMatrix, getPriority, listCampaigns } from "../api";
 
 // SURFACE → Authorization Map. A deterministic read model over captured traffic:
 // which identities have been OBSERVED using each normalized endpoint, and which have
@@ -33,6 +33,7 @@ export default function AuthorizationMap() {
   const [cid, setCid] = useState<string | null>(null);
   const [matrix, setMatrix] = useState<Matrix | null>(null);
   const [coverage, setCoverage] = useState<Coverage | null>(null);
+  const [ranked, setRanked] = useState<ResearchGap[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [q, setQ] = useState("");
@@ -47,11 +48,13 @@ export default function AuthorizationMap() {
   useEffect(() => {
     setMatrix(null);
     setCoverage(null);
+    setRanked(null);
     setSel(null);
     setError(null);
     if (!cid) return;
     getMatrix(cid).then(setMatrix).catch((e) => setError(String(e)));
     getCoverage(cid).then(setCoverage).catch((e) => setError(String(e)));
+    getPriority(cid).then((r) => setRanked(r.ranked)).catch((e) => setError(String(e)));
   }, [cid]);
 
   // observed-cell lookup — only observed cells are sent; a miss is unobserved (○).
@@ -152,7 +155,7 @@ export default function AuthorizationMap() {
               onIdentity={(col) => setSel({ kind: "identity", col })}
               selected={sel}
             />
-            {coverage && <GapsPanel coverage={coverage} />}
+            {coverage && <GapsPanel coverage={coverage} ranked={ranked} />}
           </>
         ) : (
           <Empty text="loading matrix…" />
@@ -382,25 +385,26 @@ function Inspector({
 
 // Research gaps are MISSING EVIDENCE, never findings — the panel says so and shows the
 // policy verdict a test would get, but queues nothing (Phase 5 adds the orchestrated run).
-function GapsPanel({ coverage }: { coverage: Coverage }) {
-  const live = coverage.gaps.filter((g) => !g.orphan);
+function GapsPanel({ coverage, ranked }: { coverage: Coverage; ranked: ResearchGap[] | null }) {
+  // prefer the priority engine's ranked OPEN gaps; fall back to raw coverage order.
+  const rows = ranked ?? coverage.gaps.filter((g) => !g.orphan && g.status === "OPEN");
   return (
     <div className="bg-panel border border-edge rounded-lg">
       <div className="flex items-center gap-3 px-3 py-2 border-b border-edge">
-        <span className="text-[10px] font-mono uppercase tracking-wide text-mute">Research gaps</span>
+        <span className="text-[10px] font-mono uppercase tracking-wide text-mute">Research gaps · priority-ranked</span>
         <span className="text-xs font-mono text-mute/70">
           {coverage.summary.open_gaps} open · owner→non-owner {coverage.summary.owner_nonowner_untested}
         </span>
         <span className="ml-auto text-[10px] font-mono text-mute/50">missing research evidence — not findings</span>
       </div>
-      {live.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="px-3 py-5 text-xs font-mono text-mute text-center">
           no ownership-aware gaps yet — assert researcher-controlled ownership on the Resources
           surface so ARGUS can spot untested owner → non-owner boundaries.
         </div>
       ) : (
         <div className="max-h-[36vh] overflow-auto divide-y divide-edge/40">
-          {live.map((g) => <GapRow key={g.gap_id} g={g} />)}
+          {rows.map((g) => <GapRow key={g.gap_id} g={g} />)}
         </div>
       )}
     </div>
@@ -411,6 +415,12 @@ function GapRow({ g }: { g: ResearchGap }) {
   return (
     <div className="px-3 py-2 text-xs font-mono flex flex-col gap-1">
       <div className="flex items-center gap-2 flex-wrap">
+        {g.priority_rank != null && (
+          <span className="text-accent" title={factorTitle(g.priority_factors)}>#{g.priority_rank}</span>
+        )}
+        {g.priority_score != null && (
+          <span className="text-mute/70 text-[10px]" title={factorTitle(g.priority_factors)}>score {g.priority_score}</span>
+        )}
         <span className="text-medium">{g.gap_type}</span>
         <span className="text-mute">·</span>
         <span className="text-ink">{g.method} {g.path_template}</span>
@@ -434,6 +444,13 @@ function GapRow({ g }: { g: ResearchGap }) {
       </div>
     </div>
   );
+}
+
+// the priority score's per-factor breakdown as a hover title — the ranking is explainable,
+// never an opaque number.
+function factorTitle(f?: Record<string, number>): string {
+  if (!f) return "";
+  return Object.entries(f).map(([k, v]) => `${k} +${v}`).join("  ");
 }
 
 function Legend({ sym, cls, label }: { sym: string; cls: string; label: string }) {

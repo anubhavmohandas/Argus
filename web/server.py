@@ -901,6 +901,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "coverage":
             return self._campaign_coverage(parts[2])
 
+        # research-priority engine: /api/campaign/{id}/priority (ranked gaps) and
+        # /api/campaign/{id}/intel (Command Center research intelligence). Both DERIVED
+        # research state — never execution progress, never a security score.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] in ("priority", "intel"):
+            return self._campaign_priority(parts[2], parts[3])
+
         # otherwise: static frontend
         self._serve_static(path)
 
@@ -985,6 +991,24 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(coverage.build(campaign_mod.load(cid)))
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not build coverage: {e}"}, code=500)
+
+    def _campaign_priority(self, cid: str, kind: str):
+        """GET /api/campaign/{id}/priority — ranked OPEN gaps; /intel — Command Center
+        research intelligence (coverage counts + the highest-value unexplored boundary).
+        Both read-only, both DERIVED research state kept separate from execution progress."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import priority
+        try:
+            c = campaign_mod.load(cid)
+            if kind == "intel":
+                self._send_json(priority.intel(c))
+            else:
+                self._send_json({"campaign_id": cid, "ranked": priority.rank(c)})
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not build {kind}: {e}"}, code=500)
 
     def _campaign_events(self, cid: str, qs: dict):
         """SSE stream of one campaign's structured events, replayed from its durable audit

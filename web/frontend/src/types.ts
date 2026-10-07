@@ -365,6 +365,15 @@ export interface ResearchGap {
   status: string; // OPEN | PROPOSED | TESTED | RESOLVED | BLOCKED | DISMISSED
   lifecycle?: Record<string, unknown>;
   orphan?: boolean;
+  // priority engine (argus/priority.py) — present on ranked results; research signal,
+  // never severity. priority_factors is the transparent per-factor breakdown.
+  priority_score?: number;
+  priority_rank?: number;
+  priority_factors?: Record<string, number>;
+}
+export interface PriorityResult {
+  campaign_id: string;
+  ranked: ResearchGap[];
 }
 export interface Coverage {
   campaign_id: string;
