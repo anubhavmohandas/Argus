@@ -135,26 +135,28 @@ def demo() -> None:
     lines; a leaked secret is reported as impact but never rendered raw."""
     import os
     import tempfile
-    from . import campaign as campaign_mod, finding as fmod
-    from .campaign import Experiment, Observation
+    from . import campaign as campaign_mod, finding as fmod, reproduce, resource as resource_mod
+    from .differential import Variant, run
+    from .identity import Identity, register
 
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["ARGUS_HOME"] = tmp
-        c = campaign_mod.create("Assets:\napi.acme.example\n", name="Acme")
-        exp = c.save_experiment(Experiment(
-            campaign_id=c.id, hypothesis="idor?", technique="differential_cross_account",
-            host="api.acme.example", verdict="ALLOW_WITH_LIMITS", verdict_reason="owned",
-            status="EVALUATED", classification="suspicious"))
-        base_o = c.save_observation(Observation(
-            experiment_id=exp.id, request={"method": "POST", "url": "https://api.acme.example/o/1", "headers": {"Authorization": "<redacted>"}, "body": ""},
-            response={"status": 403, "headers": {}, "body_excerpt": "forbidden", "body_len": 9}))
-        c.save_observation(Observation(
-            experiment_id=exp.id, request={"method": "POST", "url": "https://api.acme.example/o/1", "headers": {"Authorization": "<redacted>"}, "body": ""},
-            response={"status": 200, "headers": {}, "body_excerpt": "AKIAIOSFODNN7EXAMPLE secret body", "body_len": 32}))
-        exp.baseline_obs = base_o.id
-        c.save_experiment(exp)
+        os.environ["A_TOK"], os.environ["B_TOK"] = "tok-a", "tok-b"
+        c = campaign_mod.create("Assets:\napi.acme.example\nRate: 9 requests/sec\n", name="Acme")
+        a = Identity(name="user_a", role="customer", tenant="t1", researcher_owned=True, credential_ref="A_TOK")
+        b = Identity(name="user_b", role="customer", tenant="t1", researcher_owned=True, credential_ref="B_TOK")
+        register(c, a); register(c, b)
+        resource_mod.assert_ownership(c, resource_mod.Ownership(
+            resource_type="order", resource_value="order-1", owner_identity="user_a",
+            researcher_controlled=True))
+        # a server that leaks A's order to B, and the body happens to carry an AWS key
+        base = Variant(a, method="GET", path="/api/orders/1", resource="order-1", owner=a)
+        mut = Variant(b, method="GET", path="/api/orders/1", resource="order-1", owner=a)
+        leak = lambda *x: (200, {"content-type": "application/json"},
+                           '{"key":"AKIAIOSFODNN7EXAMPLE","total":9}')
+        r = run(c, "differential_cross_account", "api.acme.example", base, mut, fetch=leak)
+        f = fmod.promote(c, next(e for e in c.experiments() if e["id"] == r.experiment_id))
 
-        f = fmod.promote(c, next(e for e in c.experiments() if e["id"] == exp.id))
         # not yet reproduced / not report-ready -> NOT submittable, with critic lines
         r0 = generate(c, f.id)
         assert not r0.submittable
@@ -164,22 +166,26 @@ def demo() -> None:
         assert r0.impact_signals and "AKIAIOSFODNN7EXAMPLE" not in render(r0)
         assert "body withheld" in render(r0)
 
-        # walk it to REPORT_READY with a reproduction in history
-        fmod.advance(c, f.id, "REPRODUCIBLE", note="reproduced 3/3")
-        for s in ("IN_SCOPE", "BOUNDARY_CONFIRMED", "IMPACT_CONFIRMED", "DUPLICATE_CHECKED", "REPORT_READY"):
-            fmod.advance(c, f.id, s)
+        # earn every stage — reproduction, then the derived boundary/impact/dedupe gates
+        reproduce.verify(c, "differential_cross_account", "api.acme.example", base, mut,
+                         trials=2, fetch=leak, finding_id=f.id)
+        fmod.confirm_scope(c, f.id)
+        fmod.confirm_boundary(c, f.id)
+        fmod.confirm_impact(c, f.id)
+        fmod.complete_dedupe(c, f.id)
+        fmod.mark_report_ready(c, f.id)
         r = generate(c, f.id)
         assert r.reproduced and r.submittable, (r.reproduced, r.critic_issues)
         assert r.critic_issues == []
         md = render(r)
         assert md.startswith("# ") and "baseline" in md and "## Evidence" in md
-        assert r.evidence[0]["label"] == "baseline" and r.evidence[0]["status"] == 403
 
         # an out-of-scope finding is never submittable regardless of lifecycle
         oos = fmod.promote(c, {"id": "exp-oos", "technique": "differential_cross_account",
                                "host": "evil.example", "classification": "suspicious"})
         assert not generate(c, oos.id).submittable
         assert any("NOT REPORTABLE" in i for i in generate(c, oos.id).critic_issues)
+        del os.environ["A_TOK"], os.environ["B_TOK"]
     del os.environ["ARGUS_HOME"]
     print("report demo passed")
 

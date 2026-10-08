@@ -63,11 +63,24 @@ def verify(campaign, technique: str, host: str, baseline, mutation,
     if rep.reproduced and finding_id:
         f = finding_mod._get(campaign, finding_id)
         if f is not None and f.state == "OBSERVED":
-            finding_mod.advance(campaign, finding_id, "REPRODUCIBLE",
-                                note=f"reproduced {len(rep.classifications)}/"
-                                     f"{len(rep.classifications)} trials")
+            finding_mod.mark_reproducible(campaign, finding_id, _repro_evidence(rep),
+                                          note=f"reproduced {len(rep.classifications)}/"
+                                               f"{len(rep.classifications)} trials")
             rep.finding_id = finding_id
     return rep
+
+
+def _repro_evidence(rep: "ReproReport") -> dict:
+    """A ReproReport → the structured reproduction evidence finding.mark_reproducible verifies
+    and stores: the trial experiments (real, linked records), their classifications, and that
+    they reproduced the suspicious original. This becomes report evidence, not console text."""
+    return {
+        "reproduced": rep.reproduced,
+        "original": rep.original,
+        "trial_experiment_ids": list(rep.experiment_ids),
+        "requested_trials": rep.trials,
+        "classifications": list(rep.classifications),
+    }
 
 
 def background_verify(campaign, finding_id: str, trials: int = 2):
@@ -127,8 +140,15 @@ def background_verify(campaign, finding_id: str, trials: int = 2):
         if reproduced:
             cur = finding_mod._get(co.c, finding_id)
             if cur is not None and cur.state == "OBSERVED":
-                finding_mod.advance(co.c, finding_id, "REPRODUCIBLE",
-                                    note=f"reproduced {len(classes)}/{len(trials_done)} trials")
+                evidence = {
+                    "reproduced": True, "original": original,
+                    "trial_experiment_ids": [t.experiment_id for t in trials_done if t.experiment_id],
+                    "requested_trials": len(trials_done),
+                    "classifications": classes,
+                }
+                finding_mod.mark_reproducible(
+                    co.c, finding_id, evidence,
+                    note=f"reproduced {len(classes)}/{len(trials_done)} trials")
 
     return planner, on_complete
 

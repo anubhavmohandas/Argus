@@ -1,43 +1,51 @@
 """Report generation + deterministic critic. ARGUS-standalone: a submittable report is
-produced with no NYX — the critic is a fixed checklist, not an LLM.
+produced with no NYX — the critic is a fixed checklist, not an LLM. Findings are earned
+through the real lifecycle (reproduction + evidence-derived boundary/impact/dedupe), never
+walked by fiat — that is what makes a submittable report trustworthy.
 """
 import os
 
 import pytest
 
-from argus import campaign, finding, report
-from argus.campaign import Experiment, Observation
+from argus import campaign, finding, report, reproduce, resource
+from argus.differential import Variant, run
+from argus.identity import Identity, register
 
 
 @pytest.fixture
 def camp(tmp_path, monkeypatch):
     monkeypatch.setenv("ARGUS_HOME", str(tmp_path))
-    return campaign.create("Assets:\napi.acme.example\n", name="Acme")
+    monkeypatch.setenv("A_TOK", "tok-a")
+    monkeypatch.setenv("B_TOK", "tok-b")
+    c = campaign.create("Assets:\napi.acme.example\nRate: 9 requests/sec\n", name="Acme")
+    return c
 
 
-def _finding_with_obs(c, host="api.acme.example", leak_body="ok"):
-    exp = c.save_experiment(Experiment(
-        campaign_id=c.id, hypothesis="idor?", technique="differential_cross_account",
-        host=host, verdict="ALLOW_WITH_LIMITS", verdict_reason="owned",
-        status="EVALUATED", classification="suspicious"))
-    b = c.save_observation(Observation(
-        experiment_id=exp.id, request={"method": "POST", "url": f"https://{host}/o/1", "headers": {}, "body": ""},
-        response={"status": 403, "headers": {}, "body_excerpt": "nope", "body_len": 4}))
-    c.save_observation(Observation(
-        experiment_id=exp.id, request={"method": "POST", "url": f"https://{host}/o/1", "headers": {}, "body": ""},
-        response={"status": 200, "headers": {}, "body_excerpt": leak_body, "body_len": len(leak_body)}))
-    exp.baseline_obs = b.id
-    c.save_experiment(exp)
-    return finding.promote(c, next(e for e in c.experiments() if e["id"] == exp.id))
+def _promote(c, host="api.acme.example", leak_body='{"total":9}', path="/api/orders/1"):
+    """Run a real leaky cross-account GET differential and promote it to an OBSERVED finding,
+    with the targeted order declared researcher-controlled."""
+    a = Identity(name="user_a", role="customer", tenant="t1", researcher_owned=True, credential_ref="A_TOK")
+    b = Identity(name="user_b", role="customer", tenant="t1", researcher_owned=True, credential_ref="B_TOK")
+    register(c, a); register(c, b)
+    resource.assert_ownership(c, resource.Ownership(
+        resource_type="order", resource_value="order-1", owner_identity="user_a",
+        researcher_controlled=True))
+    base = Variant(a, method="GET", path=path, resource="order-1", owner=a)
+    mut = Variant(b, method="GET", path=path, resource="order-1", owner=a)
+    leak = lambda *x: (200, {"content-type": "application/json"}, leak_body)
+    r = run(c, "differential_cross_account", host, base, mut, fetch=leak)
+    f = finding.promote(c, next(e for e in c.experiments() if e["id"] == r.experiment_id))
+    return f, base, mut, leak
 
 
-def _walk_to_report_ready(c, fid, reproduced=True):
-    if reproduced:
-        finding.advance(c, fid, "REPRODUCIBLE", note="reproduced 3/3")
-    else:
-        finding.advance(c, fid, "REPRODUCIBLE")   # still records the state; history note differs
-    for s in ("IN_SCOPE", "BOUNDARY_CONFIRMED", "IMPACT_CONFIRMED", "DUPLICATE_CHECKED", "REPORT_READY"):
-        finding.advance(c, fid, s)
+def _earn_report_ready(c, f, base, mut, leak, host="api.acme.example"):
+    reproduce.verify(c, "differential_cross_account", host, base, mut,
+                     trials=2, fetch=leak, finding_id=f.id)
+    finding.confirm_scope(c, f.id)
+    finding.confirm_boundary(c, f.id)
+    finding.confirm_impact(c, f.id)
+    finding.complete_dedupe(c, f.id)
+    finding.mark_report_ready(c, f.id)
 
 
 def test_demo():
@@ -45,7 +53,7 @@ def test_demo():
 
 
 def test_incomplete_finding_not_submittable(camp):
-    f = _finding_with_obs(camp)
+    f, *_ = _promote(camp)
     r = report.generate(camp, f.id)
     assert not r.submittable
     assert any("not reproduced" in i for i in r.critic_issues)
@@ -53,8 +61,8 @@ def test_incomplete_finding_not_submittable(camp):
 
 
 def test_report_ready_finding_is_submittable(camp):
-    f = _finding_with_obs(camp)
-    _walk_to_report_ready(camp, f.id)
+    f, base, mut, leak = _promote(camp)
+    _earn_report_ready(camp, f, base, mut, leak)
     r = report.generate(camp, f.id)
     assert r.submittable and r.critic_issues == []
     assert r.reproduced
@@ -63,15 +71,15 @@ def test_report_ready_finding_is_submittable(camp):
 
 
 def test_evidence_baseline_first(camp):
-    f = _finding_with_obs(camp)
+    f, *_ = _promote(camp)
     r = report.generate(camp, f.id)
     assert [e["label"] for e in r.evidence] == ["baseline", "mutation"]
-    assert r.evidence[0]["status"] == 403 and r.evidence[1]["status"] == 200
+    assert all(e["status"] == 200 for e in r.evidence)
 
 
 def test_leaked_secret_reported_as_impact_never_raw(camp):
-    f = _finding_with_obs(camp, leak_body="token AKIAIOSFODNN7EXAMPLE here")
-    _walk_to_report_ready(camp, f.id)
+    f, base, mut, leak = _promote(camp, leak_body='{"key":"AKIAIOSFODNN7EXAMPLE"}')
+    _earn_report_ready(camp, f, base, mut, leak)
     r = report.generate(camp, f.id)
     md = report.render(r)
     assert r.impact_signals                              # the leak is reported
@@ -80,8 +88,10 @@ def test_leaked_secret_reported_as_impact_never_raw(camp):
 
 
 def test_out_of_scope_never_submittable(camp):
-    f = _finding_with_obs(camp, host="evil.example")
-    _walk_to_report_ready(camp, f.id)
+    # a real OOS differential is policy-blocked, so a suspicious OOS candidate is synthetic;
+    # it is tracked but never submittable.
+    f = finding.promote(camp, {"id": "exp-oos", "technique": "differential_cross_account",
+                               "host": "evil.example", "classification": "suspicious"})
     r = report.generate(camp, f.id)
     assert not r.submittable
     assert any("NOT REPORTABLE" in i for i in r.critic_issues)
