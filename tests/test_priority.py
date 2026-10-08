@@ -95,3 +95,19 @@ def test_workflow_counts_daily_attention(camp):
         "likely_duplicate_clusters", "reports_ready"}
     assert wf["open_research_gaps"] >= 1
     assert all(isinstance(v, int) and v >= 0 for v in wf.values())
+
+
+def test_feedback_nudge_is_bounded_directional_and_needs_evidence():
+    """Priority v2: validated program feedback nudges RESEARCH ATTENTION only, bounded to
+    ±6, and only once there is enough evidence."""
+    sig = {"by_boundary_type": {
+        "OWNER_NONOWNER": {"valuable": 3, "low_value": 0, "total": 3},
+        "DIFFERENT_TENANT": {"valuable": 0, "low_value": 3, "total": 3},
+    }}
+    assert priority._feedback_points(["SAME_ROLE_DIFFERENT_IDENTITY"], sig) == 6   # all valuable
+    assert priority._feedback_points(["DIFFERENT_TENANT"], sig) == -6              # all low-value
+    assert priority._feedback_points(["DIFFERENT_TENANT"], None) == 0              # no signal
+    thin = {"by_boundary_type": {"OWNER_NONOWNER": {"valuable": 1, "low_value": 0, "total": 1}}}
+    assert priority._feedback_points(["OTHER_RESEARCHER_OWNED_RESOURCE"], thin) == 0  # below min evidence
+    # the factor is part of the transparent breakdown
+    assert "feedback" in priority._score({"boundary": []}, sig)["priority_factors"]

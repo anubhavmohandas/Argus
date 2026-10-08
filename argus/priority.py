@@ -60,7 +60,39 @@ def _boundary_points(labels: list[str]) -> int:
     return 0
 
 
-def _score(gap: dict) -> dict:
+# Priority v2: a bounded, explainable nudge from VALIDATED program feedback. It can never
+# dominate the signal (±_FEEDBACK_CAP) and it only moves RESEARCH ATTENTION, never scope /
+# policy / approval. A boundary type the program has historically rewarded is nudged up; one
+# that has historically duplicated/been informative is nudged down — so ARGUS stops leading
+# the hunter back to patterns that don't pay. Needs a minimum of evidence before it moves.
+_FEEDBACK_CAP = 6
+_FEEDBACK_MIN_EVIDENCE = 2
+
+
+def _signal_key(labels: list[str]) -> str:
+    """Map a gap's boundary labels to the finding boundary_type the feedback signal is keyed
+    on. Conservative — an unrecognized label falls back to the v1 OWNER_NONOWNER boundary."""
+    if "DIFFERENT_TENANT" in labels:
+        return "DIFFERENT_TENANT"
+    if "DIFFERENT_ROLE" in labels:
+        return "DIFFERENT_ROLE"
+    return "OWNER_NONOWNER"
+
+
+def _feedback_points(labels: list[str], signal: dict | None) -> int:
+    """The feedback nudge for a gap, from program-response history. 0 until there is enough
+    evidence; otherwise ±_FEEDBACK_CAP scaled by how often that boundary type paid off."""
+    if not signal:
+        return 0
+    slot = (signal.get("by_boundary_type") or {}).get(_signal_key(labels))
+    if not slot or slot.get("total", 0) < _FEEDBACK_MIN_EVIDENCE:
+        return 0
+    total = slot["total"]
+    ratio = (slot.get("valuable", 0) - slot.get("low_value", 0)) / total   # in [-1, 1]
+    return round(ratio * _FEEDBACK_CAP)
+
+
+def _score(gap: dict, signal: dict | None = None) -> dict:
     method = (gap.get("method") or "").upper()
     factors = {
         "base": _W["base"],
@@ -71,18 +103,25 @@ def _score(gap: dict) -> dict:
         if (gap.get("policy_preview") or {}).get("verdict", "").startswith("ALLOW") else 3,
         "confidence": round(float(gap.get("confidence", 0.0)) * _W["confidence"]),
         "cheap": max(0, _W["cheap"] - max(0, int(gap.get("estimated_requests", 2)) - 2)),
+        "feedback": _feedback_points(gap.get("boundary", []) or [], signal),
     }
-    total = min(100, sum(factors.values()))
+    total = max(0, min(100, sum(factors.values())))
     return {"priority_score": total, "priority_factors": factors}
 
 
 def rank(campaign) -> list[dict]:
     """OPEN, derivable gaps scored and sorted highest-value first. Deterministic: ties break
     on gap_id so the same campaign state always yields the same order. Each gap carries its
-    score and the per-factor breakdown — the ranking is explainable, not a black box."""
+    score and the per-factor breakdown — the ranking is explainable, not a black box. v2: a
+    bounded nudge from validated program feedback (research attention only; never authority)."""
+    from . import program_response
+    try:
+        signal = program_response.priority_signal(campaign)
+    except Exception:                       # noqa: BLE001 — feedback is best-effort, never fatal
+        signal = None
     live = [g for g in coverage.gaps(campaign)
             if not g.get("orphan") and g.get("status") == "OPEN"]
-    scored = [{**g, **_score(g)} for g in live]
+    scored = [{**g, **_score(g, signal)} for g in live]
     scored.sort(key=lambda g: (-g["priority_score"], g["gap_id"]))
     for i, g in enumerate(scored):
         g["priority_rank"] = i + 1
