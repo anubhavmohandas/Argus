@@ -9,11 +9,14 @@ import {
   getCampaign,
   getClusters,
   getReport,
+  getTriage,
   listCampaigns,
+  recordTriage,
   reproduceFinding,
   subscribeCampaign,
   validateFinding,
 } from "../api";
+import type { ProgramResponse } from "../types";
 
 // The findings workspace: a dense three-column researcher surface.
 //   FINDINGS LIST  │  FINDING DETAILS (lifecycle + boundary + impact + root cause)  │  EVIDENCE / REPRODUCTION + REPORT READINESS
@@ -172,7 +175,7 @@ export default function FindingsWorkspace() {
             onReproduce={onReproduce}
             onValidate={onValidate}
           />
-          <EvidencePanel f={selected} report={report} />
+          <EvidencePanel f={selected} report={report} cid={cid} />
         </div>
       )}
     </div>
@@ -321,7 +324,64 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-function EvidencePanel({ f, report }: { f: CampaignFinding | null; report: FindingReport | null }) {
+const OUTCOMES = ["SUBMITTED", "ACCEPTED", "DUPLICATE", "INFORMATIVE", "NOT_APPLICABLE", "NEEDS_MORE_INFO", "RESOLVED"];
+
+function TriageControl({ cid, finding }: { cid: string; finding: CampaignFinding }) {
+  const [resp, setResp] = useState<ProgramResponse | null>(null);
+  const [outcome, setOutcome] = useState("SUBMITTED");
+  const [reward, setReward] = useState("");
+  const [notes, setNotes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    getTriage(cid).then((r) => setResp(r.responses.find((x) => x.finding_id === finding.id) ?? null))
+      .catch(() => { /* best-effort */ });
+  }, [cid, finding.id]);
+
+  const onRecord = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await recordTriage(cid, finding.id, { outcome, reward, notes });
+      setResp(r.triage); setReward(""); setNotes("");
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Section title="Program response (research memory)">
+      {resp && resp.outcome && (
+        <div className="text-mute mb-1">
+          latest: <span className="text-ink">{resp.outcome}</span>
+          {resp.reward ? ` · ${resp.reward}` : ""} · {resp.history.length} event(s)
+        </div>
+      )}
+      <div className="flex flex-wrap gap-1.5 items-center">
+        <select value={outcome} onChange={(e) => setOutcome(e.target.value)}
+          className="bg-panel2 border border-edge rounded px-1.5 py-1 text-[11px] text-ink outline-none focus:border-accent/60">
+          {OUTCOMES.map((o) => <option key={o} value={o}>{o}</option>)}
+        </select>
+        <input value={reward} onChange={(e) => setReward(e.target.value)} placeholder="reward"
+          className="bg-panel2 border border-edge rounded px-1.5 py-1 text-[11px] text-ink w-20 outline-none focus:border-accent/60" />
+        <input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="notes"
+          className="bg-panel2 border border-edge rounded px-1.5 py-1 text-[11px] text-ink flex-1 min-w-[80px] outline-none focus:border-accent/60" />
+        <button onClick={onRecord} disabled={busy}
+          className="text-[11px] font-mono border border-accent/40 text-accent rounded px-2 py-1 hover:bg-accent/15 disabled:opacity-40">
+          {busy ? "…" : "record"}
+        </button>
+      </div>
+      {err && <div className="text-critical mt-1">{err}</div>}
+      <div className="text-mute/50 mt-1 text-[10px]">
+        research memory only — ARGUS never submits or scrapes.
+      </div>
+    </Section>
+  );
+}
+
+function EvidencePanel({ f, report, cid }: { f: CampaignFinding | null; report: FindingReport | null; cid: string }) {
   const [showMd, setShowMd] = useState(false);
   if (!f) {
     return (
@@ -375,6 +435,8 @@ function EvidencePanel({ f, report }: { f: CampaignFinding | null; report: Findi
           <div className="text-mute/70 break-all">{r.evidence_refs.join(", ")}</div>
         </Section>
       )}
+
+      {f.state === "REPORT_READY" && <TriageControl cid={cid} finding={f} />}
 
       {r && (
         <div>

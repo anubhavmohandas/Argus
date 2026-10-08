@@ -492,6 +492,22 @@ export interface RootCauseCluster {
   representative_finding: string;
 }
 
+// ---- program-response memory (argus/program_response.py) ----
+// Research memory only: what the program said after a report was sent. Never submission or
+// scraping; feedback adjusts research priority, never scope/policy/approval.
+export interface ProgramResponse {
+  finding_id: string;
+  campaign_id: string;
+  outcome: string;                       // "" | SUBMITTED | ACCEPTED | DUPLICATE | INFORMATIVE | NOT_APPLICABLE | NEEDS_MORE_INFO | RESOLVED
+  triager_request: string;
+  duplicate_reference: string;
+  reward: string;
+  notes: string;
+  submitted_at: string;
+  response_at: string;
+  history: { outcome: string; at: string; notes?: string }[];
+}
+
 // ---- Command Center research intelligence (argus/priority.py intel()) ----
 // DERIVED research state, never execution progress and never a security score. The compact
 // boundary card is priority._top_card: enough to decide, not a dump.

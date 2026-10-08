@@ -575,6 +575,10 @@ class Handler(BaseHTTPRequestHandler):
         if len(rest) == 3 and rest[0] == "findings" and rest[2] == "validate":
             with _WRITE_LOCK:                     # rewrites the finding record — serialize
                 return self._validate_finding(c, rest[1])
+        # /findings/{finding}/triage — record the program's response (research memory only)
+        if len(rest) == 3 and rest[0] == "findings" and rest[2] == "triage":
+            with _WRITE_LOCK:
+                return self._record_triage(c, rest[1])
         # /tasks/{task}/{action}
         if len(rest) == 3 and rest[0] == "tasks" and rest[2] in ("approve", "deny", "cancel"):
             return self._task_decision(c, rest[1], rest[2])
@@ -799,6 +803,31 @@ class Handler(BaseHTTPRequestHandler):
         from dataclasses import asdict
         self._send_json({"finding": asdict(f), "reached": f.state, "stopped_reason": stopped})
 
+    def _record_triage(self, c, finding_id: str):
+        """POST /api/campaign/{id}/findings/{fid}/triage — record a program outcome as research
+        memory. No submission or scraping happens here; SUBMITTED requires a REPORT_READY
+        finding. Returns the stored record."""
+        from dataclasses import asdict
+        from argus import program_response
+        body = self._json_body()
+        if body is None:
+            return
+        outcome = (body.get("outcome") or "").strip().upper()
+        try:
+            r = program_response.record(
+                c, finding_id, outcome,
+                triager_request=str(body.get("triager_request") or ""),
+                duplicate_reference=str(body.get("duplicate_reference") or ""),
+                reward=str(body.get("reward") or ""),
+                notes=str(body.get("notes") or ""))
+        except KeyError:
+            self._send_json({"error": f"no finding {finding_id!r}"}, code=404)
+            return
+        except ValueError as e:
+            self._send_json({"error": str(e)}, code=400)
+            return
+        self._send_json({"triage": asdict(r)}, code=201)
+
     def _queue_gap(self, c, gap_id: str):
         """POST /api/campaign/{id}/gaps/{gap}/queue — run a ResearchGap's experiment proposal
         through the SAME coordinator as a pivot (one execution owner). The proposal is a plan;
@@ -963,6 +992,10 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "clusters":
             return self._campaign_clusters(parts[2])
 
+        # program-response memory: /api/campaign/{id}/triage — recorded program outcomes.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "triage":
+            return self._campaign_triage(parts[2])
+
         # a finding's structured, bounty-ready report: /api/campaign/{id}/findings/{fid}/report
         # — assembled from earned evidence, with the reportability verdict + critic result.
         if len(parts) == 6 and parts[:2] == ["api", "campaign"] and parts[3] == "findings" \
@@ -1097,6 +1130,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"campaign_id": cid, "clusters": dedupe.clusters(campaign_mod.load(cid))})
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not build clusters: {e}"}, code=500)
+
+    def _campaign_triage(self, cid: str):
+        """GET /api/campaign/{id}/triage — recorded program outcomes (research memory) plus
+        the read-only priority signal. cid validated (no traversal)."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import program_response
+        c = campaign_mod.load(cid)
+        try:
+            self._send_json({"campaign_id": cid, "responses": program_response.responses(c),
+                             "priority_signal": program_response.priority_signal(c)})
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not load triage: {e}"}, code=500)
 
     def _campaign_report(self, cid: str, finding_id: str):
         """GET /api/campaign/{id}/findings/{fid}/report — the structured report + its rendered

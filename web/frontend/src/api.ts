@@ -471,6 +471,23 @@ export function getClusters(cid: string): Promise<{ campaign_id: string; cluster
   return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/clusters`);
 }
 
+/** Record a program outcome for a finding — research memory only (no submission/scraping).
+ * SUBMITTED requires a REPORT_READY finding. */
+export function recordTriage(
+  cid: string,
+  findingId: string,
+  body: { outcome: string; triager_request?: string; duplicate_reference?: string; reward?: string; notes?: string }
+): Promise<{ triage: import("./types").ProgramResponse }> {
+  return jsonFetch(
+    `/api/campaign/${encodeURIComponent(cid)}/findings/${encodeURIComponent(findingId)}/triage`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+/** Recorded program outcomes + the read-only priority signal. */
+export function getTriage(cid: string): Promise<{ campaign_id: string; responses: import("./types").ProgramResponse[]; priority_signal: Record<string, unknown> }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/triage`);
+}
+
 /** Queue a gap's proposal: runs the plan through the EXISTING coordinator (one execution
  * owner), which re-gates it via can_test and drives the existing differential runner. Returns
  * the run snapshot + the proposal; the knowledge update arrives via the campaign event stream.

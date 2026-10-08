@@ -509,3 +509,42 @@ def test_validate_report_clusters_endpoints(api, monkeypatch):
     # clusters endpoint groups the finding
     code, cl = _req(api, f"/api/campaign/{c.id}/clusters")
     assert code == 200 and any(f.id in x["finding_ids"] for x in cl["clusters"])
+
+
+def test_triage_endpoint_records_outcome(api, monkeypatch):
+    """Program-response memory over HTTP: a REPORT_READY finding can be recorded SUBMITTED →
+    ACCEPTED; the triage listing reflects it. No submission/scraping happens server-side."""
+    monkeypatch.setenv("A_TOK", "tok-a")
+    monkeypatch.setenv("B_TOK", "tok-b")
+    from argus import campaign as cmod, finding as fmod, reproduce, resource
+    from argus.differential import Variant, run
+    from argus.identity import Identity, register
+
+    c = cmod.create("Assets:\napi.acme.example\nRate: 9 requests/sec\n", name="acme")
+    a = Identity(name="user_a", role="customer", tenant="t1", researcher_owned=True, credential_ref="A_TOK")
+    b = Identity(name="user_b", role="customer", tenant="t1", researcher_owned=True, credential_ref="B_TOK")
+    register(c, a); register(c, b)
+    resource.assert_ownership(c, resource.Ownership(
+        resource_type="order", resource_value="order-1", owner_identity="user_a", researcher_controlled=True))
+    base = Variant(a, method="GET", path="/api/orders/1", resource="order-1", owner=a)
+    mut = Variant(b, method="GET", path="/api/orders/1", resource="order-1", owner=a)
+    leak = lambda *x: (200, {"content-type": "application/json"}, '{"total":9}')
+    r = run(c, "differential_cross_account", "api.acme.example", base, mut, fetch=leak)
+    f = fmod.promote(c, next(e for e in c.experiments() if e["id"] == r.experiment_id))
+    reproduce.verify(c, "differential_cross_account", "api.acme.example", base, mut,
+                     trials=2, fetch=leak, finding_id=f.id)
+    _req(api, f"/api/campaign/{c.id}/findings/{f.id}/validate", "POST", {})
+
+    code, body = _req(api, f"/api/campaign/{c.id}/findings/{f.id}/triage", "POST",
+                      {"outcome": "SUBMITTED"})
+    assert code == 201, body
+    code, body = _req(api, f"/api/campaign/{c.id}/findings/{f.id}/triage", "POST",
+                      {"outcome": "ACCEPTED", "reward": "$500"})
+    assert code == 201 and body["triage"]["outcome"] == "ACCEPTED"
+
+    code, tr = _req(api, f"/api/campaign/{c.id}/triage")
+    assert code == 200 and any(x["finding_id"] == f.id for x in tr["responses"])
+
+    # an unknown outcome is a 400 at the trust boundary
+    code, _ = _req(api, f"/api/campaign/{c.id}/findings/{f.id}/triage", "POST", {"outcome": "BOGUS"})
+    assert code == 400
