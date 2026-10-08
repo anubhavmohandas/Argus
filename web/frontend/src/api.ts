@@ -442,6 +442,13 @@ export function getProposals(cid: string): Promise<{ campaign_id: string; propos
   return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/proposals`);
 }
 
+/** Command Center research intelligence — deterministic coverage counts + the single
+ * highest-value unexplored boundary. DERIVED research state, never execution progress and
+ * never a security score. */
+export function getIntel(cid: string): Promise<import("./types").Intel> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/intel`);
+}
+
 /** Queue a gap's proposal: runs the plan through the EXISTING coordinator (one execution
  * owner), which re-gates it via can_test and drives the existing differential runner. Returns
  * the run snapshot + the proposal; the knowledge update arrives via the campaign event stream.

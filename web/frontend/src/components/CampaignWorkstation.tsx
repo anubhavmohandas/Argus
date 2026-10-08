@@ -4,6 +4,7 @@ import type {
   CampaignRunState,
   CampaignSummary,
   EngagementLevel,
+  Intel,
   Progress,
   Task,
   TaskState,
@@ -12,11 +13,14 @@ import {
   createCampaign,
   decideTask,
   getCampaign,
+  getIntel,
   listCampaigns,
+  queueGap,
   startPivot,
   subscribeCampaign,
 } from "../api";
 import CampaignProgress from "./CampaignProgress";
+import ResearchIntel from "./ResearchIntel";
 
 const RUN_PREFIX = "campaign.run.";
 const ACTIVE_RUN = new Set<CampaignRunState>([
@@ -59,6 +63,7 @@ export default function CampaignWorkstation({
   const [programText, setProgramText] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [runState, setRunState] = useState<CampaignRunState | null>(null);
+  const [intel, setIntel] = useState<Intel | null>(null);
   const refetchTimer = useRef<number | null>(null);
 
   const refreshList = useCallback(() => {
@@ -83,6 +88,9 @@ export default function CampaignWorkstation({
         onProgress?.(d.id, d.progress);   // feed the bottom execution rail
       })
       .catch((e) => setError(String(e)));
+    // research intel is derived knowledge, independent of execution progress — refresh it
+    // on the same signal, but never let its failure clobber the detail view.
+    getIntel(id).then(setIntel).catch(() => { /* derived view is best-effort */ });
   }, [onProgress]);
 
   // Subscribe to the campaign's structured event stream; on any event, debounce a
@@ -91,6 +99,7 @@ export default function CampaignWorkstation({
     if (!cid) {
       setDetail(null);
       setRunState(null);
+      setIntel(null);
       return;
     }
     loadDetail(cid);
@@ -159,6 +168,24 @@ export default function CampaignWorkstation({
     [cid, loadDetail]
   );
 
+  const onQueueGap = useCallback(
+    async (gapId: string) => {
+      if (!cid) return;
+      setBusy("queue:" + gapId);
+      setError(null);
+      try {
+        await queueGap(cid, gapId);   // runs the plan through the EXISTING coordinator
+        loadDetail(cid);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [cid, loadDetail]
+  );
+
+  const runActive = runState != null && ACTIVE_RUN.has(runState);
   const pending = (detail?.tasks ?? []).filter((t) => t.state === "APPROVAL_REQUIRED");
 
   return (
@@ -232,6 +259,15 @@ export default function CampaignWorkstation({
       {detail && (
         <>
           <CampaignProgress p={detail.progress} />
+
+          {intel && (
+            <ResearchIntel
+              intel={intel}
+              onQueue={onQueueGap}
+              queueBusy={busy?.startsWith("queue:") ? busy.slice("queue:".length) : null}
+              queueDisabled={runActive}
+            />
+          )}
 
           <div className="flex items-center gap-2 bg-panel border border-edge rounded-lg px-3 py-2">
             <span className="text-[10px] font-mono uppercase tracking-wide text-mute">Pivot</span>

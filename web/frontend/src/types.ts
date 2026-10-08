@@ -420,6 +420,45 @@ export interface Coverage {
   };
 }
 
+// ---- Command Center research intelligence (argus/priority.py intel()) ----
+// DERIVED research state, never execution progress and never a security score. The compact
+// boundary card is priority._top_card: enough to decide, not a dump.
+export interface BoundaryCard {
+  gap_id: string;
+  priority_rank?: number;
+  priority_score?: number;
+  priority_factors?: Record<string, number>;
+  gap_type: string;
+  endpoint: string;
+  host: string;
+  boundary: string[];
+  baseline_identity?: string;
+  mutation_identity?: string;
+  resource_type?: string;
+  resource_id?: string;
+  reason?: string;
+  policy_preview?: GapPolicyPreview | null;
+  estimated_requests?: number;
+  confidence?: number | null;
+}
+export interface Intel {
+  campaign_id: string;
+  research_coverage: {
+    endpoints: number;
+    identities: number;
+    authorization_cells_observed: number;
+    authorization_cells_possible: number;
+    research_coverage_pct: number;
+    resources_known: number;
+    ownership_confirmed: number;
+    open_boundary_gaps: number;
+    note: string;
+    anonymous_dimension: boolean;
+  };
+  highest_value_boundary: BoundaryCard | null;
+  ranked_preview: BoundaryCard[];
+}
+
 // One structured SSE event (web/server.py _structured_events). `event` is the typed
 // name; `data` carries the audit record plus its `seq` for ?since= resume.
 export interface CampaignEvent {
