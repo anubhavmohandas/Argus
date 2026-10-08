@@ -82,3 +82,16 @@ def test_intel_is_separate_from_execution_progress(camp):
 
 def test_demo_self_check():
     priority.demo()
+
+
+def test_workflow_counts_daily_attention(camp):
+    """The Command Center workflow block is a pure aggregate over existing state: open gaps,
+    suspicious observations, and findings by earned stage."""
+    _owned_action(camp, "GET", "/api/orders/1", "order", "1")
+    wf = priority.workflow(camp)
+    assert set(wf) == {
+        "open_research_gaps", "experiments_awaiting_approval", "suspicious_observations",
+        "candidates_needing_reproduction", "reproduced_findings", "impact_confirmed_findings",
+        "likely_duplicate_clusters", "reports_ready"}
+    assert wf["open_research_gaps"] >= 1
+    assert all(isinstance(v, int) and v >= 0 for v in wf.values())

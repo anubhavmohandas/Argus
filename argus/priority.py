@@ -119,6 +119,33 @@ def intel(campaign) -> dict:
         },
         "highest_value_boundary": _top_card(ranked[0]) if ranked else None,
         "ranked_preview": [_top_card(g) for g in ranked[:5]],
+        "workflow": workflow(campaign),
+    }
+
+
+def workflow(campaign) -> dict:
+    """The daily-workflow counts the Command Center surfaces beyond unexplored gaps: where the
+    hunter's attention is valuable right now. Purely DERIVED from existing state (findings by
+    earned stage, pending approvals, suspicious experiments, duplicate clusters) — it computes
+    no new analysis and runs nothing."""
+    from . import dedupe, finding as finding_mod
+    finds = finding_mod.findings(campaign)
+    def in_state(*states):
+        return sum(1 for f in finds if f["state"] in states)
+    suspicious_exps = sum(1 for e in campaign.experiments()
+                          if e.get("classification") in ("suspicious", "vulnerable"))
+    approvals = sum(1 for t in campaign.tasks() if t.get("state") == "APPROVAL_REQUIRED")
+    clusters = dedupe.clusters(campaign)
+    return {
+        "open_research_gaps": sum(1 for g in coverage.gaps(campaign)
+                                  if not g.get("orphan") and g.get("status") == "OPEN"),
+        "experiments_awaiting_approval": approvals,
+        "suspicious_observations": suspicious_exps,
+        "candidates_needing_reproduction": in_state("OBSERVED"),
+        "reproduced_findings": in_state("REPRODUCIBLE", "IN_SCOPE", "BOUNDARY_CONFIRMED"),
+        "impact_confirmed_findings": in_state("IMPACT_CONFIRMED", "DUPLICATE_CHECKED"),
+        "likely_duplicate_clusters": sum(1 for c in clusters if len(c["finding_ids"]) > 1),
+        "reports_ready": sum(1 for f in finds if f["state"] == "REPORT_READY" and f["reportable"]),
     }
 
 

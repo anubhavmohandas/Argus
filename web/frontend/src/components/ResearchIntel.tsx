@@ -28,7 +28,10 @@ export default function ResearchIntel({
 }) {
   const c = intel.research_coverage;
   const top = intel.highest_value_boundary;
+  const wf = intel.workflow;
   return (
+    <div className="flex flex-col gap-3">
+    {wf && <WorkflowStrip wf={wf} />}
     <div className="bg-panel border border-edge rounded-lg p-3 grid gap-4 md:grid-cols-2">
       <div>
         <div className="text-[10px] font-mono uppercase tracking-widest text-mute/70 mb-2">
@@ -61,6 +64,37 @@ export default function ResearchIntel({
             no open boundaries — every derivable gap is tested or resolved.
           </div>
         )}
+      </div>
+    </div>
+    </div>
+  );
+}
+
+function WorkflowStrip({ wf }: { wf: NonNullable<Intel["workflow"]> }) {
+  const cells: { label: string; value: number }[] = [
+    { label: "open gaps", value: wf.open_research_gaps },
+    { label: "awaiting approval", value: wf.experiments_awaiting_approval },
+    { label: "suspicious obs", value: wf.suspicious_observations },
+    { label: "need reproduction", value: wf.candidates_needing_reproduction },
+    { label: "reproduced", value: wf.reproduced_findings },
+    { label: "impact confirmed", value: wf.impact_confirmed_findings },
+    { label: "duplicate clusters", value: wf.likely_duplicate_clusters },
+    { label: "reports ready", value: wf.reports_ready },
+  ];
+  return (
+    <div className="bg-panel border border-edge rounded-lg p-3">
+      <div className="text-[10px] font-mono uppercase tracking-widest text-mute/70 mb-2">
+        Where your attention is valuable
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        {cells.map((c) => (
+          <div key={c.label} className="flex flex-col">
+            <span className={`text-lg font-mono tabular-nums ${c.value > 0 ? "text-accent" : "text-mute/50"}`}>
+              {c.value}
+            </span>
+            <span className="text-[10px] font-mono text-mute">{c.label}</span>
+          </div>
+        ))}
       </div>
     </div>
   );

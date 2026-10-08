@@ -545,6 +545,16 @@ export interface Intel {
   };
   highest_value_boundary: BoundaryCard | null;
   ranked_preview: BoundaryCard[];
+  workflow?: {
+    open_research_gaps: number;
+    experiments_awaiting_approval: number;
+    suspicious_observations: number;
+    candidates_needing_reproduction: number;
+    reproduced_findings: number;
+    impact_confirmed_findings: number;
+    likely_duplicate_clusters: number;
+    reports_ready: number;
+  };
 }
 
 // One structured SSE event (web/server.py _structured_events). `event` is the typed
