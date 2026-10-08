@@ -571,6 +571,10 @@ class Handler(BaseHTTPRequestHandler):
         # /findings/{finding}/reproduce
         if len(rest) == 3 and rest[0] == "findings" and rest[2] == "reproduce":
             return self._reproduce_finding(c, rest[1])
+        # /findings/{finding}/validate — sequence the deterministic earned transitions
+        if len(rest) == 3 and rest[0] == "findings" and rest[2] == "validate":
+            with _WRITE_LOCK:                     # rewrites the finding record — serialize
+                return self._validate_finding(c, rest[1])
         # /tasks/{task}/{action}
         if len(rest) == 3 and rest[0] == "tasks" and rest[2] in ("approve", "deny", "cancel"):
             return self._task_decision(c, rest[1], rest[2])
@@ -777,6 +781,24 @@ class Handler(BaseHTTPRequestHandler):
         snap = co.start(planner=planner, on_complete=on_complete)
         self._send_json({"run": snap, "finding": finding_id, "trials": trials}, code=202)
 
+    def _validate_finding(self, c, finding_id: str):
+        """POST /api/campaign/{id}/findings/{fid}/validate — run the earned transitions the
+        evidence supports (scope → boundary → impact → dedupe → report-ready), stopping at the
+        first gate that is not yet earned. Deterministic derivations only; it never executes
+        requests (reproduction stays operator-controlled). Returns the updated finding + the
+        reason it stopped, if any."""
+        from argus import finding as finding_mod
+        if finding_mod._get(c, finding_id) is None:
+            self._send_json({"error": f"no finding {finding_id!r}"}, code=404)
+            return
+        try:
+            f, stopped = finding_mod.validate(c, finding_id)
+        except Exception as e:                      # noqa: BLE001 — report, don't crash
+            self._send_json({"error": str(e)}, code=500)
+            return
+        from dataclasses import asdict
+        self._send_json({"finding": asdict(f), "reached": f.state, "stopped_reason": stopped})
+
     def _queue_gap(self, c, gap_id: str):
         """POST /api/campaign/{id}/gaps/{gap}/queue — run a ResearchGap's experiment proposal
         through the SAME coordinator as a pivot (one execution owner). The proposal is a plan;
@@ -936,6 +958,17 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "proposals":
             return self._campaign_proposals(parts[2])
 
+        # root-cause / duplicate clusters: /api/campaign/{id}/clusters — findings grouped by
+        # the control point that failed (host + object family + boundary), never auto-merged.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "clusters":
+            return self._campaign_clusters(parts[2])
+
+        # a finding's structured, bounty-ready report: /api/campaign/{id}/findings/{fid}/report
+        # — assembled from earned evidence, with the reportability verdict + critic result.
+        if len(parts) == 6 and parts[:2] == ["api", "campaign"] and parts[3] == "findings" \
+                and parts[5] == "report":
+            return self._campaign_report(parts[2], parts[4])
+
         # otherwise: static frontend
         self._serve_static(path)
 
@@ -1051,6 +1084,39 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"campaign_id": cid, "proposals": proposal.proposals(campaign_mod.load(cid))})
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not build proposals: {e}"}, code=500)
+
+    def _campaign_clusters(self, cid: str):
+        """GET /api/campaign/{id}/clusters — findings grouped by the failed control point.
+        Read-only projection; nothing is merged, the hunter decides. cid validated (no traversal)."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import dedupe
+        try:
+            self._send_json({"campaign_id": cid, "clusters": dedupe.clusters(campaign_mod.load(cid))})
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not build clusters: {e}"}, code=500)
+
+    def _campaign_report(self, cid: str, finding_id: str):
+        """GET /api/campaign/{id}/findings/{fid}/report — the structured report + its rendered
+        markdown, assembled from earned evidence. Read-only; computes no new evidence."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from dataclasses import asdict
+        from argus import report as report_mod
+        c = campaign_mod.load(cid)
+        try:
+            rep = report_mod.generate(c, finding_id)
+        except KeyError:
+            self._send_json({"error": f"no finding {finding_id!r}"}, code=404)
+            return
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not build report: {e}"}, code=500)
+            return
+        self._send_json({"report": asdict(rep), "markdown": report_mod.render(rep)})
 
     def _campaign_events(self, cid: str, qs: dict):
         """SSE stream of one campaign's structured events, replayed from its durable audit

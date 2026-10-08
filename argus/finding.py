@@ -333,6 +333,36 @@ def mark_report_ready(campaign, finding_id: str, note: str = "", by: str = "") -
                     note=note, by=by)
 
 
+def validate(campaign, finding_id: str) -> tuple[Finding, str]:
+    """Run every earned transition the evidence currently supports, from the finding's
+    current stage onward, stopping at the first gate it cannot yet pass. Each gate still
+    verifies its own evidence — this only SEQUENCES the deterministic derivations (scope →
+    boundary → impact → dedupe → report-ready). It never runs reproduction, which executes
+    requests and stays operator-controlled. Returns (finding, stopped_reason)."""
+    steps = [("REPRODUCIBLE", confirm_scope), ("IN_SCOPE", confirm_boundary),
+             ("BOUNDARY_CONFIRMED", confirm_impact), ("IMPACT_CONFIRMED", complete_dedupe),
+             ("DUPLICATE_CHECKED", mark_report_ready)]
+    stopped = ""
+    for prior, fn in steps:
+        cur = _get(campaign, finding_id)
+        if cur is None:
+            raise KeyError(f"no finding {finding_id!r}")
+        if cur.state == DISMISSED:
+            stopped = "finding is dismissed"
+            break
+        if LIFECYCLE.index(cur.state) < LIFECYCLE.index(prior):
+            stopped = "needs reproduction first — run [Reproduce]"
+            break
+        if cur.state != prior:
+            continue                    # already past this gate
+        try:
+            fn(campaign, finding_id)
+        except ValueError as e:
+            stopped = str(e)
+            break
+    return _get(campaign, finding_id), stopped
+
+
 def report_ready(campaign) -> list[dict]:
     """Candidates that completed the pipeline AND the program will accept — the queue the
     report generator draws from."""
