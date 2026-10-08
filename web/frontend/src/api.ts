@@ -449,6 +449,28 @@ export function getIntel(cid: string): Promise<import("./types").Intel> {
   return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/intel`);
 }
 
+/** Sequence the deterministic earned transitions (scope→boundary→impact→dedupe→report-ready)
+ * as far as the evidence supports, stopping with a reason at the first unearned gate. This
+ * never executes requests — reproduction stays the operator-controlled coordinator path. */
+export function validateFinding(cid: string, findingId: string): Promise<import("./types").ValidateResult> {
+  return jsonFetch(
+    `/api/campaign/${encodeURIComponent(cid)}/findings/${encodeURIComponent(findingId)}/validate`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+}
+
+/** A finding's structured report + rendered markdown, with its reportability verdict and
+ * critic result. Read-only — building it computes no new evidence. */
+export function getReport(cid: string, findingId: string): Promise<import("./types").FindingReport> {
+  return jsonFetch(
+    `/api/campaign/${encodeURIComponent(cid)}/findings/${encodeURIComponent(findingId)}/report`);
+}
+
+/** Root-cause clusters — findings grouped by the failed control point (host + object family
+ * + boundary). Grouped, never merged; the hunter decides. */
+export function getClusters(cid: string): Promise<{ campaign_id: string; clusters: import("./types").RootCauseCluster[] }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/clusters`);
+}
+
 /** Queue a gap's proposal: runs the plan through the EXISTING coordinator (one execution
  * owner), which re-gates it via can_test and drives the existing differential runner. Returns
  * the run snapshot + the proposal; the knowledge update arrives via the campaign event stream.

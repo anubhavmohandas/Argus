@@ -420,6 +420,78 @@ export interface Coverage {
   };
 }
 
+// ---- finding lifecycle (argus/finding.py) ----
+// A finding's state describes what ARGUS has EARNED, not what a caller named it. `evidence`
+// is keyed by lifecycle stage; each stage's record traces back to immutable experiments/
+// observations. The frontend only reads this — transitions happen server-side via earned APIs.
+export interface CampaignFinding {
+  id: string;
+  campaign_id: string;
+  experiment_id: string;
+  host: string;
+  technique: string;
+  title: string;
+  classification: string;
+  state: string;                         // OBSERVED | REPRODUCIBLE | IN_SCOPE | BOUNDARY_CONFIRMED | IMPACT_CONFIRMED | DUPLICATE_CHECKED | REPORT_READY | DISMISSED
+  reportable: boolean;
+  suppressed_reason: string;
+  evidence: Record<string, Record<string, unknown>>;
+  history: { to: string; at: string; note?: string; by?: string }[];
+  created_at: string;
+}
+
+export interface ValidateResult {
+  finding: CampaignFinding;
+  reached: string;
+  stopped_reason: string;
+}
+
+export interface CriticIssue {
+  level: "PASS" | "WARN" | "BLOCK";
+  msg: string;
+}
+export interface FindingReport {
+  report: {
+    finding_id: string;
+    title: string;
+    host: string;
+    technique: string;
+    state: string;
+    summary: string;
+    security_boundary: Record<string, unknown>;
+    prerequisites: string[];
+    controlled_accounts: string[];
+    repro_steps: string[];
+    expected: string;
+    observed: string;
+    demonstrated_impact: string[];
+    reproduction_status: Record<string, unknown>;
+    scope_context: Record<string, unknown>;
+    root_cause: Record<string, unknown>;
+    remediation: string[];
+    evidence: { label: string; method: string; url: string; status: number; body_note: string }[];
+    evidence_refs: string[];
+    impact_signals: { type: string; severity: string; preview: string }[];
+    reportability: "REPORTABLE" | "NOT_READY" | "DO_NOT_REPORT";
+    reportability_reasons: string[];
+    critic_verdict: "PASS" | "WARN" | "BLOCK";
+    critic_issues: CriticIssue[];
+    submittable: boolean;
+  };
+  markdown: string;
+}
+
+export interface RootCauseCluster {
+  cluster_id: string;
+  host: string;
+  endpoint_family: string;
+  boundary_type: string;
+  finding_ids: string[];
+  actions: string[];
+  affected_actions: number;
+  representative_finding: string;
+}
+
 // ---- Command Center research intelligence (argus/priority.py intel()) ----
 // DERIVED research state, never execution progress and never a security score. The compact
 // boundary card is priority._top_card: enough to decide, not a dump.

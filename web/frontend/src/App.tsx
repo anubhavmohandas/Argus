@@ -29,6 +29,7 @@ import SecretRecon from "./components/SecretRecon";
 import ModuleRunner from "./components/ModuleRunner";
 import ProgramScope from "./components/ProgramScope";
 import CampaignWorkstation from "./components/CampaignWorkstation";
+import FindingsWorkspace from "./components/FindingsWorkspace";
 import CampaignProgress from "./components/CampaignProgress";
 import EndpointsSurface from "./components/EndpointsSurface";
 import ResourcesSurface from "./components/ResourcesSurface";
@@ -41,7 +42,7 @@ import { downloadReport } from "./lib";
 // progress) is a second surface. Same graphite/aqua DNA, nothing redesigned.
 
 type View =
-  | "command" | "campaigns" | "endpoints" | "resources" | "authmap" | "experiments" | "capabilities";
+  | "command" | "campaigns" | "endpoints" | "resources" | "authmap" | "experiments" | "findings" | "capabilities";
 
 const NAV: { group: string; items: { id: View; label: string }[] }[] = [
   { group: "Command", items: [{ id: "command", label: "Quick Pivot" }] },
@@ -51,7 +52,10 @@ const NAV: { group: string; items: { id: View; label: string }[] }[] = [
     { id: "resources", label: "Resources" },
     { id: "authmap", label: "Authorization Map" },
   ] },
-  { group: "Research", items: [{ id: "experiments", label: "Experiments" }] },
+  { group: "Research", items: [
+    { id: "experiments", label: "Experiments" },
+    { id: "findings", label: "Findings" },
+  ] },
   { group: "System", items: [{ id: "capabilities", label: "Capabilities" }] },
 ];
 
@@ -99,6 +103,7 @@ export default function App() {
             {view === "resources" && <ResourcesSurface />}
             {view === "authmap" && <AuthorizationMap />}
             {view === "experiments" && <ExperimentsSurface />}
+            {view === "findings" && <FindingsWorkspace />}
             {view === "capabilities" && <Capabilities />}
           </div>
         </main>
