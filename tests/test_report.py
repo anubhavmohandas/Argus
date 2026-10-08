@@ -1,10 +1,9 @@
-"""Report generation + deterministic critic. ARGUS-standalone: a submittable report is
-produced with no NYX — the critic is a fixed checklist, not an LLM. Findings are earned
-through the real lifecycle (reproduction + evidence-derived boundary/impact/dedupe), never
-walked by fiat — that is what makes a submittable report trustworthy.
+"""Reportability engine + structured report + deterministic critic. ARGUS-standalone (no
+NYX). A report is assembled from earned evidence, never prose: it carries no credential
+value, its reproduction steps point at real experiment records, it states expected vs
+observed, and its impact text cannot exceed the structured impact evidence. The critic
+BLOCKs anything that would mislead a triager.
 """
-import os
-
 import pytest
 
 from argus import campaign, finding, report, reproduce, resource
@@ -17,13 +16,10 @@ def camp(tmp_path, monkeypatch):
     monkeypatch.setenv("ARGUS_HOME", str(tmp_path))
     monkeypatch.setenv("A_TOK", "tok-a")
     monkeypatch.setenv("B_TOK", "tok-b")
-    c = campaign.create("Assets:\napi.acme.example\nRate: 9 requests/sec\n", name="Acme")
-    return c
+    return campaign.create("Assets:\napi.acme.example\nRate: 9 requests/sec\n", name="Acme")
 
 
-def _promote(c, host="api.acme.example", leak_body='{"total":9}', path="/api/orders/1"):
-    """Run a real leaky cross-account GET differential and promote it to an OBSERVED finding,
-    with the targeted order declared researcher-controlled."""
+def _promote(c, leak_body='{"total":9}', path="/api/orders/1"):
     a = Identity(name="user_a", role="customer", tenant="t1", researcher_owned=True, credential_ref="A_TOK")
     b = Identity(name="user_b", role="customer", tenant="t1", researcher_owned=True, credential_ref="B_TOK")
     register(c, a); register(c, b)
@@ -33,68 +29,122 @@ def _promote(c, host="api.acme.example", leak_body='{"total":9}', path="/api/ord
     base = Variant(a, method="GET", path=path, resource="order-1", owner=a)
     mut = Variant(b, method="GET", path=path, resource="order-1", owner=a)
     leak = lambda *x: (200, {"content-type": "application/json"}, leak_body)
-    r = run(c, "differential_cross_account", host, base, mut, fetch=leak)
+    r = run(c, "differential_cross_account", "api.acme.example", base, mut, fetch=leak)
     f = finding.promote(c, next(e for e in c.experiments() if e["id"] == r.experiment_id))
     return f, base, mut, leak
 
 
-def _earn_report_ready(c, f, base, mut, leak, host="api.acme.example"):
-    reproduce.verify(c, "differential_cross_account", host, base, mut,
+def _earn(c, f, base, mut, leak):
+    reproduce.verify(c, "differential_cross_account", "api.acme.example", base, mut,
                      trials=2, fetch=leak, finding_id=f.id)
-    finding.confirm_scope(c, f.id)
-    finding.confirm_boundary(c, f.id)
-    finding.confirm_impact(c, f.id)
-    finding.complete_dedupe(c, f.id)
-    finding.mark_report_ready(c, f.id)
+    finding.confirm_scope(c, f.id); finding.confirm_boundary(c, f.id)
+    finding.confirm_impact(c, f.id); finding.complete_dedupe(c, f.id); finding.mark_report_ready(c, f.id)
 
 
 def test_demo():
     report.demo()
 
 
-def test_incomplete_finding_not_submittable(camp):
+def test_incomplete_is_not_ready_and_critic_blocks(camp):
     f, *_ = _promote(camp)
     r = report.generate(camp, f.id)
-    assert not r.submittable
-    assert any("not reproduced" in i for i in r.critic_issues)
-    assert any("lifecycle incomplete" in i for i in r.critic_issues)
+    assert r.reportability == report.NOT_READY
+    assert any("reproduced" in x for x in r.reportability_reasons)
+    assert r.critic_verdict == report.BLOCK and not r.submittable
 
 
-def test_report_ready_finding_is_submittable(camp):
+def test_report_ready_is_submittable(camp):
     f, base, mut, leak = _promote(camp)
-    _earn_report_ready(camp, f, base, mut, leak)
+    _earn(camp, f, base, mut, leak)
     r = report.generate(camp, f.id)
-    assert r.submittable and r.critic_issues == []
-    assert r.reproduced
+    assert r.reportability == report.REPORTABLE
+    assert r.critic_verdict in (report.PASS, report.WARN) and r.submittable
     md = report.render(r)
-    assert md.startswith("# ") and "## Evidence" in md and "all checks passed" in md
+    assert md.startswith("# ") and "## Steps to reproduce" in md
 
 
-def test_evidence_baseline_first(camp):
+def test_no_credential_value_in_report(camp):
+    f, base, mut, leak = _promote(camp)
+    _earn(camp, f, base, mut, leak)
+    md = report.render(report.generate(camp, f.id))
+    assert "tok-a" not in md and "tok-b" not in md
+    assert "Bearer tok" not in md
+    # the only Authorization mention is the redacted placeholder
+    for line in md.splitlines():
+        if "Authorization" in line:
+            assert "<redacted>" in line
+
+
+def test_repro_steps_point_to_experiment_records(camp):
+    f, base, mut, leak = _promote(camp)
+    _earn(camp, f, base, mut, leak)
+    r = report.generate(camp, f.id)
+    trials = r.reproduction_status
+    joined = " ".join(r.repro_steps)
+    # the trial experiment ids are real records and are referenced in the steps
+    repro_ev = finding._get(camp, f.id).evidence["REPRODUCIBLE"]
+    real = {e["id"] for e in camp.experiments()}
+    assert repro_ev["trial_experiment_ids"] and all(t in real for t in repro_ev["trial_experiment_ids"])
+    assert any(t in joined for t in repro_ev["trial_experiment_ids"])
+    assert trials["reproduced"]
+
+
+def test_expected_vs_observed_exists(camp):
+    f, base, mut, leak = _promote(camp)
+    _earn(camp, f, base, mut, leak)
+    r = report.generate(camp, f.id)
+    assert r.expected and r.observed
+    assert "denied" in r.expected.lower() and "200" in r.observed
+
+
+def test_impact_text_cannot_exceed_evidence(camp):
+    f, base, mut, leak = _promote(camp)
+    _earn(camp, f, base, mut, leak)
+    r = report.generate(camp, f.id)
+    # every demonstrated-impact line is exactly the structured evidence, nothing invented
+    imp = finding._get(camp, f.id).evidence["IMPACT_CONFIRMED"]["demonstrated_effects"]
+    assert r.demonstrated_impact == imp
+
+
+def test_critic_blocks_unsupported_severity(camp):
+    f, base, mut, leak = _promote(camp)
+    _earn(camp, f, base, mut, leak)
+    r = report.generate(camp, f.id)
+    # inject an overstated claim into the title (as a hostile/sloppy edit would) and re-critique
+    r.title = "Critical account takeover via RCE affecting all customers"
+    verdict, issues = report.critique(r)
+    assert verdict == report.BLOCK
+    assert any("overstated" in i["msg"] for i in issues)
+
+
+def test_critic_blocks_missing_reproduction(camp):
     f, *_ = _promote(camp)
     r = report.generate(camp, f.id)
-    assert [e["label"] for e in r.evidence] == ["baseline", "mutation"]
-    assert all(e["status"] == 200 for e in r.evidence)
+    assert r.critic_verdict == report.BLOCK
+    assert any("not reproduced" in i["msg"] for i in r.critic_issues)
 
 
-def test_leaked_secret_reported_as_impact_never_raw(camp):
-    f, base, mut, leak = _promote(camp, leak_body='{"key":"AKIAIOSFODNN7EXAMPLE"}')
-    _earn_report_ready(camp, f, base, mut, leak)
+def test_report_ready_implies_no_block(camp):
+    f, base, mut, leak = _promote(camp)
+    _earn(camp, f, base, mut, leak)
     r = report.generate(camp, f.id)
-    md = report.render(r)
-    assert r.impact_signals                              # the leak is reported
-    assert "AKIAIOSFODNN7EXAMPLE" not in md              # but never rendered raw
+    assert finding._get(camp, f.id).state == "REPORT_READY"
+    assert r.critic_verdict != report.BLOCK
+
+
+def test_leaked_secret_reported_never_raw(camp):
+    f, base, mut, leak = _promote(camp, leak_body='{"key":"AKIAIOSFODNN7EXAMPLE"}')
+    _earn(camp, f, base, mut, leak)
+    md = report.render(report.generate(camp, f.id))
+    assert "AKIAIOSFODNN7EXAMPLE" not in md
     assert "body withheld" in md
 
 
-def test_out_of_scope_never_submittable(camp):
-    # a real OOS differential is policy-blocked, so a suspicious OOS candidate is synthetic;
-    # it is tracked but never submittable.
+def test_out_of_scope_do_not_report(camp):
     f = finding.promote(camp, {"id": "exp-oos", "technique": "differential_cross_account",
                                "host": "evil.example", "classification": "suspicious"})
     r = report.generate(camp, f.id)
-    assert not r.submittable
-    assert any("NOT REPORTABLE" in i for i in r.critic_issues)
+    assert r.reportability == report.DO_NOT_REPORT and not r.submittable
 
 
 if __name__ == "__main__":
