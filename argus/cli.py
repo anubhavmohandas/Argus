@@ -375,6 +375,38 @@ def _queue_line(a):
     return f"  {('tier' + str(a.tier)) if a.tier else 'tier-':<6} {a.action:<8} {a.pattern}"
 
 
+def _terse(row):
+    """One compact line for a projection row: scalar key=val pairs only (lists/dicts
+    are the --json view's job), id first, trimmed so a wide payload stays legible."""
+    if not isinstance(row, dict):
+        return str(row)
+    items = [k for k in row if not isinstance(row[k], (list, dict))]
+    items.sort(key=lambda k: k != "id")                 # id leads when present
+    return " ".join(f"{k}={row[k]}" for k in items)[:200]
+
+
+def _show(obj, as_json):
+    """Print a read-only knowledge projection. --json is the exact server payload;
+    the default is a generic compact summary (no per-view formatter to maintain)."""
+    if as_json:
+        print(json.dumps(obj, indent=2))
+        return
+    if isinstance(obj, list):
+        print(f"({len(obj)} item{'s' * (len(obj) != 1)})")
+        for row in obj:
+            print("  " + _terse(row))
+        return
+    for k, v in obj.items():
+        if isinstance(v, list):
+            print(f"{k}: {len(v)} item{'s' * (len(v) != 1)}")
+            for row in v:
+                print("  " + _terse(row))
+        elif isinstance(v, dict):
+            print(f"{k}: " + ", ".join(f"{kk}={vv}" for kk, vv in v.items()))
+        else:
+            print(f"{k}: {v}")
+
+
 def _cmd_campaign(args):
     """The differential-testing pipeline as a terminal flow. Imports the pipeline modules
     lazily so the recon-only commands don't pay for them. Safe by default: a cross-account
@@ -392,7 +424,7 @@ def _cmd_campaign(args):
             print(cid)
         return 0
     if verb is None:
-        print("usage: argus campaign {new|identity|diff|report|list}", file=sys.stderr)
+        print("usage: argus campaign {new|identity|diff|report|list|show|validate}", file=sys.stderr)
         return 2
 
     try:
@@ -427,6 +459,40 @@ def _cmd_campaign(args):
         except KeyError as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
+        return 0
+
+    if verb == "show":
+        # CLI parity with the coordinator's read-only GET projections — same functions,
+        # same payloads. Every view is a derivation over the traffic store: it touches no
+        # target and stores nothing. Imported lazily so the recon-only verbs don't pay for them.
+        from . import (coverage as cov, dedupe as dd, matrix as mx, priority as pri,
+                       program_response as pr, proposal as prop, resource as rsrc, traffic as tr)
+        views = {
+            "matrix": lambda: mx.build(c),
+            "resources": lambda: rsrc.resources(c),
+            "coverage": lambda: cov.build(c),
+            "priority": lambda: pri.rank(c),
+            "intel": lambda: pri.intel(c),
+            "proposals": lambda: prop.proposals(c),
+            "clusters": lambda: dd.clusters(c),
+            "triage": lambda: {"responses": pr.responses(c),
+                               "priority_signal": pr.priority_signal(c)},
+            "endpoints": lambda: tr.endpoints(c),
+        }
+        _show(views[args.view](), args.json)
+        return 0
+
+    if verb == "validate":
+        # Run the earned lifecycle transitions the finding's evidence supports, stopping at
+        # the first unearned gate. Deterministic derivations only — never executes a request.
+        if fmod._get(c, args.finding) is None:
+            print(f"error: no finding {args.finding!r}", file=sys.stderr)
+            return 2
+        f, stopped = fmod.validate(c, args.finding)
+        flag = "reportable" if f.reportable else "SUPPRESSED"
+        print(f"{f.id}  reached {f.state}  ({flag})")
+        if stopped:
+            print(f"  stopped: {stopped}")
         return 0
 
     if verb == "diff":
@@ -472,7 +538,7 @@ def _cmd_campaign(args):
                   f"{'REPRODUCED' if rr.reproduced else 'flaky'} ({fmod._get(c, f.id).state})")
         return 0
 
-    print("usage: argus campaign {new|identity|diff|report|list}", file=sys.stderr)
+    print("usage: argus campaign {new|identity|diff|report|list|show|validate}", file=sys.stderr)
     return 2
 
 
@@ -591,6 +657,13 @@ def _run(argv=None):
     crp.add_argument("campaign"); crp.add_argument("finding")
     cls = cps.add_parser("list", help="List campaigns, or one campaign's findings")
     cls.add_argument("campaign", nargs="?")
+    csh = cps.add_parser("show", help="Print a read-only knowledge projection (CLI parity with the web GET routes)")
+    csh.add_argument("campaign")
+    csh.add_argument("view", choices=["matrix", "resources", "coverage", "priority",
+                                      "intel", "proposals", "clusters", "triage", "endpoints"])
+    csh.add_argument("--json", action="store_true", help="exact server payload (default: compact summary)")
+    cvd = cps.add_parser("validate", help="Run the earned lifecycle transitions a finding's evidence supports")
+    cvd.add_argument("campaign"); cvd.add_argument("finding")
 
     args = p.parse_args(argv)
 

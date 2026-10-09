@@ -91,6 +91,37 @@ def test_suspicious_flow_promotes_and_reports(home, capsys, monkeypatch):
     assert report_md.startswith("# ") and "## Evidence" in report_md
 
 
+def test_show_projections_and_validate(home, capsys, monkeypatch):
+    # CLI parity: every read-only projection the web exposes prints from the terminal,
+    # and `validate` runs the earned lifecycle. Reuse the suspicious flow to earn a finding.
+    cid = _new_campaign(home)
+    main(["campaign", "identity", cid, "user_a", "--owned", "--cred", "A_TOK"])
+    main(["campaign", "identity", cid, "user_b", "--owned", "--cred", "B_TOK"])
+    monkeypatch.setattr(differential, "_default_fetch",
+                        lambda m, u, h, b: (200, {"content-type": "application/json"}, "{}"))
+    main(["campaign", "diff", cid, "api.acme.example", "--baseline", "user_a",
+          "--mutation", "user_b", "--path", "/api/orders/1/cancel", "--method", "POST",
+          "--resource", "order_1", "--trials", "2"])
+    capsys.readouterr()
+
+    for view in ("matrix", "resources", "coverage", "priority", "intel",
+                 "proposals", "clusters", "triage", "endpoints"):
+        assert main(["campaign", "show", cid, view]) == 0, view
+        assert capsys.readouterr().out                       # a view never prints nothing
+
+    # --json is the exact server payload: parseable, non-empty
+    import json
+    assert main(["campaign", "show", cid, "coverage", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["campaign_id"] == cid
+
+    main(["campaign", "list", cid])
+    fid = next(w for w in capsys.readouterr().out.split() if w.startswith("find-"))
+    assert main(["campaign", "validate", cid, fid]) == 0
+    assert "reached" in capsys.readouterr().out
+
+    assert main(["campaign", "validate", cid, "find-nope"]) == 2  # unknown finding, clean exit
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
