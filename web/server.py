@@ -987,6 +987,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "proposals":
             return self._campaign_proposals(parts[2])
 
+        # the research planner: /api/campaign/{id}/plan — the single highest-value SAFE next
+        # action (or an honest stop reason) + the campaign completion handoff. DERIVED and
+        # read-only: it decides, it executes nothing; the orchestrator stays the sole executor.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "plan":
+            return self._campaign_plan(parts[2])
+
         # root-cause / duplicate clusters: /api/campaign/{id}/clusters — findings grouped by
         # the control point that failed (host + object family + boundary), never auto-merged.
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "clusters":
@@ -1123,6 +1129,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"campaign_id": cid, "proposals": proposal.proposals(campaign_mod.load(cid))})
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not build proposals: {e}"}, code=500)
+
+    def _campaign_plan(self, cid: str):
+        """GET /api/campaign/{id}/plan — the planner's next-best-safe-action decision + the
+        completion handoff (what's mapped/tested/confirmed, what remains, why stopped). DERIVED
+        and read-only; it never executes. cid validated against the listing (no traversal)."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import planner
+        try:
+            c = campaign_mod.load(cid)
+            self._send_json({"campaign_id": cid, "assessment": planner.assess(c),
+                             "completion": planner.completion(c)})
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not build plan: {e}"}, code=500)
 
     def _campaign_clusters(self, cid: str):
         """GET /api/campaign/{id}/clusters — findings grouped by the failed control point.

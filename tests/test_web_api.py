@@ -588,3 +588,17 @@ def test_triage_endpoint_records_outcome(api, monkeypatch):
     # an unknown outcome is a 400 at the trust boundary
     code, _ = _req(api, f"/api/campaign/{c.id}/findings/{f.id}/triage", "POST", {"outcome": "BOGUS"})
     assert code == 400
+
+
+def test_plan_endpoint_reports_decision_and_completion(api):
+    cid = _campaign(api)
+    code, body = _req(api, f"/api/campaign/{cid}/plan")
+    assert code == 200, body
+    # an empty campaign has nothing safe to do, and says so honestly (never "secure")
+    assert body["assessment"]["stopped"] is True
+    assert body["assessment"]["stop_reason"] == "no_open_gaps"
+    assert body["completion"]["status"] == "RESEARCH_EXHAUSTED"
+    assert body["completion"]["research_coverage_note"] == "research coverage, not a security score"
+    # unknown campaign is a clean 404, not a traversal or a crash
+    code, _ = _req(api, "/api/campaign/does-not-exist/plan")
+    assert code == 404
