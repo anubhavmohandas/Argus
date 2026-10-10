@@ -197,6 +197,7 @@ _TECHNIQUES: dict[str, tuple[bool, str]] = {
     "injection_probe":            (True,  "medium"),   # reflected xss/ssti canary (non-destructive)
     "port_scan":                  (True,  "medium"),
     "differential_same_account":  (True,  "medium"),   # baseline vs mutation, one identity
+    "differential_anonymous":     (True,  "medium"),   # authed baseline vs no-credential replay
     "differential_cross_account": (True,  "high"),     # reach identity A's object as identity B
     "state_change":               (True,  "high"),     # any write / mutation
     "mass_enumeration":           (True,  "high"),     # id sweeps, credential spray

@@ -56,6 +56,56 @@ def test_gap_quotes_policy_but_never_executes(camp):
     assert "vulnerable" not in str(g).lower() and "finding" not in str(g).lower()
 
 
+def _authed_export(c):
+    """An authenticated researcher-owned identity observed on an object-free endpoint."""
+    imod.register(c, imod.Identity(name="customer_c", role="customer", tenant="t1",
+                                   researcher_owned=True, credential_ref="C_TOK"))
+    traffic.capture(c, method="GET", url="https://api.acme.example/account/export",
+                    headers={"Authorization": "Bearer s"}, identity="customer_c",
+                    response={"status": 200})
+
+
+def test_anonymous_to_authenticated_gap_on_object_free_endpoint(camp, monkeypatch):
+    """Boundary v2: an authed identity observed on an endpoint, anonymous never observed =>
+    one ANONYMOUS_TO_AUTHENTICATED gap, mapped to the differential_anonymous technique, with
+    the policy verdict quoted — never executed."""
+    monkeypatch.setenv("C_TOK", "tok-c")
+    _authed_export(camp)
+    anon = [g for g in _live(camp) if g["gap_type"] == "ANONYMOUS_TO_AUTHENTICATED"]
+    assert len(anon) == 1
+    g = anon[0]
+    assert g["baseline_identity"] == "customer_c" and g["mutation_identity"] == "anonymous"
+    assert g["technique"] == "differential_anonymous"
+    assert "ANONYMOUS_TO_AUTHENTICATED" in g["boundary"]
+    assert g["policy_preview"]["verdict"].startswith("ALLOW")      # medium, in scope
+    assert g["status"] == "OPEN"
+    assert "vulnerable" not in str(g).lower()                      # a gap, not a verdict
+
+
+def test_anonymous_gap_never_targets_an_uncontrolled_object(camp, monkeypatch):
+    """SAFETY: an authed request against an object whose ownership is NOT researcher-controlled
+    yields NO anonymous gap — ARGUS never fires an unauthenticated request at a possibly-real
+    user's object. Unknown stays unknown."""
+    monkeypatch.setenv("C_TOK", "tok-c")
+    imod.register(camp, imod.Identity(name="customer_c", role="customer", tenant="t1",
+                                      researcher_owned=True, credential_ref="C_TOK"))
+    # order 999 is observed but never asserted researcher-controlled
+    traffic.capture(camp, method="GET", url="https://api.acme.example/api/orders/999",
+                    headers={"Authorization": "Bearer s"}, identity="customer_c",
+                    response={"status": 200})
+    assert not any(g["gap_type"] == "ANONYMOUS_TO_AUTHENTICATED" for g in _live(camp))
+
+
+def test_anonymous_gap_suppressed_once_anonymous_is_observed(camp, monkeypatch):
+    """If anonymous traffic was already observed on the endpoint the authentication boundary is
+    no longer unexplored — no gap."""
+    monkeypatch.setenv("C_TOK", "tok-c")
+    _authed_export(camp)
+    traffic.capture(camp, method="GET", url="https://api.acme.example/account/export",
+                    headers={}, identity="", response={"status": 401})   # anonymous seen
+    assert not any(g["gap_type"] == "ANONYMOUS_TO_AUTHENTICATED" for g in _live(camp))
+
+
 def test_boundary_labels_only_when_metadata_supports_them(camp):
     _owner_cancels_777(camp)
     g = _live(camp)[0]

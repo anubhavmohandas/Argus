@@ -416,6 +416,7 @@ export interface Coverage {
     total_gaps: number;
     open_gaps: number;
     owner_nonowner_untested: number;
+    anonymous_to_authenticated?: number;
     by_status: Record<string, number>;
   };
 }

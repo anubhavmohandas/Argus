@@ -148,6 +148,75 @@ def _derive_gaps(campaign) -> list[dict]:
     return gaps
 
 
+def _derive_anonymous_gaps(campaign) -> list[dict]:
+    """Boundary v2 — ANONYMOUS_TO_AUTHENTICATED gaps. An endpoint where a researcher-owned
+    AUTHENTICATED identity was observed, but anonymous (unauthenticated) was NEVER observed:
+    the authentication boundary is untested. One meaningful comparison per endpoint (the first
+    authed baseline), never a combinatorial sweep.
+
+    SAFETY — the anonymous replay only happens when there is no uncontrolled user/resource
+    interaction: the baseline request touches NO object, or only researcher-controlled objects.
+    An unauthenticated request is never sent at a possibly-real user's object; unknown stays a
+    non-gap. This is a GAP (missing evidence), never a verdict: unobserved ≠ vulnerable."""
+    idents = {i.name: i for i in identity_mod.identities(campaign)}
+    owned_authed = {n: i for n, i in idents.items()
+                    if i.researcher_owned and i.credential_ref and n != identity_mod.ANONYMOUS.name}
+    if not owned_authed:
+        return []
+    controlled = {(o.resource_type, o.resource_value)
+                  for o in resource.ownerships(campaign) if o.controlled_for_crossaccount()}
+    seen: dict[str, dict] = {}
+    for cap in traffic.captures(campaign):
+        ep_id = traffic._fingerprint(cap.get("method", ""), cap.get("host", ""),
+                                     traffic.normalize_path(cap.get("path", "")))
+        ikey = (cap.get("identity") or "").strip() or identity_mod.ANONYMOUS.name
+        cell = seen.setdefault(ep_id, {
+            "endpoint_id": ep_id, "method": cap.get("method", ""), "host": cap.get("host", ""),
+            "path_template": traffic.normalize_path(cap.get("path", "")),
+            "identities": set(), "authed_caps": {}})
+        cell["identities"].add(ikey)
+        if ikey in owned_authed:
+            cell["authed_caps"].setdefault(ikey, []).append(cap)
+
+    gaps: list[dict] = []
+    for ep_id, cell in seen.items():
+        if identity_mod.ANONYMOUS.name in cell["identities"]:
+            continue                            # anonymous already observed here -> not this gap
+        authed_here = sorted(cell["authed_caps"])
+        if not authed_here:
+            continue                            # no researcher-owned authed baseline to replay
+        baseline = authed_here[0]
+        caps = cell["authed_caps"][baseline]
+        cands = resource._path_candidates(caps[0])
+        if any((c["resource_type"], c["value"]) not in controlled for c in cands):
+            continue                            # uncontrolled object in path -> unknown, no gap
+        decision = campaign.policy.can_test(cell["host"], "differential_anonymous",
+                                            account=owned_authed[baseline])
+        conf = round(min(0.9, 0.6 + 0.3 * min(1.0, len(caps) / 3.0)), 2)
+        gaps.append({
+            "gap_id": _gap_id("ANONYMOUS_TO_AUTHENTICATED", ep_id, baseline,
+                              identity_mod.ANONYMOUS.name, "", ""),
+            "gap_type": "ANONYMOUS_TO_AUTHENTICATED",
+            "boundary": ["ANONYMOUS_TO_AUTHENTICATED"],
+            "endpoint_id": ep_id, "method": cell["method"], "host": cell["host"],
+            "path_template": cell["path_template"],
+            "baseline_identity": baseline, "mutation_identity": identity_mod.ANONYMOUS.name,
+            "resource_type": "", "resource_id": "",
+            "ownership_context": {},
+            "evidence": {"owner_observations": len(caps),
+                         "owner_capture_refs": [c.get("id", "") for c in caps[:5]]},
+            "confidence": conf,
+            "reason": (f"authenticated {baseline} observed performing {cell['method']} on "
+                       f"{cell['path_template']}; no anonymous request ever observed"),
+            "policy_preview": {"verdict": decision.verdict.value,
+                               "reason": decision.reason, "limits": decision.limits},
+            "estimated_requests": _EST_REQUESTS,
+            "technique": "differential_anonymous",
+        })
+    gaps.sort(key=lambda g: (g["endpoint_id"], g["baseline_identity"]))
+    return gaps
+
+
 # --- lifecycle overlay (persisted, keyed by deterministic gap_id) ---------
 def _state_path(campaign) -> Path:
     return campaign.dir / "gaps.json"
@@ -191,7 +260,7 @@ def gaps(campaign) -> list[dict]:
     states = _states(campaign)
     out = []
     seen = set()
-    for g in _derive_gaps(campaign):
+    for g in _derive_gaps(campaign) + _derive_anonymous_gaps(campaign):
         st = states.get(g["gap_id"])
         g = {**g, "status": (st or {}).get("status", "OPEN"),
              "lifecycle": st or {"status": "OPEN"}}
@@ -220,6 +289,8 @@ def build(campaign) -> dict:
             "open_gaps": sum(1 for g in gs if g["status"] == "OPEN"),
             "owner_nonowner_untested": sum(1 for g in live
                                            if g["gap_type"] == "OWNER_NONOWNER_UNTESTED"),
+            "anonymous_to_authenticated": sum(1 for g in live
+                                              if g["gap_type"] == "ANONYMOUS_TO_AUTHENTICATED"),
             "by_status": by_status,
         },
     }

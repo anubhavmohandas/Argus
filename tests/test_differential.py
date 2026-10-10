@@ -42,6 +42,36 @@ def test_demo():
     differential.demo()
 
 
+# --- anonymous → authenticated (Boundary v2) ------------------------------
+def _anon_pair():
+    """An authenticated baseline vs the SAME request with no credentials. Both variants carry
+    the authed identity as `owner` so it stays a single-axis (identity) differential and the
+    gate weighs a researcher-owned account."""
+    authed, anon = USER_A, identity.ANONYMOUS
+    base = Variant(authed, method="GET", path="/account/export", owner=authed)
+    mut = Variant(anon, method="GET", path="/account/export", owner=authed)
+    return base, mut
+
+
+def test_anonymous_still_granted_is_suspicious(camp):
+    """authN not enforced: the authed baseline works AND the no-credential replay is also
+    granted => suspicious (a candidate, never 'vulnerable')."""
+    base, mut = _anon_pair()
+    r = run(camp, "differential_anonymous", "api.acme.example", base, mut,
+            fetch=lambda *a: (200, {}, "secret-export"))
+    assert r.classification == "suspicious"
+
+
+def test_anonymous_denied_is_secure(camp):
+    """authN enforced: the no-credential replay is denied (401) => secure, the expected
+    outcome — an unobserved anonymous path is not a bug by itself."""
+    base, mut = _anon_pair()
+    def fetch(method, url, headers, body):
+        return (200, {}, "ok") if headers else (401, {}, "")   # authed ok, anonymous denied
+    r = run(camp, "differential_anonymous", "api.acme.example", base, mut, fetch=fetch)
+    assert r.classification == "secure"
+
+
 # --- SAFETY INVARIANTS ----------------------------------------------------
 
 def test_real_victims_object_is_never_executed(camp):

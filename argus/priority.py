@@ -48,9 +48,12 @@ def _sensitivity(path: str) -> int:
 
 
 def _boundary_points(labels: list[str]) -> int:
-    # cross-tenant > cross-role > same-role-different-identity (classic IDOR) > the rest.
+    # cross-tenant > anonymous-to-authenticated (missing authN) > cross-role >
+    # same-role-different-identity (classic IDOR) > the rest.
     if "DIFFERENT_TENANT" in labels:
         return _W["boundary"]
+    if "ANONYMOUS_TO_AUTHENTICATED" in labels:
+        return 14
     if "DIFFERENT_ROLE" in labels:
         return 11
     if "SAME_ROLE_DIFFERENT_IDENTITY" in labels:

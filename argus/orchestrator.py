@@ -507,6 +507,7 @@ def _differential_worker(task: Task, campaign):
 _DEFAULT_WORKERS: dict[str, callable] = {
     "http_probe": _http_probe_worker,
     "differential_same_account": _differential_worker,
+    "differential_anonymous": _differential_worker,
     "differential_cross_account": _differential_worker,
 }
 

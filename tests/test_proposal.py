@@ -58,6 +58,30 @@ def test_to_task_is_a_differential_cross_account_task(camp):
     assert t.spec["baseline"]["identity"] == "customer_a"
     assert t.spec["mutation"]["identity"] == "customer_b"
     assert t.spec["mutation"]["path"] == "/api/orders/777/cancel"
+
+
+def test_anonymous_gap_proposal_and_task_drop_credentials(camp, monkeypatch):
+    """Boundary v2: an ANONYMOUS_TO_AUTHENTICATED gap builds a plan whose mutation identity is
+    anonymous and whose task maps to differential_anonymous — the authed identity is the bridge
+    owner (so can_test weighs a researcher-owned account), and no object is targeted."""
+    monkeypatch.setenv("C_TOK", "tok-c")
+    imod.register(camp, imod.Identity(name="customer_c", role="customer", tenant="t1",
+                                      researcher_owned=True, credential_ref="C_TOK"))
+    traffic.capture(camp, method="GET", url="https://api.acme.example/account/export",
+                    headers={"Authorization": "Bearer s"}, identity="customer_c",
+                    response={"status": 200})
+    gap = next(g for g in coverage.build(camp)["gaps"]
+               if g.get("gap_type") == "ANONYMOUS_TO_AUTHENTICATED")
+    p = proposal.build(camp, gap)
+    assert p["mutation_identity"] == "anonymous" and p["baseline_identity"] == "customer_c"
+    assert p["target_resource"] == "" and p["required_ownership_assertions"] == []
+    assert "authentication" in p["expected_secure_behavior"]
+
+    t = proposal.to_task(camp, p)
+    assert t.technique == "differential_anonymous"
+    assert t.spec["baseline"]["identity"] == "customer_c"
+    assert t.spec["mutation"]["identity"] == "anonymous"
+    assert t.spec["mutation"]["path"] == "/account/export"
     assert getattr(t.account, "researcher_owned", False) is True   # owner drives the gate
 
 

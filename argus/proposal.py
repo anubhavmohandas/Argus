@@ -60,6 +60,32 @@ def build(campaign, gap: dict) -> dict:
     rtype = gap.get("resource_type", "")
     preview = gap.get("policy_preview") or {}
     safe = preview.get("verdict", "").startswith("ALLOW")
+
+    if gap.get("gap_type") == "ANONYMOUS_TO_AUTHENTICATED":
+        # No shared object: the authenticated baseline is replayed with NO credentials. The
+        # bridge owner is the authed baseline identity (both variants), so to_task + boundary
+        # derivation work unchanged; required ownership assertions are empty (no object).
+        endpoint = f"{method} {gap.get('path_template', path)}".strip()
+        return {
+            "proposal_id": f"prop-{gap['gap_id']}",
+            "gap_id": gap["gap_id"], "gap_type": gap.get("gap_type", ""),
+            "host": gap.get("host", ""), "endpoint": endpoint, "method": method, "path": path,
+            "hypothesis": f"does {endpoint} succeed with NO credentials (anonymous)?",
+            "baseline_identity": owner, "mutation_identity": mutation,
+            "baseline_resource": "", "target_resource": "",
+            "security_boundary": gap.get("boundary", []),
+            "expected_secure_behavior": (f"the unauthenticated request is rejected (401/403) — "
+                                         f"{endpoint} requires authentication"),
+            "reason": gap.get("reason", ""), "policy_decision_preview": preview,
+            "request_count": gap.get("estimated_requests", 2),
+            "risk": ("controlled — anonymous replay of a researcher-observed request; no object "
+                     "interaction" if safe else "requires explicit human approval before any request"),
+            "required_ownership_assertions": [],
+            "technique": gap.get("technique", "differential_anonymous"),
+            "confidence": gap.get("confidence"),
+            "priority_score": gap.get("priority_score"), "priority_rank": gap.get("priority_rank"),
+        }
+
     return {
         "proposal_id": f"prop-{gap['gap_id']}",
         "gap_id": gap["gap_id"],

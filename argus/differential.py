@@ -167,6 +167,15 @@ def _classify(technique: str, mutation: Variant, base: dict, mut: dict, cmp: dic
     'vulnerable' (that needs a reproduction the spec puts in a later slice)."""
     if base["access"] == "error" or mut["access"] == "error":
         return "inconclusive"                       # a request never landed — can't compare
+    if technique == "differential_anonymous":
+        # baseline is an authenticated identity; the mutation drops ALL credentials. The ONLY
+        # suspicious signal is the anonymous request STILL being granted — authentication was
+        # not actually enforced. Anonymous DENIED is the correct, secure outcome. If the authed
+        # baseline itself didn't succeed there is nothing to compare against.
+        anonymous = not mutation.identity.auth_headers()
+        if base["access"] != "granted":
+            return "inconclusive"
+        return "suspicious" if (anonymous and mut["access"] == "granted") else "secure"
     if technique == "differential_cross_account":
         # The ONLY suspicious cross-account signal is B reaching A's object. B being
         # DENIED is the correct, secure outcome — the access legitimately differs
