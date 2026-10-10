@@ -19,11 +19,15 @@ cross-account execution predicate — only an explicit CONFIRMED assertion can. 
 with no assertion has an UNKNOWN owner, and unknown is a normal, first-class state, never
 a warning.
 
-occam: candidates are mined from PATH PARAMETERS only — the one traffic location where the
-REST convention gives real provenance (a variable segment IS an object reference, and the
-preceding collection segment names its type). Query/body/Location mining is the marked
-upgrade path, gated on a real case where a path param is not enough, not a guess that one
-exists. Ownership assertions persist in one ownership.json, exactly as identities.json.
+occam: candidates are mined from the request locations whose evidence is actually persisted
+in the capture — PATH parameters, QUERY parameters, and the redacted request BODY. All
+three are NAME-GATED: a value becomes a candidate only when it sits under a field whose name
+is an object reference (a path collection segment, or an `*_id`/`id`/`orderId` field), never
+because it merely looks like a uuid/int. RESPONSE-field and Location-header mining remain the
+marked upgrade path — they are gated not on taste but on evidence: the capture model does not
+yet persist sanitized response bodies/headers, so there is nothing to mine. Lift that gate by
+extending the capture record (and its redaction boundary), not by guessing. Ownership
+assertions persist in one ownership.json, exactly as identities.json.
 """
 from __future__ import annotations
 
@@ -33,6 +37,7 @@ import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 from . import traffic
 
@@ -45,7 +50,14 @@ _PREFIXED_ID = re.compile(r"[a-z][a-z0-9]*_[0-9a-zA-Z]*[0-9][0-9a-zA-Z]*")
 
 OWNERSHIP_STATES = ("CONFIRMED", "INFERRED")
 # where a candidate came from — a closed vocab so provenance is never a free-text guess.
-CANDIDATE_SOURCES = ("path parameter",)
+CANDIDATE_SOURCES = ("path parameter", "query parameter", "request body")
+
+# A field NAME that denotes an object reference: bare `id`/`uuid`/`guid`, snake `order_id`,
+# or camel `orderId`. The `_` / case boundary is REQUIRED (so `valid`, `android`, `rapid` are
+# not swept in). This is the query/body analogue of the path-collection convention: the name,
+# not the value, is what makes a candidate — a lone uuid under `page` is never a resource.
+_SNAKE_ID = re.compile(r"(?:([a-z0-9]+)_)?(?:id|uuid|guid)")
+_CAMEL_ID = re.compile(r"([a-z][a-z0-9]*)(?:Id|Uuid|Guid|UUID|GUID)")
 
 
 def _now() -> str:
@@ -177,6 +189,88 @@ def _path_candidates(cap: dict) -> list[dict]:
     return out
 
 
+def _id_field_prefix(key: str) -> str | None:
+    """Classify a param/field NAME. Returns the type-naming prefix for an object-reference
+    field (`order_id`->'order', `orderId`->'order'), "" for a bare `id`/`uuid`/`guid` (an
+    object ref whose type the name does not give), or None if the name is not a reference."""
+    m = _SNAKE_ID.fullmatch(key.lower())
+    if m:
+        return m.group(1) or ""
+    m = _CAMEL_ID.fullmatch(key)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _ref_candidate(key: str, value, source: str) -> dict | None:
+    """A (name, value) pair becomes a candidate only when the NAME is an object reference and
+    the VALUE is id-shaped (and not a redacted secret). Type comes from the name prefix; a
+    bare `id` stays type 'unknown' — an opaque reference never hallucinates a type."""
+    prefix = _id_field_prefix(key)
+    if prefix is None:
+        return None
+    val = str(value).strip()
+    if not val or val == traffic._REDACTED or not _is_resource_id(val):
+        return None
+    if prefix:
+        return {"value": val, "resource_type": _singular(prefix), "field": key,
+                "raw_segment": key, "source": source, "confidence": "medium"}
+    return {"value": val, "resource_type": "unknown", "field": key,
+            "raw_segment": key, "source": source, "confidence": "low"}
+
+
+def _query_candidates(cap: dict) -> list[dict]:
+    """Object references in the (redacted) query string: ?order_id=ord_1 -> order ord_1.
+    Redacted sensitive values are already stripped and are skipped by _ref_candidate."""
+    q = urlsplit(cap.get("url", "") or "").query
+    out = []
+    for k, v in parse_qsl(q, keep_blank_values=True):
+        c = _ref_candidate(k, v, "query parameter")
+        if c:
+            out.append(c)
+    return out
+
+
+def _walk_scalars(obj, _depth: int = 0):
+    """Yield (key, scalar) for every scalar under a named key in a JSON value. Recurses dicts
+    and dicts-in-lists; bodies are already capped at capture, so no explicit size guard."""
+    if _depth > 6:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                yield from _walk_scalars(v, _depth + 1)
+            else:
+                yield str(k), v
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_scalars(v, _depth + 1)
+
+
+def _body_candidates(cap: dict) -> list[dict]:
+    """Object references in the (redacted) request body — JSON object/array fields, or form
+    keys. Interpretation only; the body excerpt itself remains the evidence of record."""
+    body = (cap.get("body_excerpt", "") or "").strip()
+    if not body:
+        return []
+    out = []
+    if body[:1] in ("{", "["):
+        try:
+            obj = json.loads(body)
+        except ValueError:
+            return []                       # truncated/opaque body -> no candidates, no guess
+        for k, v in _walk_scalars(obj):
+            c = _ref_candidate(k, v, "request body")
+            if c:
+                out.append(c)
+    else:
+        for k, v in parse_qsl(body, keep_blank_values=True):
+            c = _ref_candidate(k, v, "request body")
+            if c:
+                out.append(c)
+    return out
+
+
 def candidates(campaign) -> list[dict]:
     """All resource candidates mined from captured traffic, aggregated by (type, value).
     A projection: read-only, rebuilt on demand, provenance + confidence retained. Secrets
@@ -186,7 +280,7 @@ def candidates(campaign) -> list[dict]:
         ep_id = traffic._fingerprint(
             cap.get("method", ""), cap.get("host", ""),
             traffic.normalize_path(cap.get("path", "")))
-        for cand in _path_candidates(cap):
+        for cand in _path_candidates(cap) + _query_candidates(cap) + _body_candidates(cap):
             key = (cand["resource_type"], cand["value"])
             row = agg.get(key)
             if row is None:
@@ -284,6 +378,27 @@ def demo() -> None:
         assert order["sources"] == ["path parameter"] and order["confidence"] == "medium"
         # an opaque id with no collection segment infers NO type — unknown stays unknown
         assert ("unknown", "507f1f77bcf86cd799439011") in cands
+
+        # query + body mining (Resource Discovery V2), all NAME-gated:
+        traffic.capture(c, method="GET",
+                        url="https://api.acme.example/api/search?order_id=ord_55&page=2&token=sek",
+                        identity="customer_a", response={"status": 200})
+        traffic.capture(c, method="POST", url="https://api.acme.example/api/transfer",
+                        headers={"Content-Type": "application/json"},
+                        body='{"invoice_id":"inv_9","amount":100,"note":"valid","order":{"id":"ord_77"}}',
+                        identity="customer_a", response={"status": 200})
+        cands = {(x["resource_type"], x["value"]): x for x in candidates(c)}
+        # query: order_id value is mined as an order; page=2 is NOT (name is not a reference);
+        # the redacted token value is skipped.
+        q = cands[("order", "ord_55")]
+        assert "query parameter" in q["sources"] and q["confidence"] == "medium"
+        assert ("unknown", "2") not in cands and ("order", "2") not in cands
+        assert all(v != "<redacted>" for (_t, v) in cands)
+        # body: invoice_id -> invoice; amount/note never swept in; a bare nested `id` keeps
+        # its value but stays type unknown (the name gives no type).
+        assert "request body" in cands[("invoice", "inv_9")]["sources"]
+        assert not any(v == "100" or v == "valid" for (_t, v) in cands)
+        assert ("unknown", "ord_77") in cands
 
         # no assertion => unknown owner, never researcher-controlled
         rows = {(r["resource_type"], r["value"]): r for r in resources(c)}
