@@ -3,11 +3,9 @@ import type {
   CampaignFinding,
   CampaignSummary,
   FindingReport,
-  RootCauseCluster,
 } from "../types";
 import {
   getCampaign,
-  getClusters,
   getReport,
   getTriage,
   listCampaigns,
@@ -18,10 +16,12 @@ import {
 } from "../api";
 import type { ProgramResponse } from "../types";
 
-// The findings workspace: a dense three-column researcher surface.
+// The findings workspace: finding TRUTH, not report preparation (that lives in Reports).
 //   FINDINGS LIST  │  FINDING DETAILS (lifecycle + boundary + impact + root cause)  │  EVIDENCE / REPRODUCTION + REPORT READINESS
 // Status language is precise and EARNED — never "VULNERABLE/CRITICAL" because one experiment
 // looked suspicious. Every mutation goes through an earned server API; this only reads + commands.
+// `filter` splits the nav: Candidates = investigation in progress, Validated = REPORT_READY.
+export type FindingsFilter = "candidates" | "validated";
 
 const STATUS_LABEL: Record<string, string> = {
   OBSERVED: "Needs reproduction",
@@ -56,16 +56,14 @@ function statusLabel(f: CampaignFinding): string {
   return STATUS_LABEL[f.state] ?? f.state;
 }
 
-export default function FindingsWorkspace() {
+export default function FindingsWorkspace({ filter }: { filter: FindingsFilter }) {
   const [campaigns, setCampaigns] = useState<CampaignSummary[]>([]);
   const [cid, setCid] = useState<string | null>(null);
   const [findings, setFindings] = useState<CampaignFinding[]>([]);
-  const [clusters, setClusters] = useState<RootCauseCluster[]>([]);
   const [selId, setSelId] = useState<string | null>(null);
   const [report, setReport] = useState<FindingReport | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showCluster, setShowCluster] = useState(false);
   const refetchTimer = useRef<number | null>(null);
 
   useEffect(() => {
@@ -76,12 +74,11 @@ export default function FindingsWorkspace() {
     getCampaign(id)
       .then((d) => setFindings((d.findings as unknown as CampaignFinding[]) ?? []))
       .catch((e) => setError(String(e)));
-    getClusters(id).then((r) => setClusters(r.clusters)).catch(() => { /* best-effort */ });
   }, []);
 
   useEffect(() => {
     if (!cid) {
-      setFindings([]); setClusters([]); setSelId(null);
+      setFindings([]); setSelId(null);
       return;
     }
     loadFindings(cid);
@@ -104,7 +101,10 @@ export default function FindingsWorkspace() {
     getReport(cid, selId).then(setReport).catch(() => setReport(null));
   }, [cid, selId, findings]);
 
-  const selected = findings.find((f) => f.id === selId) ?? null;
+  const visible = filter === "validated"
+    ? findings.filter((f) => f.state === "REPORT_READY")
+    : findings.filter((f) => f.state !== "REPORT_READY");
+  const selected = visible.find((f) => f.id === selId) ?? null;
 
   const onReproduce = useCallback(async () => {
     if (!cid || !selId) return;
@@ -135,7 +135,9 @@ export default function FindingsWorkspace() {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center gap-3">
-        <span className="text-xs font-mono uppercase tracking-wide text-mute">Findings</span>
+        <span className="text-xs font-mono uppercase tracking-wide text-mute">
+          {filter === "validated" ? "Validated" : "Candidates"}
+        </span>
         <select
           value={cid ?? ""}
           onChange={(e) => { setCid(e.target.value || null); setSelId(null); }}
@@ -144,14 +146,7 @@ export default function FindingsWorkspace() {
           <option value="">select a campaign…</option>
           {campaigns.map((c) => <option key={c.id} value={c.id}>{c.id}</option>)}
         </select>
-        {cid && (
-          <button
-            onClick={() => setShowCluster((v) => !v)}
-            className="text-xs font-mono text-accent hover:underline ml-auto"
-          >
-            {showCluster ? "findings" : `duplicate clusters (${clusters.length})`}
-          </button>
-        )}
+        {cid && <span className="text-[11px] font-mono text-mute ml-auto">{visible.length} shown</span>}
       </div>
 
       {error && (
@@ -162,13 +157,13 @@ export default function FindingsWorkspace() {
 
       {!cid ? (
         <div className="text-xs font-mono text-mute px-1">
-          select a campaign to review its findings — each advances only as the evidence earns it.
+          {filter === "validated"
+            ? "select a campaign to see its report-ready findings — submission prep lives in Reports."
+            : "select a campaign to review candidates — each advances only as the evidence earns it."}
         </div>
-      ) : showCluster ? (
-        <ClusterView clusters={clusters} findings={findings} />
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-[minmax(220px,300px)_1fr_minmax(260px,380px)] gap-3 min-h-[60vh]">
-          <FindingsList findings={findings} selId={selId} onSelect={setSelId} />
+          <FindingsList findings={visible} selId={selId} onSelect={setSelId} />
           <FindingDetails
             f={selected}
             busy={busy}
@@ -382,7 +377,6 @@ function TriageControl({ cid, finding }: { cid: string; finding: CampaignFinding
 }
 
 function EvidencePanel({ f, report, cid }: { f: CampaignFinding | null; report: FindingReport | null; cid: string }) {
-  const [showMd, setShowMd] = useState(false);
   if (!f) {
     return (
       <div className="bg-panel border border-edge rounded-lg px-3 py-4 text-xs font-mono text-mute">
@@ -439,58 +433,11 @@ function EvidencePanel({ f, report, cid }: { f: CampaignFinding | null; report: 
       {f.state === "REPORT_READY" && <TriageControl cid={cid} finding={f} />}
 
       {r && (
-        <div>
-          <button
-            onClick={() => setShowMd((v) => !v)}
-            className="text-[11px] font-mono text-accent hover:underline"
-          >
-            {showMd ? "hide report" : "view report"}
-          </button>
-          {showMd && (
-            <pre className="mt-2 bg-panel2 border border-edge rounded p-2 text-[11px] text-ink whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto">
-              {report?.markdown}
-            </pre>
-          )}
+        <div className="text-[10px] font-mono text-mute/60">
+          full structured report + markdown export live in the Reports workspace.
         </div>
       )}
     </div>
   );
 }
 
-function ClusterView({
-  clusters, findings,
-}: { clusters: RootCauseCluster[]; findings: CampaignFinding[] }) {
-  const title = (id: string) => findings.find((f) => f.id === id)?.title ?? id;
-  if (clusters.length === 0) {
-    return (
-      <div className="bg-panel border border-edge rounded-lg px-3 py-4 text-xs font-mono text-mute">
-        no clusters yet.
-      </div>
-    );
-  }
-  return (
-    <div className="flex flex-col gap-2">
-      {clusters.map((c) => (
-        <div key={c.cluster_id} className="bg-panel border border-edge rounded-lg p-3 text-xs font-mono">
-          <div className="flex items-center justify-between">
-            <span className="text-accent">{c.host} · {c.endpoint_family || "—"}</span>
-            <span className="text-mute">{c.boundary_type}</span>
-          </div>
-          <div className="text-mute mt-1">
-            {c.affected_actions} affected action(s) · {c.finding_ids.length} finding(s)
-          </div>
-          {c.actions.length > 0 && (
-            <div className="text-mute/70 mt-1">{c.actions.join("  ·  ")}</div>
-          )}
-          <ul className="list-disc ml-4 mt-1 text-mute">
-            {c.finding_ids.map((id) => (
-              <li key={id} className={id === c.representative_finding ? "text-ink" : ""}>
-                {title(id)}{id === c.representative_finding ? "  (representative)" : ""}
-              </li>
-            ))}
-          </ul>
-        </div>
-      ))}
-    </div>
-  );
-}

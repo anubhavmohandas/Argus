@@ -471,6 +471,12 @@ export function getClusters(cid: string): Promise<{ campaign_id: string; cluster
   return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/clusters`);
 }
 
+/** The report queue — one backend-decided readiness/critic/cluster row per finding. The
+ * frontend renders queue_status verbatim; it never derives readiness itself. */
+export function getReports(cid: string): Promise<{ campaign_id: string; reports: import("./types").ReportQueueRow[] }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/reports`);
+}
+
 /** Record a program outcome for a finding — research memory only (no submission/scraping).
  * SUBMITTED requires a REPORT_READY finding. */
 export function recordTriage(

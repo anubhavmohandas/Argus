@@ -80,6 +80,7 @@ function WorkflowStrip({ wf }: { wf: NonNullable<Intel["workflow"]> }) {
     { label: "impact confirmed", value: wf.impact_confirmed_findings },
     { label: "duplicate clusters", value: wf.likely_duplicate_clusters },
     { label: "reports ready", value: wf.reports_ready },
+    { label: "reports blocked", value: wf.reports_blocked },
   ];
   return (
     <div className="bg-panel border border-edge rounded-lg p-3">

@@ -554,7 +554,32 @@ export interface Intel {
     impact_confirmed_findings: number;
     likely_duplicate_clusters: number;
     reports_ready: number;
+    reports_blocked: number;
   };
+}
+
+// One row of the report queue (web/server.py /reports → argus/report.py queue()). The backend
+// decides queue_status + reportability + critic; the Reports workspace renders these verbatim
+// and NEVER derives readiness itself.
+export type QueueStatus = "READY" | "NOT_READY" | "BLOCKED" | "DUPLICATE" | "DO_NOT_REPORT";
+export interface ReportQueueRow {
+  finding_id: string;
+  title: string;
+  host: string;
+  technique: string;
+  endpoint: string;
+  boundary_type: string;
+  boundary_confirmed: boolean;
+  impact: string[];
+  state: string;
+  reportability: "REPORTABLE" | "NOT_READY" | "DO_NOT_REPORT";
+  reportability_reasons: string[];
+  critic_verdict: "PASS" | "WARN" | "BLOCK";
+  submittable: boolean;
+  cluster_id: string;
+  duplicate: boolean;
+  last_verified: string;
+  queue_status: QueueStatus;
 }
 
 // One structured SSE event (web/server.py _structured_events). `event` is the typed

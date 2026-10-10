@@ -92,7 +92,7 @@ def test_workflow_counts_daily_attention(camp):
     assert set(wf) == {
         "open_research_gaps", "experiments_awaiting_approval", "suspicious_observations",
         "candidates_needing_reproduction", "reproduced_findings", "impact_confirmed_findings",
-        "likely_duplicate_clusters", "reports_ready"}
+        "likely_duplicate_clusters", "reports_ready", "reports_blocked"}
     assert wf["open_research_gaps"] >= 1
     assert all(isinstance(v, int) and v >= 0 for v in wf.values())
 

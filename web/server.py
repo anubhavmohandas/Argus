@@ -992,6 +992,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "clusters":
             return self._campaign_clusters(parts[2])
 
+        # report queue: /api/campaign/{id}/reports — one deterministic readiness/critic/cluster
+        # row per finding. The Reports workspace renders queue_status verbatim; it never derives
+        # readiness itself. Per-report detail stays the /findings/{fid}/report endpoint.
+        if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "reports":
+            return self._campaign_reports(parts[2])
+
         # program-response memory: /api/campaign/{id}/triage — recorded program outcomes.
         if len(parts) == 4 and parts[:2] == ["api", "campaign"] and parts[3] == "triage":
             return self._campaign_triage(parts[2])
@@ -1130,6 +1136,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"campaign_id": cid, "clusters": dedupe.clusters(campaign_mod.load(cid))})
         except Exception as e:                      # noqa: BLE001 — read path, report not crash
             self._send_json({"error": f"could not build clusters: {e}"}, code=500)
+
+    def _campaign_reports(self, cid: str):
+        """GET /api/campaign/{id}/reports — the report queue: one backend-decided readiness/
+        critic/cluster row per finding. Read-only; computes no new evidence. cid validated."""
+        campaign_mod, _ = _domain()
+        if cid not in set(campaign_mod.listing()):
+            self._send_json({"error": f"no campaign {cid!r}"}, code=404)
+            return
+        from argus import report as report_mod
+        c = campaign_mod.load(cid)
+        try:
+            self._send_json({"campaign_id": cid, "reports": report_mod.queue(c)})
+        except Exception as e:                      # noqa: BLE001 — read path, report not crash
+            self._send_json({"error": f"could not build report queue: {e}"}, code=500)
 
     def _campaign_triage(self, cid: str):
         """GET /api/campaign/{id}/triage — recorded program outcomes (research memory) plus

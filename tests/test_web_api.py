@@ -510,6 +510,46 @@ def test_validate_report_clusters_endpoints(api, monkeypatch):
     code, cl = _req(api, f"/api/campaign/{c.id}/clusters")
     assert code == 200 and any(f.id in x["finding_ids"] for x in cl["clusters"])
 
+    # report queue: one backend-decided row for the finding. Status is the server's verdict —
+    # the frontend renders it, never derives it. A reproduced, report-ready finding is READY.
+    code, q = _req(api, f"/api/campaign/{c.id}/reports")
+    assert code == 200, q
+    row = next(r for r in q["reports"] if r["finding_id"] == f.id)
+    assert row["queue_status"] == "READY" and row["submittable"] is True
+    assert row["reportability"] == "REPORTABLE" and row["critic_verdict"] in ("PASS", "WARN")
+    assert row["endpoint"] == "GET /api/orders/1"
+    # evidence refs point at the actual stored experiment, and no secret rides along in the row
+    assert "tok-a" not in str(row) and "tok-b" not in str(row)
+
+
+def test_reports_queue_shows_not_ready_with_missing_gates(api, monkeypatch):
+    """A finding that has NOT earned its gates appears NOT_READY in the queue, and the exact
+    missing prerequisites are carried on the row — the hunter's 'what do I still need?' answer,
+    decided by the backend engine, never the frontend."""
+    monkeypatch.setenv("A_TOK", "tok-a")
+    monkeypatch.setenv("B_TOK", "tok-b")
+    from argus import campaign as cmod, finding as fmod, resource
+    from argus.differential import Variant, run
+    from argus.identity import Identity, register
+
+    c = cmod.create("Assets:\napi.acme.example\nRate: 9 requests/sec\n", name="acme2")
+    a = Identity(name="user_a", role="customer", tenant="t1", researcher_owned=True, credential_ref="A_TOK")
+    b = Identity(name="user_b", role="customer", tenant="t1", researcher_owned=True, credential_ref="B_TOK")
+    register(c, a); register(c, b)
+    resource.assert_ownership(c, resource.Ownership(
+        resource_type="order", resource_value="order-1", owner_identity="user_a", researcher_controlled=True))
+    base = Variant(a, method="GET", path="/api/orders/1", resource="order-1", owner=a)
+    mut = Variant(b, method="GET", path="/api/orders/1", resource="order-1", owner=a)
+    leak = lambda *x: (200, {"content-type": "application/json"}, '{"total":9}')
+    r = run(c, "differential_cross_account", "api.acme.example", base, mut, fetch=leak)
+    f = fmod.promote(c, next(e for e in c.experiments() if e["id"] == r.experiment_id))  # OBSERVED only
+
+    code, q = _req(api, f"/api/campaign/{c.id}/reports")
+    assert code == 200, q
+    row = next(x for x in q["reports"] if x["finding_id"] == f.id)
+    assert row["queue_status"] == "NOT_READY" and row["submittable"] is False
+    assert any("reproduced" in reason for reason in row["reportability_reasons"])
+
 
 def test_triage_endpoint_records_outcome(api, monkeypatch):
     """Program-response memory over HTTP: a REPORT_READY finding can be recorded SUBMITTED →

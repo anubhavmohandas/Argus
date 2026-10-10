@@ -30,6 +30,8 @@ import ModuleRunner from "./components/ModuleRunner";
 import ProgramScope from "./components/ProgramScope";
 import CampaignWorkstation from "./components/CampaignWorkstation";
 import FindingsWorkspace from "./components/FindingsWorkspace";
+import ReportsWorkspace from "./components/ReportsWorkspace";
+import ClusterWorkspace from "./components/ClusterWorkspace";
 import CampaignProgress from "./components/CampaignProgress";
 import EndpointsSurface from "./components/EndpointsSurface";
 import ResourcesSurface from "./components/ResourcesSurface";
@@ -42,7 +44,8 @@ import { downloadReport } from "./lib";
 // progress) is a second surface. Same graphite/aqua DNA, nothing redesigned.
 
 type View =
-  | "command" | "campaigns" | "endpoints" | "resources" | "authmap" | "experiments" | "findings" | "capabilities";
+  | "command" | "campaigns" | "endpoints" | "resources" | "authmap" | "experiments"
+  | "candidates" | "validated" | "clusters" | "reports" | "capabilities";
 
 const NAV: { group: string; items: { id: View; label: string }[] }[] = [
   { group: "Command", items: [{ id: "command", label: "Quick Pivot" }] },
@@ -54,7 +57,12 @@ const NAV: { group: string; items: { id: View; label: string }[] }[] = [
   ] },
   { group: "Research", items: [
     { id: "experiments", label: "Experiments" },
-    { id: "findings", label: "Findings" },
+  ] },
+  { group: "Findings", items: [
+    { id: "candidates", label: "Candidates" },
+    { id: "validated", label: "Validated" },
+    { id: "clusters", label: "Duplicate Clusters" },
+    { id: "reports", label: "Reports" },
   ] },
   { group: "System", items: [{ id: "capabilities", label: "Capabilities" }] },
 ];
@@ -103,7 +111,10 @@ export default function App() {
             {view === "resources" && <ResourcesSurface />}
             {view === "authmap" && <AuthorizationMap />}
             {view === "experiments" && <ExperimentsSurface />}
-            {view === "findings" && <FindingsWorkspace />}
+            {view === "candidates" && <FindingsWorkspace filter="candidates" />}
+            {view === "validated" && <FindingsWorkspace filter="validated" />}
+            {view === "clusters" && <ClusterWorkspace />}
+            {view === "reports" && <ReportsWorkspace />}
             {view === "capabilities" && <Capabilities />}
           </div>
         </main>

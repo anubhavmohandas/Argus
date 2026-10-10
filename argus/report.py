@@ -354,6 +354,69 @@ def render(report: Report) -> str:
     return "\n".join(L)
 
 
+# --- report queue (Reports workspace) -------------------------------------
+def _queue_status(rep: "Report", cl: dict | None) -> str:
+    """ONE backend-decided status for a finding in the report queue. The frontend renders this
+    verbatim — it never derives readiness itself.
+
+    Order is deliberate. NOT_READY (unearned gates) dominates: a finding whose evidence is
+    incomplete is 'still working', not 'blocked' — even though the critic also BLOCKs it for
+    the same missing evidence. BLOCKED is reserved for a finding that HAS earned reportability
+    but the critic still disqualifies (e.g. a severity claim exceeding the demonstrated impact)
+    — the genuine 'a triager would reject this' state."""
+    if rep.reportability == DO_NOT_REPORT:
+        return "DO_NOT_REPORT"
+    if rep.reportability == NOT_READY:
+        return "NOT_READY"
+    if rep.critic_verdict == BLOCK:                 # reportable, but critic-disqualified
+        return "BLOCKED"
+    if cl and cl["size"] > 1 and not cl["representative"]:
+        return "DUPLICATE"
+    if rep.submittable:
+        return "READY"
+    return "NOT_READY"
+
+
+def queue(campaign) -> list[dict]:
+    """A compact report-queue row per finding: the deterministic readiness/critic/cluster
+    verdict the Reports workspace lists. Reuses generate() (so reportability + critic are the
+    same engine the detail view shows) and the dedupe clusters; computes no new evidence and
+    touches no network. A finding whose report cannot assemble is skipped, not faked."""
+    from . import dedupe
+    cl_of: dict[str, dict] = {}
+    for c in dedupe.clusters(campaign):
+        for fid in c["finding_ids"]:
+            cl_of[fid] = {"cluster_id": c["cluster_id"],
+                          "representative": fid == c["representative_finding"],
+                          "size": len(c["finding_ids"])}
+    rows = []
+    for fd in finding_mod.findings(campaign):
+        fid = fd["id"]
+        try:
+            rep = generate(campaign, fid)
+        except Exception:                           # noqa: BLE001 — a bad finding is skipped
+            continue
+        cl = cl_of.get(fid)
+        base = next((e for e in rep.evidence if e["label"] == "baseline"),
+                    rep.evidence[0] if rep.evidence else None)
+        endpoint = f"{base['method']} {urlsplit(base['url']).path}".strip() if base else ""
+        rows.append({
+            "finding_id": fid, "title": rep.title, "host": rep.host,
+            "technique": rep.technique, "endpoint": endpoint,
+            "boundary_type": rep.security_boundary.get("boundary_type", "unknown"),
+            "boundary_confirmed": bool(rep.security_boundary.get("confirmed")),
+            "impact": list(rep.demonstrated_impact),
+            "state": rep.state, "reportability": rep.reportability,
+            "reportability_reasons": rep.reportability_reasons,
+            "critic_verdict": rep.critic_verdict, "submittable": rep.submittable,
+            "cluster_id": (cl or {}).get("cluster_id", ""),
+            "duplicate": bool(cl and cl["size"] > 1 and not cl["representative"]),
+            "last_verified": rep.reproduction_status.get("last_verified", ""),
+            "queue_status": _queue_status(rep, cl),
+        })
+    return rows
+
+
 def demo() -> None:
     """Self-check (offline): a reproduced, report-ready finding renders a submittable report
     with expected/observed, evidence-backed impact, and real reproduction steps; a leaked
@@ -403,6 +466,12 @@ def demo() -> None:
         assert "## Steps to reproduce" in md and "## Expected vs observed" in md
         assert "Authorization" not in md.replace("<redacted>", "")  # no raw auth value
         assert "AKIAIOSFODNN7EXAMPLE" not in md
+
+        # the report queue carries the SAME backend verdict, one row per finding.
+        q = queue(c)
+        assert len(q) == 1 and q[0]["finding_id"] == f.id
+        assert q[0]["queue_status"] == "READY" and q[0]["submittable"]
+        assert q[0]["endpoint"] == "GET /api/orders/1"
 
         del os.environ["A_TOK"], os.environ["B_TOK"]
     del os.environ["ARGUS_HOME"]

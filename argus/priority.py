@@ -167,10 +167,12 @@ def workflow(campaign) -> dict:
     hunter's attention is valuable right now. Purely DERIVED from existing state (findings by
     earned stage, pending approvals, suspicious experiments, duplicate clusters) — it computes
     no new analysis and runs nothing."""
-    from . import dedupe, finding as finding_mod
+    from . import dedupe, finding as finding_mod, report as report_mod
     finds = finding_mod.findings(campaign)
     def in_state(*states):
         return sum(1 for f in finds if f["state"] in states)
+    # reports a triager would reject right now: reportable finding whose critic BLOCKs.
+    blocked = sum(1 for r in report_mod.queue(campaign) if r["queue_status"] == "BLOCKED")
     suspicious_exps = sum(1 for e in campaign.experiments()
                           if e.get("classification") in ("suspicious", "vulnerable"))
     approvals = sum(1 for t in campaign.tasks() if t.get("state") == "APPROVAL_REQUIRED")
@@ -185,6 +187,7 @@ def workflow(campaign) -> dict:
         "impact_confirmed_findings": in_state("IMPACT_CONFIRMED", "DUPLICATE_CHECKED"),
         "likely_duplicate_clusters": sum(1 for c in clusters if len(c["finding_ids"]) > 1),
         "reports_ready": sum(1 for f in finds if f["state"] == "REPORT_READY" and f["reportable"]),
+        "reports_blocked": blocked,
     }
 
 

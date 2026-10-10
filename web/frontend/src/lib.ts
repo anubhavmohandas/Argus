@@ -35,6 +35,18 @@ export function sevRank(s: Severity): number {
   return SEV_ORDER[s] ?? 0;
 }
 
+/** Download an arbitrary text string as a file (used by the Reports workspace for report
+ * markdown — the server-rendered report is the truth; this just saves it). */
+export function downloadText(filename: string, text: string): void {
+  const blob = new Blob([text], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename.replace(/[^a-z0-9._-]/gi, "_");
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 import type { Dossier } from "./types";
 
 /** Build a Markdown bounty-style report from a dossier and trigger a download. */
