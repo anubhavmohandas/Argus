@@ -84,6 +84,10 @@ class CapturedRequest:
     session_id: str = ""
     response_status: int | None = None
     response_content_type: str = ""
+    response_headers: dict = field(default_factory=dict)   # redacted (Set-Cookie etc. stripped)
+    response_body_excerpt: str = ""                        # redacted + capped
+    response_body_len: int = 0
+    response_location: str = ""                            # redirect target, sensitive query stripped
     source: str = "manual"
     id: str = field(default_factory=lambda: f"cap-{uuid.uuid4().hex[:12]}")
     captured_at: str = field(default_factory=_now)
@@ -245,13 +249,30 @@ def capture(campaign, *, method: str, url: str, headers: dict | None = None, bod
     path = s.path or "/"
     content_type = _header(headers, "content-type")
 
+    # Response evidence is sanitized by the SAME boundary as the request before it is stored:
+    # sensitive headers (Set-Cookie, …) redacted, sensitive body values redacted, the redirect
+    # target's sensitive query values stripped. A secret never enters the durable corpus.
+    resp_headers_raw = response.get("headers") or {}
+    resp_ct = str(response.get("content_type", "")) or _header(resp_headers_raw, "content-type")
+    resp_body = str(response.get("body", "") or "")
+    resp_headers = _redact_headers(resp_headers_raw)
+    # a Location value is a URL and may carry a secret in its query — redact it like any URL
+    # (the header NAME is not sensitive, so _redact_headers kept its value verbatim).
+    for k in list(resp_headers):
+        if k.lower() == "location":
+            resp_headers[k] = _redact_url(resp_headers[k])
+
     cap = CapturedRequest(
         method=method, scheme=scheme, host=host, path=path,
         url=_redact_url(url), headers=_redact_headers(headers),
         body_excerpt=_redact_body(body, content_type)[:_BODY_CAP], body_len=len(body),
         identity=identity, session_id=session_id,
         response_status=response.get("status"),
-        response_content_type=str(response.get("content_type", "")),
+        response_content_type=resp_ct,
+        response_headers=resp_headers,
+        response_body_excerpt=_redact_body(resp_body, resp_ct)[:_BODY_CAP],
+        response_body_len=len(resp_body),
+        response_location=_redact_url(_header(resp_headers_raw, "location")),
         source=source)
     _save_capture(campaign, cap)
 
@@ -367,11 +388,15 @@ def import_har(campaign, har: dict, *, identity: str = "", session_id: str = "",
         if post.get("mimeType") and not _header(headers, "content-type"):
             headers["Content-Type"] = post["mimeType"]
         resp = entry.get("response") or {}
+        resp_headers = {h.get("name", ""): h.get("value", "") for h in resp.get("headers", []) or []
+                        if h.get("name")}
         _, ep = capture(
             campaign, method=req.get("method", "GET"), url=url, headers=headers, body=body,
             identity=identity, session_id=session_id, source=source,
             response={"status": resp.get("status"),
-                      "content_type": (resp.get("content") or {}).get("mimeType", "")})
+                      "content_type": (resp.get("content") or {}).get("mimeType", ""),
+                      "headers": resp_headers,
+                      "body": (resp.get("content") or {}).get("text", "")})
         out.append(ep)
     return out
 
@@ -404,13 +429,30 @@ def demo() -> None:
         assert e["auth"] == "required" and set(e["response_classes"]) == {"2xx", "4xx"}
         assert e["obs_count"] == 2
 
-        # the secret never reached disk — not the token value, not the bearer
+        # sanitized RESPONSE evidence is persisted: a Set-Cookie secret and a token in the
+        # response body are redacted, a redirect Location's sensitive query stripped, while the
+        # object id in the body/location is KEPT (it is evidence, not a credential).
+        capture(c, method="POST", url="https://api.acme.example/api/login",
+                headers={"Content-Type": "application/json"}, identity="user_a",
+                response={"status": 302,
+                          "headers": {"Set-Cookie": "session=topsecret; HttpOnly",
+                                      "Location": "/api/orders/777?token=leaky"},
+                          "content_type": "application/json",
+                          "body": '{"order_id":"ord_777","token":"topsecret"}'})
+        login = next(x for x in captures(c) if x["path"] == "/api/login")
+        assert login["response_body_len"] == len('{"order_id":"ord_777","token":"topsecret"}')
+        assert "topsecret" not in login["response_body_excerpt"] and "ord_777" in login["response_body_excerpt"]
+        assert login["response_headers"].get("Set-Cookie") == _REDACTED
+        assert "token=leaky" not in login["response_location"] and "/api/orders/777" in login["response_location"]
+
+        # the secret never reached disk — not the token value, not the bearer, not the cookie
         corpus = "".join((c.dir / "captures" / f).read_text()
                          for f in os.listdir(c.dir / "captures"))
         assert "supersecret" not in corpus and "session=abc" not in corpus
+        assert "topsecret" not in corpus and "token=leaky" not in corpus
         assert "<redacted>" in corpus
         # evidence (raw capture) is a separate record from the interpretation (endpoint)
-        assert len(captures(c)) == 2
+        assert len(captures(c)) == 3                      # orders/123, orders/456, login
         assert captures_for(c, e["id"])[0]["method"] == "GET"
 
         # HAR import produces the same durable endpoints

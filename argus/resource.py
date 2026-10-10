@@ -50,7 +50,8 @@ _PREFIXED_ID = re.compile(r"[a-z][a-z0-9]*_[0-9a-zA-Z]*[0-9][0-9a-zA-Z]*")
 
 OWNERSHIP_STATES = ("CONFIRMED", "INFERRED")
 # where a candidate came from — a closed vocab so provenance is never a free-text guess.
-CANDIDATE_SOURCES = ("path parameter", "query parameter", "request body")
+CANDIDATE_SOURCES = ("path parameter", "query parameter", "request body",
+                     "response body", "location header")
 
 # A field NAME that denotes an object reference: bare `id`/`uuid`/`guid`, snake `order_id`,
 # or camel `orderId`. The `_` / case boundary is REQUIRED (so `valid`, `android`, `rapid` are
@@ -166,10 +167,11 @@ def _looks_like_collection(seg: str) -> bool:
         and seg.lower() not in ("api", "www")
 
 
-def _path_candidates(cap: dict) -> list[dict]:
+def _path_candidates(cap: dict, source: str = "path parameter") -> list[dict]:
     """Variable path segments as resource references. The preceding collection segment names
     the type (orders/123 -> order), which stays UNKNOWN for an opaque/variable predecessor —
-    an opaque id never hallucinates a type."""
+    an opaque id never hallucinates a type. `source` lets the SAME path convention mine a
+    response Location target (/orders/ord_9) with honest provenance."""
     path = cap.get("path", "") or ""
     parts = path.split("/")
     out = []
@@ -184,7 +186,7 @@ def _path_candidates(cap: dict) -> list[dict]:
             rtype, field_name, confidence = "unknown", "", "low"
         out.append({
             "value": seg, "resource_type": rtype, "field": field_name,
-            "raw_segment": prev, "source": "path parameter", "confidence": confidence,
+            "raw_segment": prev, "source": source, "confidence": confidence,
         })
     return out
 
@@ -271,6 +273,35 @@ def _body_candidates(cap: dict) -> list[dict]:
     return out
 
 
+def _response_candidates(cap: dict) -> list[dict]:
+    """Object references the SERVER returned — fields in the (redacted) response body and the
+    redirect Location target. This is derived candidate knowledge only: it never asserts
+    ownership. A response field like `owner_id` becomes a candidate resource, NOT a confirmed
+    researcher-controlled owner — only an explicit CONFIRMED assertion can do that. Redacted
+    secret values are already stripped and are skipped by the extractors."""
+    out = []
+    body = (cap.get("response_body_excerpt", "") or "").strip()
+    if body[:1] in ("{", "["):
+        try:
+            obj = json.loads(body)
+        except ValueError:
+            obj = None
+        if obj is not None:
+            for k, v in _walk_scalars(obj):
+                c = _ref_candidate(k, v, "response body")
+                if c:
+                    out.append(c)
+    loc = cap.get("response_location", "") or ""
+    if loc:
+        s = urlsplit(loc)
+        out += _path_candidates({"path": s.path}, source="location header")
+        for k, v in parse_qsl(s.query, keep_blank_values=True):
+            c = _ref_candidate(k, v, "location header")
+            if c:
+                out.append(c)
+    return out
+
+
 def candidates(campaign) -> list[dict]:
     """All resource candidates mined from captured traffic, aggregated by (type, value).
     A projection: read-only, rebuilt on demand, provenance + confidence retained. Secrets
@@ -280,7 +311,8 @@ def candidates(campaign) -> list[dict]:
         ep_id = traffic._fingerprint(
             cap.get("method", ""), cap.get("host", ""),
             traffic.normalize_path(cap.get("path", "")))
-        for cand in _path_candidates(cap) + _query_candidates(cap) + _body_candidates(cap):
+        for cand in (_path_candidates(cap) + _query_candidates(cap)
+                     + _body_candidates(cap) + _response_candidates(cap)):
             key = (cand["resource_type"], cand["value"])
             row = agg.get(key)
             if row is None:
@@ -399,6 +431,23 @@ def demo() -> None:
         assert "request body" in cands[("invoice", "inv_9")]["sources"]
         assert not any(v == "100" or v == "valid" for (_t, v) in cands)
         assert ("unknown", "ord_77") in cands
+
+        # response-derived knowledge: a returned body field + a redirect Location target.
+        # A returned owner_id is a candidate resource, NEVER a confirmed owner (only an
+        # explicit CONFIRMED assertion can mark researcher_controlled).
+        traffic.capture(c, method="POST", url="https://api.acme.example/api/checkout",
+                        identity="customer_a",
+                        response={"status": 302, "content_type": "application/json",
+                                  "headers": {"Location": "/api/invoices/inv_55?ref=x"},
+                                  "body": '{"order_id":"ord_88","owner_id":"usr_7"}'})
+        cands = {(x["resource_type"], x["value"]): x for x in candidates(c)}
+        assert "response body" in cands[("order", "ord_88")]["sources"]
+        assert ("owner", "usr_7") in cands                       # candidate, not an owner claim
+        assert "location header" in cands[("invoice", "inv_55")]["sources"]
+        # the candidate never became a researcher-controlled ownership assertion
+        rows = {(r["resource_type"], r["value"]): r for r in resources(c)}
+        assert rows[("owner", "usr_7")]["researcher_controlled"] is False
+        assert rows[("order", "ord_88")]["ownership_status"] == ""
 
         # no assertion => unknown owner, never researcher-controlled
         rows = {(r["resource_type"], r["value"]): r for r in resources(c)}
