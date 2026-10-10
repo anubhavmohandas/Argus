@@ -38,6 +38,7 @@ _W = {                                  # factor -> max points; the base is ever
     "actionable": 10,                   # runnable now (ALLOW*) beats needs-approval
     "confidence": 10,                   # from the gap's own confidence
     "cheap": 4,                         # fewer requests => slightly higher
+    "proximity": 8,                     # v3: near a control point already proven broken
 }
 
 
@@ -95,7 +96,38 @@ def _feedback_points(labels: list[str], signal: dict | None) -> int:
     return round(ratio * _FEEDBACK_CAP)
 
 
-def _score(gap: dict, signal: dict | None = None) -> dict:
+# Priority v3: root-cause proximity. When ARGUS has already EVIDENCE-confirmed a broken
+# authorization control on an object family (e.g. /orders/{id}), an untested SIBLING action on
+# the same family (/orders/{id}/refund) deserves attention — the same control point is in play.
+# This is a bounded NUDGE (±_W["proximity"]), never a claim the sibling shares the vulnerability:
+# proximity ≠ same vuln. It reads only EARNED state (findings past BOUNDARY_CONFIRMED), so it is
+# as evidence-gated as the feedback factor.
+def _confirmed_families(campaign) -> set[tuple[str, str]]:
+    """(host, endpoint_family) for every finding whose boundary is evidence-confirmed. A gap on
+    the same family sits next to a control point ARGUS already proved broken."""
+    from . import dedupe, finding as finding_mod
+    confirmed_ix = finding_mod.LIFECYCLE.index("BOUNDARY_CONFIRMED")
+    out: set[tuple[str, str]] = set()
+    for d in finding_mod.findings(campaign):
+        st = d.get("state", "")
+        if st not in finding_mod.LIFECYCLE or finding_mod.LIFECYCLE.index(st) < confirmed_ix:
+            continue
+        fp = dedupe.fingerprint(campaign, finding_mod.Finding(**d))
+        if fp.get("host") and fp.get("endpoint_family"):
+            out.add((fp["host"], fp["endpoint_family"]))
+    return out
+
+
+def _proximity_points(gap: dict, confirmed_families: set[tuple[str, str]]) -> int:
+    if not confirmed_families:
+        return 0
+    from . import dedupe
+    fam = dedupe._family(gap.get("path_template", ""))
+    return _W["proximity"] if (fam and (gap.get("host", ""), fam) in confirmed_families) else 0
+
+
+def _score(gap: dict, signal: dict | None = None,
+           confirmed_families: set[tuple[str, str]] | None = None) -> dict:
     method = (gap.get("method") or "").upper()
     factors = {
         "base": _W["base"],
@@ -107,6 +139,7 @@ def _score(gap: dict, signal: dict | None = None) -> dict:
         "confidence": round(float(gap.get("confidence", 0.0)) * _W["confidence"]),
         "cheap": max(0, _W["cheap"] - max(0, int(gap.get("estimated_requests", 2)) - 2)),
         "feedback": _feedback_points(gap.get("boundary", []) or [], signal),
+        "proximity": _proximity_points(gap, confirmed_families or set()),
     }
     total = max(0, min(100, sum(factors.values())))
     return {"priority_score": total, "priority_factors": factors}
@@ -122,9 +155,13 @@ def rank(campaign) -> list[dict]:
         signal = program_response.priority_signal(campaign)
     except Exception:                       # noqa: BLE001 — feedback is best-effort, never fatal
         signal = None
+    try:
+        confirmed = _confirmed_families(campaign)
+    except Exception:                       # noqa: BLE001 — proximity is best-effort, never fatal
+        confirmed = set()
     live = [g for g in coverage.gaps(campaign)
             if not g.get("orphan") and g.get("status") == "OPEN"]
-    scored = [{**g, **_score(g, signal)} for g in live]
+    scored = [{**g, **_score(g, signal, confirmed)} for g in live]
     scored.sort(key=lambda g: (-g["priority_score"], g["gap_id"]))
     for i, g in enumerate(scored):
         g["priority_rank"] = i + 1
@@ -256,6 +293,16 @@ def demo() -> None:
             assert sum(g["priority_factors"].values()) in (g["priority_score"],)  # no clamp here
         # deterministic
         assert [g["gap_id"] for g in rank(cmod.load(c.id))] == [g["gap_id"] for g in ranked]
+
+        # v3 proximity: a gap on a family with an evidence-confirmed broken control is nudged
+        # up by exactly _W["proximity"]; one on an unrelated family is not. A bounded nudge,
+        # computed directly here so the self-check fails if the factor logic breaks.
+        refund_gap = next(g for g in ranked if "refunds" in g["path_template"])
+        near = _score(refund_gap, None, {(refund_gap["host"], "refunds")})
+        far = _score(refund_gap, None, {(refund_gap["host"], "unrelated")})
+        assert near["priority_factors"]["proximity"] == _W["proximity"]
+        assert far["priority_factors"]["proximity"] == 0
+        assert near["priority_score"] == far["priority_score"] + _W["proximity"]
 
         it = intel(c)
         assert it["highest_value_boundary"]["gap_id"] == ranked[0]["gap_id"]
