@@ -37,6 +37,7 @@ from argus import (
     finding,
     identity as identity_mod,
     orchestrator as orchestrator_mod,
+    planner,
     priority,
     proposal,
     report,
@@ -45,6 +46,9 @@ from argus import (
     session as session_mod,
     traffic,
 )
+
+_DIFF_TECHNIQUES = ("differential_cross_account", "differential_anonymous",
+                    "differential_same_account")
 
 HOST = "fixture.local"
 PROGRAM = f"Assets:\n{HOST}\nRate: 20 requests/sec\n"
@@ -173,6 +177,57 @@ def test_golden_vulnerable_path():
             ])
             for secret in ("tok-a", "tok-b", "Bearer tok", "FIX_A_TOK=tok"):
                 assert secret not in blob, f"secret leaked: {secret!r}"
+        finally:
+            for k in ("ARGUS_HOME", "FIX_A_TOK", "FIX_B_TOK"):
+                os.environ.pop(k, None)
+
+
+def test_golden_autonomous_loop():
+    """The bounded autonomous loop drives the planner's decisions through ONE orchestrator,
+    cycle after cycle, against the fixture: the vulnerable boundary becomes a finding, the
+    secure one resolves with no finding, and the loop stops honestly once no safe worthwhile
+    gap remains — all gates and ownership rules intact, no worker invocation around the orch."""
+    with fixture_app.running_app() as port, tempfile.TemporaryDirectory() as tmp:
+        os.environ["ARGUS_HOME"] = tmp
+        try:
+            fetch = _make_fetch(port)
+            c = campaign_mod.create(PROGRAM, name="Fixture-Auto")
+            os.environ["FIX_A_TOK"], os.environ["FIX_B_TOK"] = "tok-a", "tok-b"
+            for name, cred in (("user_a", "FIX_A_TOK"), ("user_b", "FIX_B_TOK")):
+                identity_mod.register(c, identity_mod.Identity(
+                    name=name, role="customer", tenant="t1", researcher_owned=True,
+                    credential_ref=cred))
+            # owner traffic on BOTH routes -> two researcher-controlled objects -> real gaps
+            for route, rtype in (("/api/orders", "order"), ("/api/secure-orders", "secure-order")):
+                traffic.capture(c, method="GET", url=f"https://{HOST}{route}/1",
+                                headers={"Authorization": "Bearer tok-a"}, identity="user_a",
+                                response={"status": 200, "content_type": "application/json"})
+                resource_mod.assert_ownership(c, resource_mod.Ownership(
+                    resource_type=rtype, resource_value="1", owner_identity="user_a",
+                    tenant="t1", researcher_controlled=True))
+
+            orch = orchestrator_mod.Orchestrator(c)
+            worker = _diff_worker(fetch)
+            for tech in _DIFF_TECHNIQUES:
+                orch.register_worker(tech, worker)
+
+            result = planner.autonomous_run(c, orch, max_actions=10)
+
+            # the loop ran real experiments and converged: nothing safe remains to run
+            assert result["actions"], "the loop should have run at least one safe action"
+            assert all(a["verdict"].startswith("ALLOW") for a in result["actions"] if a["ran"])
+            final = planner.assess(c)
+            assert final["counts"]["safe_runnable"] == 0        # every safe gap consumed
+            assert result["completion"]["status"] == "RESEARCH_EXHAUSTED"
+            assert result["completion"]["why_stopped"] in (
+                "no_open_gaps", "all_remaining_need_approval", "all_remaining_denied")
+
+            # the vulnerable cross-account boundary produced exactly one finding; the secure
+            # route (and any anonymous boundary the fixture denies) produced none
+            assert any(e["classification"] == "suspicious" for e in c.experiments())
+            assert any(e["classification"] == "secure" for e in c.experiments())
+            fs = finding.findings(c)
+            assert len(fs) == 1 and fs[0]["technique"] == "differential_cross_account"
         finally:
             for k in ("ARGUS_HOME", "FIX_A_TOK", "FIX_B_TOK"):
                 os.environ.pop(k, None)

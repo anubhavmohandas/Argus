@@ -151,6 +151,51 @@ def completion(campaign, *, budget_remaining: int | None = None) -> dict:
     }
 
 
+def autonomous_run(campaign, orch, *, max_actions: int = 25,
+                   budget_remaining: int | None = None) -> dict:
+    """Bounded autonomous research loop — "autonomous within policy". Each cycle: ask the
+    planner for the single highest-value SAFE action, run it through the GIVEN orchestrator,
+    update knowledge (reconcile), re-assess — until the planner stops (no safe worthwhile gap)
+    or max_actions is reached. Returns the action trace + the final completion handoff.
+
+    Safety is inherited, not reinvented: it runs ONLY gaps whose policy preview is ALLOW*, and
+    even then each task is re-gated by can_test inside orch.propose and every outbound request
+    is re-gated again — a gap that policy re-decides as approval/deny at propose time is parked
+    (BLOCKED), never auto-run. The orchestrator is the SOLE executor; this drives it, it does
+    not bypass it. It proposes on the caller's orchestrator (the one that will run) so each
+    cycle's task is actually drained, and the caller owns the one-execution-owner guarantee
+    (don't drive an orchestrator for a campaign a coordinator is actively running).
+
+    occam: synchronous, the same shape the golden E2E runs for one gap, generalized to a
+    bounded sequence. It converges because reconcile moves every run gap out of OPEN, so the
+    planner never re-picks it; max_actions is the hard backstop."""
+    actions: list[dict] = []
+    for _ in range(max_actions):
+        decision = assess(campaign, budget_remaining=budget_remaining)
+        if decision["stopped"]:
+            break
+        gap = decision["next_action"]["gap"]
+        gap_id = gap["gap_id"]
+        # use the proposal assess() already built from the FULL gap — _top_card is a trimmed
+        # view and would lose the concrete request path proposal.build derives from evidence.
+        prop = decision["next_action"]["proposal"]
+        task = proposal.to_task(campaign, prop)
+        orch.propose(task)                       # re-gate on the SAME orch that will run it
+        coverage.set_gap_state(campaign, gap_id, "PROPOSED", note=f"task={task.id}")
+        if not (task.verdict or "").startswith("ALLOW"):
+            # policy re-decided stricter than the preview — park it, do not run, move on
+            coverage.set_gap_state(campaign, gap_id, "BLOCKED", note=f"verdict {task.verdict}")
+            actions.append({"gap_id": gap_id, "verdict": task.verdict, "ran": False})
+            continue
+        orch.run()
+        rec = proposal.reconcile(campaign)
+        actions.append({"gap_id": gap_id, "verdict": task.verdict, "ran": True, "reconciled": rec})
+        if budget_remaining is not None:
+            budget_remaining -= int(gap.get("estimated_requests", 2))
+    return {"campaign_id": campaign.id, "actions": actions,
+            "completion": completion(campaign, budget_remaining=budget_remaining)}
+
+
 def demo() -> None:
     """Self-check (offline): with two safe owner->non-owner gaps the planner picks the
     highest-ranked worthwhile one and is RESEARCH_ACTIVE; a tight budget that can't afford any
