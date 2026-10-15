@@ -196,6 +196,67 @@ def autonomous_run(campaign, orch, *, max_actions: int = 25,
             "completion": completion(campaign, budget_remaining=budget_remaining)}
 
 
+def background_autonomous(campaign, *, max_actions: int = 25,
+                          budget_remaining: int | None = None):
+    """Return (planner, on_complete) that drive "autonomous within policy" through a
+    CampaignRunCoordinator — the SAME single-writer execution owner as a pivot/queue, not a
+    new engine. planner is None (no up-front batch); on_complete is a RE-ARMABLE cycle the
+    coordinator calls each time its queue drains empty:
+
+        reconcile the finished experiment  ->  knowledge.updated
+        assess the single next SAFE action ->  planner.assessed
+          stopped / budget / max_actions   ->  planner.exhausted, finish (COMPLETE)
+          else propose exactly ONE action  ->  planner.selected, keep looping
+
+    Same safety as the synchronous autonomous_run: it proposes ONLY gaps assess() already
+    classified ALLOW* (HUMAN_APPROVAL gaps are never auto-proposed — they stay operator-queued
+    via the plan's parked list), each task is re-gated by can_test inside orch.propose, and a
+    task policy re-decides stricter than its preview is cancelled + the gap BLOCKED, never run
+    and never left to silently park the loop. The coordinator owns pause/resume/stop/approval;
+    this only decides WHAT the next bounded experiment is. Converges because reconcile moves
+    every run gap out of OPEN so it is never re-picked; max_actions is the hard backstop.
+
+    occam: a closure over a tiny mutable counter dict, returned as the coordinator's existing
+    on_complete hook — the loop's re-arm is a 2-line change in run.py, not a second runner."""
+    st = {"actions": 0, "budget": budget_remaining}
+
+    def on_complete(co) -> bool:
+        rec = proposal.reconcile(co.c)                 # idempotent; a no-op on the first cycle
+        if rec:
+            co.c.audit("knowledge_updated", reconciled=len(rec),
+                       gaps=[r.get("gap_id", "") for r in rec if isinstance(r, dict)])
+        if st["actions"] >= max_actions:
+            co.c.audit("planner_exhausted", reason="max_actions", actions=st["actions"])
+            return False
+        decision = assess(co.c, budget_remaining=st["budget"])
+        co.c.audit("planner_assessed", actions=st["actions"], stopped=decision["stopped"],
+                   **decision["counts"])
+        if decision["stopped"]:
+            co.c.audit("planner_exhausted", reason=decision["stop_reason"], actions=st["actions"])
+            return False
+        gap = decision["next_action"]["gap"]
+        gap_id = gap["gap_id"]
+        task = co.orch.propose(proposal.to_task(co.c, decision["next_action"]["proposal"]))
+        coverage.set_gap_state(co.c, gap_id, "PROPOSED", note=f"task={task.id}")
+        st["actions"] += 1
+        if st["budget"] is not None:
+            st["budget"] -= int(gap.get("estimated_requests", 2))
+        if not (task.verdict or "").startswith("ALLOW"):
+            # defense-in-depth re-decided stricter than the preview: cancel it (so the loop
+            # does not park on an approval the operator never asked for) + mark the gap BLOCKED,
+            # then re-assess — the blocked gap is out of OPEN and won't be re-picked.
+            co.orch.cancel(task.id, "autonomous", "policy re-decided stricter than preview")
+            coverage.set_gap_state(co.c, gap_id, "BLOCKED", note=f"verdict {task.verdict}")
+            co.c.audit("planner_blocked", gap_id=gap_id, verdict=task.verdict)
+            return True
+        co.c.audit("planner_selected", gap_id=gap_id, endpoint=gap.get("endpoint", ""),
+                   boundary=gap.get("boundary", []), reason=gap.get("reason", ""),
+                   estimated_requests=gap.get("estimated_requests"), action=st["actions"])
+        return True
+
+    return None, on_complete
+
+
 def demo() -> None:
     """Self-check (offline): with two safe owner->non-owner gaps the planner picks the
     highest-ranked worthwhile one and is RESEARCH_ACTIVE; a tight budget that can't afford any

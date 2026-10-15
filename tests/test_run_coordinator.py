@@ -297,3 +297,60 @@ def test_run_transitions_are_audited_in_order(home):
     from argus.run import _RUN_TRANSITIONS
     for frm, to in zip(states, states[1:]):
         assert to in _RUN_TRANSITIONS.get(frm, set()) or to == frm
+
+
+# --- re-armable on_complete: the mechanism autonomous research rides on ----
+def test_rearmable_on_complete_drives_a_bounded_loop(home):
+    """on_complete returning truthy re-arms the loop: it proposes the next task, the loop
+    drains it, then asks again — until on_complete returns falsy (COMPLETE). This is exactly
+    how planner.background_autonomous cycles; here with instant workers so it is deterministic
+    (the existing one-shot pivot/queue callbacks return None, so they still run once as before)."""
+    c = _camp()
+    co = coordinator_for(c)
+    calls: list[str] = []
+    co.orch.register_worker("http_probe", _instant_probe(calls))
+    state = {"n": 0}
+
+    def on_complete(cc):
+        if state["n"] >= 3:
+            return False
+        state["n"] += 1
+        cc.orch.propose(Task(campaign_id=c.id, technique="http_probe",
+                             host=f"h{state['n']}.acme.example", hypothesis="up?"))
+        return True
+
+    co.start(on_complete=on_complete)
+    assert _wait(lambda: co.snapshot()["run_state"] == "COMPLETE"), co.snapshot()
+    # one task proposed and run per cycle, in order, exactly three times
+    assert calls == ["h1.acme.example", "h2.acme.example", "h3.acme.example"]
+
+
+def test_rearmable_loop_honors_stop_mid_cycle(home):
+    """stop() during a re-armed (autonomous-style) loop is honored: the in-flight bounded
+    task finishes, no further cycle is proposed, and the run ends STOPPED — the re-arm never
+    bypasses the loop's stop check."""
+    c = _camp()
+    co = coordinator_for(c)
+    gate = threading.Event()
+    calls: list[str] = []
+
+    def worker(t, cc):
+        gate.wait(5)                                  # hold the step so we can stop mid-run
+        calls.append(t.host)
+        return ({"request": {"method": "GET", "url": f"https://{t.host}/", "headers": {}, "body": ""},
+                 "response": {"status": 200}}, "")
+
+    co.orch.register_worker("http_probe", worker)
+
+    def on_complete(cc):                              # never stops on its own — only stop() ends it
+        cc.orch.propose(Task(campaign_id=c.id, technique="http_probe",
+                             host="h.acme.example", hypothesis="x"))
+        return True
+
+    co.start(on_complete=on_complete)
+    assert _wait(lambda: co._state == "RUNNING")      # proposed one, now latched inside the step
+    co.stop()
+    gate.set()                                        # release the in-flight bounded task
+    assert _wait(lambda: co.snapshot()["run_state"] in ("STOPPED", "COMPLETE"))
+    assert co.snapshot()["run_state"] == "STOPPED"
+    assert len(calls) == 1                            # exactly the one in-flight task, no re-arm

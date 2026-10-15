@@ -18,6 +18,7 @@ import {
   getPlan,
   listCampaigns,
   queueGap,
+  startAutonomous,
   startPivot,
   subscribeCampaign,
 } from "../api";
@@ -68,6 +69,9 @@ export default function CampaignWorkstation({
   const [runState, setRunState] = useState<CampaignRunState | null>(null);
   const [intel, setIntel] = useState<Intel | null>(null);
   const [plan, setPlan] = useState<CampaignPlan | null>(null);
+  // the autonomous loop's latest live decision (SSE planner.selected) — "what ARGUS is testing
+  // right now", distinct from the plan's "what's next". Cleared when the loop stops honestly.
+  const [autoNow, setAutoNow] = useState<{ endpoint: string; reason: string } | null>(null);
   const refetchTimer = useRef<number | null>(null);
 
   const refreshList = useCallback(() => {
@@ -107,6 +111,7 @@ export default function CampaignWorkstation({
       setRunState(null);
       setIntel(null);
       setPlan(null);
+      setAutoNow(null);
       return;
     }
     loadDetail(cid);
@@ -119,7 +124,18 @@ export default function CampaignWorkstation({
           const rs = suffix as CampaignRunState;
           setRunState(rs);
           onRunState?.(cid, rs);
+          if (rs === "COMPLETE" || rs === "STOPPED" || rs === "FAILED") setAutoNow(null);
         }
+      }
+      // live autonomous activity: the coordinator audits each planner decision, so the browser
+      // learns "what ARGUS is testing now" straight from the event stream (not a poll).
+      if (ev.event === "planner.selected") {
+        setAutoNow({
+          endpoint: String(ev.data.endpoint ?? ""),
+          reason: String(ev.data.reason ?? ""),
+        });
+      } else if (ev.event === "planner.exhausted") {
+        setAutoNow(null);
       }
       if (refetchTimer.current) window.clearTimeout(refetchTimer.current);
       refetchTimer.current = window.setTimeout(() => loadDetail(cid), 250);
@@ -174,6 +190,19 @@ export default function CampaignWorkstation({
     },
     [cid, loadDetail]
   );
+
+  const onStartAutonomous = useCallback(async () => {
+    if (!cid) return;
+    setBusy("autonomous");
+    setError(null);
+    try {
+      await startAutonomous(cid);   // coordinator-owned; SSE + the execution rail carry the rest
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }, [cid]);
 
   const onQueueGap = useCallback(
     async (gapId: string) => {
@@ -274,6 +303,10 @@ export default function CampaignWorkstation({
               onQueue={onQueueGap}
               queueBusy={busy?.startsWith("queue:") ? busy.slice("queue:".length) : null}
               queueDisabled={runActive}
+              onStartAutonomous={onStartAutonomous}
+              autonomousStarting={busy === "autonomous"}
+              running={runActive}
+              activity={autoNow}
             />
           )}
 

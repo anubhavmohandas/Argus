@@ -269,8 +269,13 @@ class CampaignRunCoordinator:
                     self._wake.clear()
                     continue
                 if self._on_complete is not None:
-                    self._on_complete(self)       # passive analysis / projection, serialized here
-                    self._on_complete = None      # run once per run
+                    # on_complete runs on THIS single-writer thread when the queue drains empty.
+                    # A truthy return means it proposed more work (autonomous research re-assess)
+                    # — loop back and drain it, re-gated/paused/stopped like any other step. A
+                    # falsy return is the one-shot projection (pivot/queue): run once, complete.
+                    if self._on_complete(self):
+                        continue
+                    self._on_complete = None
                 self._finish(run_id, "COMPLETE")
                 return
         except BaseException as e:              # noqa: BLE001 — a loop fault must be recorded, not silent

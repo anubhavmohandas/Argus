@@ -402,6 +402,13 @@ _EVENT_MAP = {
     "differential_blocked": "policy.deny",
     "run_recovered": "campaign.run.recovered",
     "reproducibility_check": "reproduction.checked",
+    # autonomous research planner (argus/planner.background_autonomous) — the coordinator-owned
+    # loop's decisions, each one audited on its single writer thread so SSE ordering is exact.
+    "planner_assessed": "planner.assessed",
+    "planner_selected": "planner.selected",
+    "planner_blocked": "planner.blocked",
+    "planner_exhausted": "planner.exhausted",
+    "knowledge_updated": "knowledge.updated",
 }
 _VERDICT_EVENT = {
     "ALLOW": "policy.allow", "ALLOW_WITH_LIMITS": "policy.limit",
@@ -566,6 +573,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._assert_ownership(c)
         if rest == ["pivot"]:
             return self._start_pivot(c)
+        if rest == ["autonomous"]:
+            return self._start_autonomous(c)
         if rest and rest[0] in ("pause", "resume", "stop") and len(rest) == 1:
             return self._run_control(c, rest[0])
         # /findings/{finding}/reproduce
@@ -848,6 +857,47 @@ class Handler(BaseHTTPRequestHandler):
             return
         snap = co.start(planner=planner, on_complete=on_complete)
         self._send_json({"run": snap, "gap_id": gap_id, "proposal": prop}, code=202)
+
+    def _start_autonomous(self, c):
+        """POST /api/campaign/{id}/autonomous — start "autonomous within policy" research
+        bound to this campaign, owned by the SAME coordinator as a pivot/queue (one execution
+        owner). The body carries only a bounded action cap + optional request budget; it can
+        never name a target, provider, or technique. The planner repeatedly chooses the single
+        highest-value SAFE next experiment and runs it through the orchestrator, parking nothing
+        it wasn't asked to — see argus/planner.background_autonomous. Returns 202 immediately;
+        planner.*/experiment.*/knowledge.updated + run-state transitions arrive via SSE. 409 if
+        a run already owns this campaign; pause/resume/stop control it like any other run."""
+        body = self._json_body() or {}
+        raw = body.get("max_actions")
+        try:
+            max_actions = 25 if raw is None else int(raw)   # 0 is a value, not "unset"
+        except (TypeError, ValueError):
+            self._send_json({"error": "max_actions must be an integer"}, code=400)
+            return
+        if not (1 <= max_actions <= 200):
+            self._send_json({"error": "max_actions out of range [1,200]"}, code=400)
+            return
+        budget = body.get("budget_remaining")
+        if budget is not None:
+            try:
+                budget = int(budget)
+            except (TypeError, ValueError):
+                self._send_json({"error": "budget_remaining must be an integer"}, code=400)
+                return
+            if budget < 0:
+                self._send_json({"error": "budget_remaining must be >= 0"}, code=400)
+                return
+        co = _coordinator(c)
+        if co.is_active():
+            self._send_json({"error": "a run is already active; stop it before starting autonomous"},
+                            code=409)
+            return
+        from argus import planner
+        planner_cb, on_complete = planner.background_autonomous(
+            c, max_actions=max_actions, budget_remaining=budget)
+        snap = co.start(planner=planner_cb, on_complete=on_complete)
+        self._send_json({"run": snap, "mode": "autonomous", "max_actions": max_actions},
+                        code=202)
 
     def _run_control(self, c, action: str):
         """POST /api/campaign/{id}/{pause|resume|stop} — thin controller over the

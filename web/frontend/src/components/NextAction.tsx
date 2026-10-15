@@ -28,31 +28,45 @@ export default function NextAction({
   onQueue,
   queueBusy,
   queueDisabled,
+  onStartAutonomous,
+  autonomousStarting,
+  running,
+  activity,
 }: {
   assessment: Assessment;
   completion: Completion;
   onQueue: (gapId: string) => void;
   queueBusy: string | null; // gap_id currently queuing, or null
   queueDisabled: boolean; // a run already owns execution
+  onStartAutonomous: () => void;
+  autonomousStarting: boolean;
+  running: boolean; // a run (possibly this autonomous loop) owns execution
+  activity: { endpoint: string; reason: string } | null; // live planner.selected, if running
 }) {
   const na = assessment.next_action;
   const exhausted = completion.status === "RESEARCH_EXHAUSTED";
   return (
     <div
       className={`bg-panel border rounded-lg p-3 ${
-        exhausted ? "border-edge" : "border-accent/40"
+        exhausted && !running ? "border-edge" : "border-accent/40"
       }`}
     >
       <div className="flex items-center justify-between mb-2">
         <div
           className={`text-[10px] font-mono uppercase tracking-widest ${
-            exhausted ? "text-mute/70" : "text-accent"
+            exhausted && !running ? "text-mute/70" : "text-accent"
           }`}
         >
-          {exhausted ? "Research exhausted under current knowledge" : "Best next research action"}
+          {running
+            ? "Autonomous research running"
+            : exhausted
+              ? "Research exhausted under current knowledge"
+              : "Best next research action"}
         </div>
         <CountsChip a={assessment} />
       </div>
+
+      {running && <ActivityStrip activity={activity} />}
 
       {na ? (
         <ActionBlock
@@ -62,6 +76,9 @@ export default function NextAction({
           onQueue={onQueue}
           queuing={queueBusy === na.gap.gap_id}
           queueDisabled={queueDisabled}
+          onStartAutonomous={onStartAutonomous}
+          autonomousStarting={autonomousStarting}
+          running={running}
         />
       ) : (
         <StoppedBlock
@@ -74,6 +91,27 @@ export default function NextAction({
       )}
 
       <CompletionFooter completion={completion} />
+    </div>
+  );
+}
+
+function ActivityStrip({ activity }: { activity: { endpoint: string; reason: string } | null }) {
+  return (
+    <div className="mb-2 flex items-start gap-2 text-xs font-mono bg-accent/5 border border-accent/20 rounded px-2 py-1.5">
+      <span className="text-accent animate-pulse mt-0.5" aria-hidden>
+        ●
+      </span>
+      <div className="min-w-0">
+        {activity ? (
+          <>
+            <div className="text-ink break-all">testing {activity.endpoint}</div>
+            {activity.reason && <div className="text-mute truncate">{activity.reason}</div>}
+          </>
+        ) : (
+          <div className="text-mute">assessing the next safe experiment…</div>
+        )}
+        <div className="text-mute/60 text-[10px]">control from the execution rail ↓</div>
+      </div>
     </div>
   );
 }
@@ -97,6 +135,9 @@ function ActionBlock({
   onQueue,
   queuing,
   queueDisabled,
+  onStartAutonomous,
+  autonomousStarting,
+  running,
 }: {
   gap: BoundaryCard;
   hypothesis: string;
@@ -104,6 +145,9 @@ function ActionBlock({
   onQueue: (gapId: string) => void;
   queuing: boolean;
   queueDisabled: boolean;
+  onStartAutonomous: () => void;
+  autonomousStarting: boolean;
+  running: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const verdict = gap.policy_preview?.verdict ?? "—";
@@ -166,6 +210,14 @@ function ActionBlock({
           className="text-[11px] font-mono border border-accent/40 text-accent rounded px-2 py-1 hover:bg-accent/15 disabled:opacity-40"
         >
           {queuing ? "queuing…" : "queue this experiment"}
+        </button>
+        <button
+          onClick={onStartAutonomous}
+          disabled={autonomousStarting || running}
+          title={running ? "a run already owns execution — stop it first" : "run safe experiments until none remain"}
+          className="text-[11px] font-mono border border-accent/40 text-accent rounded px-2 py-1 hover:bg-accent/15 disabled:opacity-40"
+        >
+          {autonomousStarting ? "starting…" : "run autonomous research"}
         </button>
       </div>
     </div>

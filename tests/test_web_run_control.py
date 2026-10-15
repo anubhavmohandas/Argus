@@ -236,3 +236,45 @@ def test_reproduce_refused_while_a_run_is_active(api, monkeypatch):
     assert code == 409 and "already active" in body["error"]
     release["api.acme.example"].set()
     _wait(lambda: not co.is_active())
+
+
+# --- autonomous-within-policy background mode ----------------------------
+def test_autonomous_rejects_bad_max_actions(api):
+    cid = _campaign(api)
+    code, body = _req(api, f"/api/campaign/{cid}/autonomous", "POST", {"max_actions": 0})
+    assert code == 400 and "max_actions" in body["error"]
+
+
+def test_autonomous_starts_and_converges_honestly_on_empty_campaign(api):
+    """POST /autonomous returns immediately with a run snapshot; the coordinator owns the loop.
+    An empty campaign has no derivable gap, so the planner stops HONESTLY (RESEARCH_EXHAUSTED,
+    never "secure") and the run ends COMPLETE — the real wiring, no network, no stub."""
+    cid = _campaign(api)
+    code, body = _req(api, f"/api/campaign/{cid}/autonomous", "POST", {})
+    assert code == 202, body
+    assert body["mode"] == "autonomous" and body["run"]["run_id"]
+    co = _coordinator(cid)
+    assert _wait(lambda: co.snapshot()["run_state"] == "COMPLETE")
+    from argus import campaign as cmod, planner
+    c = cmod.load(cid)
+    assert planner.completion(c)["status"] == "RESEARCH_EXHAUSTED"
+    events = [a["event"] for a in c.audit_trail()]
+    assert "planner_exhausted" in events
+
+
+def test_autonomous_409_when_a_run_is_already_active(api, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def worker(t, c):
+        entered.set()
+        release.wait(5)
+        return ({"request": {"method": "GET", "url": f"https://{t.host}/", "headers": {}, "body": ""},
+                 "response": {"status": 200}}, "")
+    _stub_planner(monkeypatch, worker)
+    cid = _campaign(api)
+    _req(api, f"/api/campaign/{cid}/pivot", "POST", {"level": "active"})
+    assert _wait(lambda: entered.is_set())            # a run now owns the campaign
+    code, body = _req(api, f"/api/campaign/{cid}/autonomous", "POST", {})
+    assert code == 409 and "active" in body["error"]  # one execution owner
+    release.set()

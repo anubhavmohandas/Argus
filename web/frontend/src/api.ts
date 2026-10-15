@@ -274,6 +274,22 @@ export function startPivot(
   });
 }
 
+/** Start "autonomous within policy" research — the coordinator repeatedly asks the planner
+ * for the single highest-value SAFE experiment and runs it through the one orchestrator,
+ * parking nothing it wasn't asked to. Returns immediately with the run snapshot; planner.* /
+ * experiment.* / knowledge.updated + run-state transitions arrive via SSE. Pause/resume/stop
+ * are the same coordinator controls as any run. 409 if a run already owns the campaign. */
+export function startAutonomous(
+  cid: string,
+  opts: { max_actions?: number; budget_remaining?: number } = {}
+): Promise<{ run: RunSnapshot; mode: string; max_actions: number }> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/autonomous`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+  });
+}
+
 /** Pause / resume / stop a campaign's run — thin controllers over the coordinator. PAUSE
  * stops NEW dispatch (a bounded task in flight finishes); STOP preserves durable queued
  * work. The operation is applied on the coordinator's single thread, never racing a run. */
@@ -325,6 +341,9 @@ export function subscribeCampaign(
     "experiment.created", "experiment.completed",
     "finding.promoted", "finding.transition", "identity.registered",
     "reproduction.checked",
+    // autonomous research planner decisions (argus/planner.background_autonomous)
+    "planner.assessed", "planner.selected", "planner.blocked", "planner.exhausted",
+    "knowledge.updated",
     // coordinator run-state transitions — the authority for campaign activity
     "campaign.run.starting", "campaign.run.running", "campaign.run.pausing",
     "campaign.run.paused", "campaign.run.waiting_approval", "campaign.run.stopping",

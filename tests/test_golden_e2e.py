@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -43,9 +44,19 @@ from argus import (
     report,
     reproduce,
     resource as resource_mod,
+    run as run_mod,
     session as session_mod,
     traffic,
 )
+
+
+def _wait(pred, timeout=20.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return False
 
 _DIFF_TECHNIQUES = ("differential_cross_account", "differential_anonymous",
                     "differential_same_account")
@@ -229,6 +240,63 @@ def test_golden_autonomous_loop():
             fs = finding.findings(c)
             assert len(fs) == 1 and fs[0]["technique"] == "differential_cross_account"
         finally:
+            for k in ("ARGUS_HOME", "FIX_A_TOK", "FIX_B_TOK"):
+                os.environ.pop(k, None)
+
+
+def test_golden_autonomous_loop_via_coordinator():
+    """The SAME autonomous loop, but owned by the CampaignRunCoordinator — the REAL background
+    path a UI drives. start() returns immediately; the coordinator's single writer thread then
+    re-assesses + runs ONE safe experiment per cycle through its OWN orchestrator (the re-armable
+    on_complete), emits planner.* decisions as audit/SSE events, converges to a finding on the
+    vulnerable route, and ends COMPLETE with an honest stop — no second runner, gates intact."""
+    with fixture_app.running_app() as port, tempfile.TemporaryDirectory() as tmp:
+        os.environ["ARGUS_HOME"] = tmp
+        run_mod._reset_registry()
+        try:
+            fetch = _make_fetch(port)
+            c = campaign_mod.create(PROGRAM, name="Fixture-Auto-Coord")
+            os.environ["FIX_A_TOK"], os.environ["FIX_B_TOK"] = "tok-a", "tok-b"
+            for name, cred in (("user_a", "FIX_A_TOK"), ("user_b", "FIX_B_TOK")):
+                identity_mod.register(c, identity_mod.Identity(
+                    name=name, role="customer", tenant="t1", researcher_owned=True,
+                    credential_ref=cred))
+            for route, rtype in (("/api/orders", "order"), ("/api/secure-orders", "secure-order")):
+                traffic.capture(c, method="GET", url=f"https://{HOST}{route}/1",
+                                headers={"Authorization": "Bearer tok-a"}, identity="user_a",
+                                response={"status": 200, "content_type": "application/json"})
+                resource_mod.assert_ownership(c, resource_mod.Ownership(
+                    resource_type=rtype, resource_value="1", owner_identity="user_a",
+                    tenant="t1", researcher_controlled=True))
+
+            co = run_mod.coordinator_for(c)
+            worker = _diff_worker(fetch)
+            for tech in _DIFF_TECHNIQUES:
+                co.orch.register_worker(tech, worker)
+
+            planner_cb, on_complete = planner.background_autonomous(c, max_actions=10)
+            snap = co.start(planner=planner_cb, on_complete=on_complete)
+            assert snap["run_state"] in ("STARTING", "RUNNING")      # returned immediately
+
+            assert _wait(lambda: co.snapshot()["run_state"] == "COMPLETE"), co.snapshot()
+
+            # converged honestly THROUGH the coordinator: every safe gap consumed, one finding
+            assert planner.assess(c)["counts"]["safe_runnable"] == 0
+            assert planner.completion(c)["status"] == "RESEARCH_EXHAUSTED"
+            assert any(e["classification"] == "suspicious" for e in c.experiments())
+            assert any(e["classification"] == "secure" for e in c.experiments())
+            fs = finding.findings(c)
+            assert len(fs) == 1 and fs[0]["technique"] == "differential_cross_account"
+
+            # the coordinator surfaced the planner's decisions as auditable (=> SSE) events,
+            # and the terminal stop is honest, never a "secure" verdict
+            events = [a["event"] for a in c.audit_trail()]
+            assert {"planner_selected", "planner_exhausted", "knowledge_updated"} <= set(events)
+            stop = next(a for a in reversed(c.audit_trail()) if a["event"] == "planner_exhausted")
+            assert stop["reason"] in ("no_open_gaps", "all_remaining_need_approval",
+                                      "all_remaining_denied", "below_useful_threshold")
+        finally:
+            run_mod._reset_registry()
             for k in ("ARGUS_HOME", "FIX_A_TOK", "FIX_B_TOK"):
                 os.environ.pop(k, None)
 
