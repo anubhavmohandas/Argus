@@ -4,11 +4,9 @@ The runner sends real active requests as two identities, so the tests that matte
 are the ones proving it NEVER sends one the policy didn't clear — especially that a
 non-researcher-owned (real) victim's object is never touched automatically.
 """
-import os
-
 import pytest
 
-from argus import campaign, differential, identity, orchestrator
+from argus import campaign, differential, identity
 from argus.differential import Variant, normalize, compare, run
 from argus.identity import Identity
 from argus.orchestrator import Orchestrator, Task
