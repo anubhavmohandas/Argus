@@ -312,6 +312,76 @@ def test_golden_autonomous_loop_via_coordinator():
                 os.environ.pop(k, None)
 
 
+def test_golden_autonomous_restart_recovers_and_continues_safely():
+    """Durability of the NEW background mode. After an autonomous run, a simulated process death
+    (run.json left in an active state) must recover to STOPPED on restart — never blindly resume
+    state-changing work — while the durable research state (findings, experiments, resolved gaps
+    = negative memory) survives. A fresh autonomous run on the reloaded campaign then exhausts
+    HONESTLY without re-running the already-resolved boundaries: no new experiment, no dead work.
+    The autonomous driver adds no new persistent state, so this is the coordinator's own crash
+    recovery + the planner's durable negative memory, proven together for the autonomous path."""
+    with fixture_app.running_app() as port, tempfile.TemporaryDirectory() as tmp:
+        os.environ["ARGUS_HOME"] = tmp
+        run_mod._reset_registry()
+        try:
+            fetch = _make_fetch(port)
+            c = campaign_mod.create(PROGRAM, name="Fixture-Restart")
+            os.environ["FIX_A_TOK"], os.environ["FIX_B_TOK"] = "tok-a", "tok-b"
+            for name, cred in (("user_a", "FIX_A_TOK"), ("user_b", "FIX_B_TOK")):
+                identity_mod.register(c, identity_mod.Identity(
+                    name=name, role="customer", tenant="t1", researcher_owned=True,
+                    credential_ref=cred))
+            for route, rtype in (("/api/orders", "order"), ("/api/secure-orders", "secure-order")):
+                traffic.capture(c, method="GET", url=f"https://{HOST}{route}/1",
+                                headers={"Authorization": "Bearer tok-a"}, identity="user_a",
+                                response={"status": 200, "content_type": "application/json"})
+                resource_mod.assert_ownership(c, resource_mod.Ownership(
+                    resource_type=rtype, resource_value="1", owner_identity="user_a",
+                    tenant="t1", researcher_controlled=True))
+
+            co = run_mod.coordinator_for(c)
+            for tech in _DIFF_TECHNIQUES:
+                co.orch.register_worker(tech, _diff_worker(fetch))
+            pcb, oc = planner.background_autonomous(c, max_actions=10)
+            co.start(planner=pcb, on_complete=oc)
+            assert _wait(lambda: co.snapshot()["run_state"] == "COMPLETE"), co.snapshot()
+
+            findings_before = len(finding.findings(c))
+            experiments_before = len(c.experiments())
+            resolved_before = sum(1 for g in coverage.build(c)["gaps"] if g["status"] == "RESOLVED")
+            assert findings_before and experiments_before and resolved_before
+
+            # simulate a process that died with the run still "active"
+            co._persist("RUNNING", "run-ghost")
+            run_mod._reset_registry()                            # drop the in-memory coordinator
+
+            # restart: fresh process, reload the campaign from disk
+            c2 = campaign_mod.load(c.id)
+            co2 = run_mod.coordinator_for(c2)
+            assert co2.snapshot()["run_state"] == "STOPPED"      # never trusts a stale active run
+            assert any(a["event"] == "run_recovered" for a in c2.audit_trail())
+
+            # durable research state survived the restart intact
+            assert len(finding.findings(c2)) == findings_before
+            assert len(c2.experiments()) == experiments_before
+            assert sum(1 for g in coverage.build(c2)["gaps"]
+                       if g["status"] == "RESOLVED") == resolved_before
+
+            # a fresh autonomous run is SAFE: durable negative memory is honored, so the resolved
+            # boundaries are never re-run — it exhausts honestly with no new experiments
+            for tech in _DIFF_TECHNIQUES:
+                co2.orch.register_worker(tech, _diff_worker(fetch))
+            pcb2, oc2 = planner.background_autonomous(c2, max_actions=10)
+            co2.start(planner=pcb2, on_complete=oc2)
+            assert _wait(lambda: co2.snapshot()["run_state"] == "COMPLETE"), co2.snapshot()
+            assert len(c2.experiments()) == experiments_before   # nothing new to safely run
+            assert planner.completion(c2)["status"] == "RESEARCH_EXHAUSTED"
+        finally:
+            run_mod._reset_registry()
+            for k in ("ARGUS_HOME", "FIX_A_TOK", "FIX_B_TOK"):
+                os.environ.pop(k, None)
+
+
 def test_golden_secure_path():
     """GAP -> controlled test -> access CORRECTLY DENIED -> no finding -> negative memory ->
     the planner moves on (the resolved boundary is never re-recommended)."""
