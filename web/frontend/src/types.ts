@@ -613,3 +613,60 @@ export interface Policy {
   warnings: string[];
   scope_file: string;
 }
+
+// ---- research planner (argus/planner.py → GET /api/campaign/{id}/plan) ----
+// The planner's decision is DERIVED and read-only: it chooses among experiments policy has
+// ALREADY permitted, and its terminal state is RESEARCH_EXHAUSTED, never "secure". The frontend
+// renders this verbatim and never re-decides safety, priority, or a stop reason itself.
+
+// Closed vocabulary of why the planner has no safe next action (argus/planner.STOP_REASONS).
+export type StopReason =
+  | ""
+  | "no_open_gaps"
+  | "all_remaining_need_approval"
+  | "all_remaining_denied"
+  | "below_useful_threshold"
+  | "budget_exhausted";
+
+export interface Assessment {
+  campaign_id: string;
+  next_action: { gap: BoundaryCard; proposal: ExperimentProposal } | null;
+  stopped: boolean;
+  stop_reason: StopReason;
+  parked_for_approval: BoundaryCard[];
+  ranked_preview: BoundaryCard[];
+  counts: { open_gaps: number; safe_runnable: number; need_approval: number; denied: number };
+}
+
+export interface Completion {
+  campaign_id: string;
+  mapped: {
+    assets_in_scope: number;
+    endpoints_known: number;
+    identities: number;
+    resources_observed: number;
+    ownership_confirmed: number;
+  };
+  researched: {
+    research_gaps_total: number;
+    open_gaps: number;
+    experiments_run: number;
+    secure_boundaries_confirmed: number;
+    suspicious_candidates: number;
+    reproduced_findings: number;
+    impact_confirmed: number;
+    reports_ready: number;
+    reports_blocked: number;
+  };
+  remaining: { untested_boundaries: number; awaiting_approval: number; safe_runnable_now: number };
+  status: "RESEARCH_EXHAUSTED" | "RESEARCH_ACTIVE";
+  why_stopped: StopReason;
+  next_action: Assessment["next_action"];
+  research_coverage_note: string;
+}
+
+export interface CampaignPlan {
+  campaign_id: string;
+  assessment: Assessment;
+  completion: Completion;
+}

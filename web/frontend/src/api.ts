@@ -449,6 +449,13 @@ export function getIntel(cid: string): Promise<import("./types").Intel> {
   return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/intel`);
 }
 
+/** The research planner's decision for a campaign: the single highest-value SAFE next action
+ * (or an honest stop reason) + the completion handoff. DERIVED and read-only — fetching it
+ * executes nothing; the orchestrator stays the sole executor. */
+export function getPlan(cid: string): Promise<import("./types").CampaignPlan> {
+  return jsonFetch(`/api/campaign/${encodeURIComponent(cid)}/plan`);
+}
+
 /** Sequence the deterministic earned transitions (scope→boundary→impact→dedupe→report-ready)
  * as far as the evidence supports, stopping with a reason at the first unearned gate. This
  * never executes requests — reproduction stays the operator-controlled coordinator path. */

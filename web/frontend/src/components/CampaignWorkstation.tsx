@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   CampaignDetail,
+  CampaignPlan,
   CampaignRunState,
   CampaignSummary,
   EngagementLevel,
@@ -14,12 +15,14 @@ import {
   decideTask,
   getCampaign,
   getIntel,
+  getPlan,
   listCampaigns,
   queueGap,
   startPivot,
   subscribeCampaign,
 } from "../api";
 import CampaignProgress from "./CampaignProgress";
+import NextAction from "./NextAction";
 import ResearchIntel from "./ResearchIntel";
 
 const RUN_PREFIX = "campaign.run.";
@@ -64,6 +67,7 @@ export default function CampaignWorkstation({
   const [busy, setBusy] = useState<string | null>(null);
   const [runState, setRunState] = useState<CampaignRunState | null>(null);
   const [intel, setIntel] = useState<Intel | null>(null);
+  const [plan, setPlan] = useState<CampaignPlan | null>(null);
   const refetchTimer = useRef<number | null>(null);
 
   const refreshList = useCallback(() => {
@@ -88,9 +92,11 @@ export default function CampaignWorkstation({
         onProgress?.(d.id, d.progress);   // feed the bottom execution rail
       })
       .catch((e) => setError(String(e)));
-    // research intel is derived knowledge, independent of execution progress — refresh it
-    // on the same signal, but never let its failure clobber the detail view.
+    // research intel + the planner's decision are derived knowledge, independent of execution
+    // progress — refresh them on the same signal, but never let a derived view's failure clobber
+    // the detail view. The plan is the headline "best next safe action" (or honest stop).
     getIntel(id).then(setIntel).catch(() => { /* derived view is best-effort */ });
+    getPlan(id).then(setPlan).catch(() => { /* derived view is best-effort */ });
   }, [onProgress]);
 
   // Subscribe to the campaign's structured event stream; on any event, debounce a
@@ -100,6 +106,7 @@ export default function CampaignWorkstation({
       setDetail(null);
       setRunState(null);
       setIntel(null);
+      setPlan(null);
       return;
     }
     loadDetail(cid);
@@ -259,6 +266,16 @@ export default function CampaignWorkstation({
       {detail && (
         <>
           <CampaignProgress p={detail.progress} />
+
+          {plan && (
+            <NextAction
+              assessment={plan.assessment}
+              completion={plan.completion}
+              onQueue={onQueueGap}
+              queueBusy={busy?.startsWith("queue:") ? busy.slice("queue:".length) : null}
+              queueDisabled={runActive}
+            />
+          )}
 
           {intel && (
             <ResearchIntel
