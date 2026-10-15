@@ -139,6 +139,27 @@ def test_unreachable_is_inconclusive(camp):
     assert r.classification == "inconclusive"
 
 
+def test_expired_session_baseline_is_inconclusive_not_secure(camp):
+    """Session reliability: if the OWNER's OWN request (the baseline) is denied — an expired or
+    invalid researcher session, NOT an authorization property — both identities see 401. The
+    old cross-account rule read 'B not granted' as secure, a false negative that would become
+    permanent negative memory. With no established baseline the honest result is inconclusive."""
+    base, mut = _cross(owner=USER_A)
+    r = run(camp, "differential_cross_account", "api.acme.example", base, mut,
+            fetch=lambda *a: (401, {}, ""))      # the researcher's own session is dead
+    assert r.comparison["access"] == ["denied", "denied"]
+    assert r.classification == "inconclusive"    # NOT "secure" — nothing was established
+
+
+def test_login_redirect_baseline_is_inconclusive(camp):
+    """A 3xx login redirect on the baseline is a session failure (logged out), never a secure
+    denial — the directive's explicit 'must not mistake login redirect for secure behavior'."""
+    base, mut = _cross(owner=USER_A)
+    r = run(camp, "differential_cross_account", "api.acme.example", base, mut,
+            fetch=lambda *a: (302, {"location": "https://api.acme.example/login"}, ""))
+    assert r.classification == "inconclusive"
+
+
 # --- COMPARISON / CONTROLLED-MUTATION RULES -------------------------------
 
 def test_single_mutation_enforced(camp):

@@ -161,20 +161,34 @@ def compare(base: dict, mut: dict) -> dict:
     }
 
 
+def _baseline_established(base: dict) -> bool:
+    """Session-health precondition for ANY authorization conclusion: did the baseline — the
+    known-good request (the owner reaching their OWN object, or the authenticated identity on
+    its normal path) — actually reach the object with a healthy session? Only a clean 2xx
+    counts. A 401/403, a login redirect (3xx), a 404, or a transport error means the
+    researcher's OWN session/setup — an expired/invalid token — explains the responses, and
+    from there an authorization denial and a dead session look IDENTICAL. So no 'secure' (a
+    dead boundary becoming negative memory) and no 'suspicious' can be drawn: the honest result
+    is 'inconclusive'. This is the one place session reliability enters the conclusion."""
+    return base.get("access") == "granted"
+
+
 def _classify(technique: str, mutation: Variant, base: dict, mut: dict, cmp: dict) -> str:
     """ARGUS's deterministic first pass — a fact about the comparison, not a verdict on
     severity. 'suspicious' flags a candidate for NYX/reproduction; it is NEVER
     'vulnerable' (that needs a reproduction the spec puts in a later slice)."""
     if base["access"] == "error" or mut["access"] == "error":
         return "inconclusive"                       # a request never landed — can't compare
+    if not _baseline_established(base):
+        # the baseline never established healthy access (expired/invalid session, login
+        # redirect, missing object). We cannot tell authorization from a dead session, so we
+        # refuse to conclude — observed, never remembered as a secure dead boundary.
+        return "inconclusive"
     if technique == "differential_anonymous":
         # baseline is an authenticated identity; the mutation drops ALL credentials. The ONLY
         # suspicious signal is the anonymous request STILL being granted — authentication was
-        # not actually enforced. Anonymous DENIED is the correct, secure outcome. If the authed
-        # baseline itself didn't succeed there is nothing to compare against.
+        # not actually enforced. Anonymous DENIED is the correct, secure outcome.
         anonymous = not mutation.identity.auth_headers()
-        if base["access"] != "granted":
-            return "inconclusive"
         return "suspicious" if (anonymous and mut["access"] == "granted") else "secure"
     if technique == "differential_cross_account":
         # The ONLY suspicious cross-account signal is B reaching A's object. B being
