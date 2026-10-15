@@ -295,6 +295,17 @@ def test_golden_autonomous_loop_via_coordinator():
             stop = next(a for a in reversed(c.audit_trail()) if a["event"] == "planner_exhausted")
             assert stop["reason"] in ("no_open_gaps", "all_remaining_need_approval",
                                       "all_remaining_denied", "below_useful_threshold")
+
+            # SECRET SAFETY on the NEW surfaces: the autonomous event stream + the plan payload
+            # the UI consumes (assess/completion over GET /plan) carry NO credential, even though
+            # a real token rode over the wire to the fixture for this entire loop.
+            blob = "\n".join([
+                json.dumps(c.audit_trail()),          # every planner.* / knowledge.updated event
+                json.dumps(planner.assess(c)), json.dumps(planner.completion(c)),
+                json.dumps(c.experiments()), json.dumps(c.observations()),
+            ])
+            for secret in ("tok-a", "tok-b", "Bearer tok", "FIX_A_TOK=tok"):
+                assert secret not in blob, f"secret leaked: {secret!r}"
         finally:
             run_mod._reset_registry()
             for k in ("ARGUS_HOME", "FIX_A_TOK", "FIX_B_TOK"):
