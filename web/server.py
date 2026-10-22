@@ -11,7 +11,7 @@ node/edge/finding graph as JSON.
 
 Run from the repo root (the parent of this `web/` dir):
 
-    python3 web/server.py                 # serves API on 127.0.0.1:8787
+    python3 web/server.py                 # serves API on 127.0.0.1:8788
     python3 web/server.py --port 9000
     python3 web/server.py --host 0.0.0.0  # expose on LAN (see the warning below)
 
@@ -1343,7 +1343,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser(description="Argus web API (stdlib SSE over the argus engine)")
     ap.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
-    ap.add_argument("--port", type=int, default=8787, help="bind port (default 8787)")
+    ap.add_argument("--port", type=int, default=8788, help="bind port (default 8788)")
     args = ap.parse_args()
 
     if args.host not in ("127.0.0.1", "localhost"):

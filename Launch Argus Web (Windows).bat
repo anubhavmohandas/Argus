@@ -3,7 +3,7 @@ REM Argus (Windows) — pulls latest code, launches the web API, opens the UI.
 REM Double-click in Explorer. Close this window to stop Argus.
 cd /d "%~dp0"
 
-set "URL=http://127.0.0.1:8787"
+set "URL=http://127.0.0.1:8788"
 
 REM 1. Fetch the latest code (fast-forward only — never clobbers local work).
 if exist ".git" (
@@ -12,7 +12,7 @@ if exist ".git" (
 )
 
 REM 2. Stop any server already holding the port, so we run the code we just pulled.
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8787 ^| findstr LISTENING') do taskkill /F /PID %%a >nul 2>&1
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8788 ^| findstr LISTENING') do taskkill /F /PID %%a >nul 2>&1
 
 if exist ".venv\Scripts\activate.bat" call ".venv\Scripts\activate.bat"
 

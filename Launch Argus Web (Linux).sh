@@ -4,7 +4,7 @@
 # will offer "Run"). Close the terminal / Ctrl-C to stop Argus.
 cd "$(dirname "$0")" || exit 1
 
-URL="http://127.0.0.1:8787"
+URL="http://127.0.0.1:8788"
 
 # 1. Fetch the latest code (fast-forward only — never clobbers local work).
 if [ -d .git ]; then
@@ -13,7 +13,7 @@ if [ -d .git ]; then
 fi
 
 # 2. Stop any server already holding the port, so we run the code we just pulled.
-pids=$(lsof -ti tcp:8787 2>/dev/null)
+pids=$(lsof -ti tcp:8788 2>/dev/null)
 [ -n "$pids" ] && { echo "Restarting server…"; kill $pids 2>/dev/null; sleep 1; }
 
 [ -f .venv/bin/activate ] && source .venv/bin/activate

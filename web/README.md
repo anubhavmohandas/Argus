@@ -21,9 +21,9 @@ Two terminals, from the **repo root**:
 
 ```bash
 # 1) the engine API (stdlib, no deps)
-python3 web/server.py                 # http://127.0.0.1:8787
+python3 web/server.py                 # http://127.0.0.1:8788
 
-# 2) the frontend dev server (proxies /api -> :8787)
+# 2) the frontend dev server (proxies /api -> :8788)
 cd web/frontend
 npm install
 npm run dev                           # http://localhost:5173
@@ -33,7 +33,7 @@ npm run dev                           # http://localhost:5173
 
 ```bash
 cd web/frontend && npm install && npm run build   # emits web/frontend/dist
-cd ../.. && python3 web/server.py                 # serves UI + API on :8787
+cd ../.. && python3 web/server.py                 # serves UI + API on :8788
 ```
 
 ### Docker (self-contained)
@@ -43,8 +43,8 @@ Builds the frontend and bundles it with the engine in one image. Build from the
 
 ```bash
 docker build -f web/Dockerfile -t argus-web .
-docker run --rm -p 8787:8787 -e GITHUB_TOKEN=ghp_xxx argus-web
-# open http://127.0.0.1:8787
+docker run --rm -p 8788:8788 -e GITHUB_TOKEN=ghp_xxx argus-web
+# open http://127.0.0.1:8788
 ```
 
 Or with compose:
@@ -55,10 +55,10 @@ GITHUB_TOKEN=ghp_xxx docker compose -f web/docker-compose.yml up --build
 
 `git` is installed in the image (the `github_org` module needs it). The `phone`
 module's optional `phonenumbers` dependency is not installed — add it if needed.
-The container binds `0.0.0.0` inside, mapped to `127.0.0.1:8787` on the host by
+The container binds `0.0.0.0` inside, mapped to `127.0.0.1:8788` on the host by
 default; active engagement tiers still require authorization in the UI.
 
-Open http://127.0.0.1:8787.
+Open http://127.0.0.1:8788.
 
 ## Engagement levels
 

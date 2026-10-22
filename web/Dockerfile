@@ -4,8 +4,8 @@
 #
 # Build from the REPO ROOT (so the argus/ package is in context):
 #   docker build -f web/Dockerfile -t argus-web .
-#   docker run --rm -p 8787:8787 -e GITHUB_TOKEN=ghp_xxx argus-web
-#   open http://127.0.0.1:8787
+#   docker run --rm -p 8788:8788 -e GITHUB_TOKEN=ghp_xxx argus-web
+#   open http://127.0.0.1:8788
 #
 # Notes:
 # - The engine is stdlib-only, so there is nothing to pip install for it.
@@ -35,8 +35,8 @@ COPY web/server.py ./web/server.py
 COPY --from=frontend /build/dist ./web/frontend/dist
 
 ENV PYTHONUNBUFFERED=1
-EXPOSE 8787
+EXPOSE 8788
 
 # Bind to 0.0.0.0 so the port is reachable from the host; the engine's
 # active tiers still require operator authorization in the UI.
-CMD ["python", "web/server.py", "--host", "0.0.0.0", "--port", "8787"]
+CMD ["python", "web/server.py", "--host", "0.0.0.0", "--port", "8788"]

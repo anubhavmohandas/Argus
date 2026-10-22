@@ -1,7 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// Dev server proxies /api to the stdlib Python server (web/server.py on :8787).
+// Dev server proxies /api to the stdlib Python server (web/server.py on :8788).
 // Build output goes to dist/, which web/server.py serves directly in prod.
 export default defineConfig({
   plugins: [react()],
@@ -9,7 +9,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8787",
+        target: "http://127.0.0.1:8788",
         changeOrigin: true,
       },
     },

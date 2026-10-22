@@ -123,7 +123,7 @@ selector, live run log, the entity graph, and the findings dossier. The server
 no recon logic.
 
 ```bash
-docker compose -f web/docker-compose.yml up --build   # → http://127.0.0.1:8787
+docker compose -f web/docker-compose.yml up --build   # → http://127.0.0.1:8788
 ```
 
 Dev (hot reload) and build details: [`web/README.md`](web/README.md). The
