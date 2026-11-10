@@ -18,6 +18,8 @@ re-fetches the RAW GitHub file for the analyst to read.
 from __future__ import annotations
 
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -31,14 +33,43 @@ _API = "https://api.github.com/search/code"
 # Dork keywords paired with the target domain. Bounded — GitHub's authenticated
 # code-search allows ~10 req/min, so this is budget-limited like admin_probe.
 _DORKS = [
-    "aws_secret_access_key", "api_key", "client_secret", "access_token",
-    "jwt_secret", "db_password", "secret_token", "filename:.env",
+    # secret / credential keywords (sir's GitHub Recon Dorking Guide)
+    "aws_secret_access_key", "aws_access_key_id", "api_key", "apikey",
+    "client_secret", "access_token", "jwt_secret", "secret_token",
+    "db_password", "database_password", "smtp_password", "ftp_password",
+    "oauth_token", "oauth_secret", "x-api-key", '"Authorization: Bearer"',
+    # credential-bearing file types (guide's path:*.ext -> extension:ext for the code-search API)
+    "filename:.env", "extension:env", "extension:yml", "extension:yaml",
+    "extension:properties", "extension:ini", "extension:sql", "extension:pem",
+    "filename:id_rsa", "extension:key", "filename:database.yml",
+    "filename:.npmrc", "filename:wp-config.php",
+    # cloud / provider key formats
+    "AIzaSy extension:json", "sk_live_ extension:js", "AWS_ACCESS_KEY_ID extension:env",
+    "shpat_ in:file", "shpca_ in:file", "NRAK- in:file", "xoxb- in:file", "glpat- in:file",
+    "twilio_account_sid extension:env", "sendgrid_api_key extension:json",
+    # API documentation / endpoint exposure
+    "swagger extension:json", "api-docs", "postman_collection extension:json",
+    "openapi extension:yaml",
 ]
 
 
+# Code search allows 10 req/min authenticated; past that GitHub answers 403 and
+# _gh_get returns None, so un-paced dorks would be silently skipped, not searched.
+_SEARCH_INTERVAL = 6.5
+_search_lock = threading.Lock()
+_last_search = 0.0
+
+
 def _gh_get(url: str, token: str, timeout: float = 15.0):
-    """Authenticated GET against the GitHub API → parsed JSON or None."""
+    """Authenticated GET against the GitHub API → parsed JSON or None.
+    Paced to the code-search rate limit (a full dork run takes ~4.5 min)."""
     import json
+    global _last_search
+    with _search_lock:
+        wait = _last_search + _SEARCH_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_search = time.monotonic()
     req = urllib.request.Request(url, headers={
         "User-Agent": _UA,
         "Accept": "application/vnd.github+json",

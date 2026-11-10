@@ -129,7 +129,7 @@ def test_ephemeral_campaign_fails_closed_outside_the_seed(home):
 # If a new module appears here, confirm it is passive (add it) or route it through the
 # orchestrator — do not let `run` reach a target without can_test.
 _PASSIVE_MODULES = {
-    "dns", "github_dork", "github_org", "ip", "jsmap", "phone", "postman_dork",
+    "apk", "dns", "github_dork", "github_org", "ip", "jsmap", "phone", "postman_dork",
     "rdap", "secrets", "subdomains", "urlscan", "username", "wayback",
 }
 

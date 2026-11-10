@@ -52,11 +52,39 @@ def _fetch(url: str, timeout: float = 20.0, cap: int = 2 * 1024 * 1024) -> str:
         return ""
 
 
+# JS-asset prioritisation (from sir's JSHarvester wayback scoring): scan the
+# highest-value bundles first within the fixed max_files budget — sourcemaps
+# (original-source reconstruction) lead, then config/secret/auth/api bundles.
+_JS_KEYWORDS = {
+    **{k: 10 for k in ("config", "env", "secret", "secrets", "credential", "credentials",
+                       "apikey", "api-key", "auth", "oauth", "token", "jwt", "firebase",
+                       "aws", "stripe", "twilio", "sendgrid")},
+    **{k: 8 for k in ("app", "main", "api", "admin", "dashboard", "internal", "private",
+                      "backend", "sdk", "graphql", "payment", "checkout", "wallet")},
+    **{k: 6 for k in ("staging", "dev", "debug", "test", "qa", "uat", "sandbox", "beta",
+                      "legacy", "backup")},
+    **{k: 5 for k in ("bundle", "vendor", "chunk", "runtime", "settings", "constants")},
+}
+
+
+def _score_js(url: str) -> int:
+    """Keyword-weighted value of a JS/map URL; sourcemaps pinned highest."""
+    path = url.split("id_/", 1)[-1].lower().split("?", 1)[0].split("#", 1)[0]
+    if path.endswith(".map"):
+        return 1000
+    return sum(w for k, w in _JS_KEYWORDS.items() if k in path)
+
+
+def _prioritize(urls):
+    """De-dupe + order JS URLs by descending value (sourcemaps + secret/auth bundles first)."""
+    return sorted(dict.fromkeys(urls), key=_score_js, reverse=True)
+
+
 def jsmap_scan(domain: str, *, list_js=_cdx_js, fetch=_fetch, max_files: int = 40):
     """Core logic, injectable for offline tests. Yields triaged secret Findings
     from archived JS/source-map files for `domain`."""
     seen: set[str] = set()
-    urls = list_js(domain)[:max_files]
+    urls = _prioritize(list_js(domain))[:max_files]
     for u in urls:
         body = fetch(u)
         if not body:

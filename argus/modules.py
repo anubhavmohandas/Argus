@@ -159,6 +159,11 @@ _SECRET_PATTERNS = [
     ("SENTRY_DSN", LOW, "observability", r"https://[a-f0-9]+@o[0-9]+\.ingest\.sentry\.io/[0-9]+"),
     ("DISCORD_BOT", HIGH, "bot_token", r"\b[MN][A-Za-z\d]{23}\.[\w\-]{6}\.[\w\-]{27}\b"),
     ("TELEGRAM_BOT", HIGH, "bot_token", r"\b\d{8,10}:[A-Za-z0-9_\-]{35}\b"),
+    # provider tokens added from sir's API-recon guide + JSHarvester patterns
+    ("GITLAB_PAT", HIGH, "saas_api", r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
+    ("SHOPIFY_TOKEN", CRITICAL, "saas_api", r"\bshp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}\b"),
+    ("NEW_RELIC", HIGH, "saas_api", r"\bNRAK-[A-Z0-9]{27}\b"),
+    ("DISCORD_WEBHOOK", MEDIUM, "bot_token", r"https://discord(?:app)?\.com/api/webhooks/\d{17,20}/[A-Za-z0-9_\-]{60,}"),
 ]
 _SECRET_COMPILED = [(n, s, c, re.compile(p)) for (n, s, c, p) in _SECRET_PATTERNS]
 
